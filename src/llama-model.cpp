@@ -2811,6 +2811,10 @@ int32_t llama_model_n_embd(const llama_model * model) {
 }
 
 void llama_model_borrow_output(llama_model * model, const llama_model * other) {
+    // keep the draft's own head when it has one (e.g. tied token embeddings)
+    if (model->output != nullptr || other->output == nullptr) {
+        return;
+    }
     model->output   = other->output;
     model->output_s = other->output_s;
 }
