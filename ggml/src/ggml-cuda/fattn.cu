@@ -1015,56 +1015,47 @@ static __global__ void kv_stream_normalize_chunk_results(
     dst[row*D + tid] = accumulator[row*D + tid]/accumulator_meta[row].y;
 }
 
-#ifdef GGML_CUDA_FA_ALL_QUANTS
 using kv_stream_native_partial_fn = void (*)(
     ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *, int);
 
-template<ggml_type type_K>
-static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_type type_v) {
-    switch (type_v) {
-        case GGML_TYPE_F16:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_F16>;
-        case GGML_TYPE_Q4_0:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_0>;
-        case GGML_TYPE_Q4_1:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_1>;
-        case GGML_TYPE_Q5_0:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_0>;
-        case GGML_TYPE_Q5_1:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_1>;
-        case GGML_TYPE_Q8_0:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q8_0>;
-        case GGML_TYPE_BF16:
-            return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_BF16>;
-        default:
+#define KV_STREAM_NATIVE_V_CASE(type_K_case, type_V_case)                                  \
+        case GGML_TYPE_##type_V_case:                                                      \
+            if constexpr (GGML_CUDA_FA_##type_K_case##_##type_V_case) {                    \
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<                         \
+                    KV_STREAM_HEAD_DIM, GGML_TYPE_##type_K_case, GGML_TYPE_##type_V_case>; \
+            }                                                                              \
             return nullptr;
-    }
-}
+
+#define KV_STREAM_NATIVE_K_CASE(type_K_case)                                               \
+        case GGML_TYPE_##type_K_case:                                                      \
+            switch (type_v) {                                                              \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, F16)                                  \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, Q4_0)                                 \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, Q4_1)                                 \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, Q5_0)                                 \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, Q5_1)                                 \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, Q8_0)                                 \
+                KV_STREAM_NATIVE_V_CASE(type_K_case, BF16)                                 \
+                default:                                                                   \
+                    return nullptr;                                                        \
+            }
 
 static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
         ggml_type type_k, ggml_type type_v) {
-#define KV_STREAM_NATIVE_K_CASE(type_K) \
-        case type_K: return kv_stream_resolve_native_partial_for_v<type_K>(type_v)
     switch (type_k) {
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_F16);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q4_0);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q4_1);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q5_0);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q5_1);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_Q8_0);
-        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_BF16);
-        default: return nullptr;
+        KV_STREAM_NATIVE_K_CASE(F16)
+        KV_STREAM_NATIVE_K_CASE(Q4_0)
+        KV_STREAM_NATIVE_K_CASE(Q4_1)
+        KV_STREAM_NATIVE_K_CASE(Q5_0)
+        KV_STREAM_NATIVE_K_CASE(Q5_1)
+        KV_STREAM_NATIVE_K_CASE(Q8_0)
+        KV_STREAM_NATIVE_K_CASE(BF16)
+        default:
+            return nullptr;
     }
 #undef KV_STREAM_NATIVE_K_CASE
+#undef KV_STREAM_NATIVE_V_CASE
 }
-#endif // GGML_CUDA_FA_ALL_QUANTS
 
 } // namespace
 
@@ -1187,11 +1178,10 @@ ggml_backend_cuda_kv_stream_attention_mode
 ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_v) {
     const auto capabilities_k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
     const auto capabilities_v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-    if (capabilities_k.direct_attention && capabilities_v.direct_attention) {
+    if (capabilities_k.direct_attention && capabilities_v.direct_attention &&
+            kv_stream_resolve_native_partial(type_k, type_v) != nullptr) {
         return GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
     }
-#endif // GGML_CUDA_FA_ALL_QUANTS
     if (capabilities_k.storage && capabilities_v.storage &&
             capabilities_k.online_write && capabilities_v.online_write &&
             capabilities_k.decode_f16 && capabilities_v.decode_f16 &&
@@ -1796,13 +1786,11 @@ void ggml_cuda_flash_attn_ext_streamed(
         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type);
     const bool convert_to_f16 =
         attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
-#ifdef GGML_CUDA_FA_ALL_QUANTS
     const kv_stream_native_partial_fn native_partial =
         attention_mode == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ?
             kv_stream_resolve_native_partial(K->type, V->type) : nullptr;
     GGML_ASSERT(attention_mode != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT ||
         native_partial != nullptr);
-#endif // GGML_CUDA_FA_ALL_QUANTS
     const to_fp16_cuda_t converter_k = convert_to_f16 && K->type != GGML_TYPE_F16 ?
         ggml_get_to_fp16_cuda(K->type) : nullptr;
     const to_fp16_cuda_t converter_v = convert_to_f16 && V->type != GGML_TYPE_F16 ?
@@ -2273,12 +2261,8 @@ void ggml_cuda_flash_attn_ext_streamed(
                         KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
                             ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
                 } else {
-#ifdef GGML_CUDA_FA_ALL_QUANTS
                     GGML_ASSERT(native_partial != nullptr);
                     native_partial(ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
-#else
-                    GGML_ABORT("native quantized KV streaming requires GGML_CUDA_FA_ALL_QUANTS");
-#endif // GGML_CUDA_FA_ALL_QUANTS
                 }
             }
 
