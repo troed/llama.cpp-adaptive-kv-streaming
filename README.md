@@ -23,23 +23,15 @@ cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=O
 cmake --build build --config Release -j
 ```
 
-* Download this version of Qwen 3.8 27B
+* Download the model and its DFlash2 draft
 
-[bsaleh03's ASCII condensed UD-IQ4_XS](https://huggingface.co/bsaleh03/Qwen3.8-27B-ASCII-Condensed)
-
-* Run this script to extract MTP to a separate file
-
-```sh
-python3 gguf-py/gguf/scripts/gguf_extract_mtp.py \
-    Qwen3.8-27B-ASCII-Condensed-UD-IQ4_XS.gguf \
-    Qwen3.8-27B-ASCII-Condensed-MTP.gguf
-```
+[the ASCII condensed IQ4_XS target and the condensed DFlash2 draft](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed)
 
 * Use the following parameters (models-preset.ini format) when launching llama-server
 
 ```
-m = Qwen3.8-27B-ASCII-Condensed-UD-IQ4_XS.gguf
-md = Qwen3.8-27B-ASCII-Condensed-MTP.gguf
+m = Qwen3.8-27B-ASCII-Condensed-IQ4_XS-3.84bpw.gguf
+md = Qwen3.8-27B-ASCII-Condensed-DFlash2-Q2_K_S-MIX.gguf
 device-draft = CUDA0
 n-gpu-layers-draft = all
 ctx-size = 160000
@@ -47,13 +39,13 @@ n-gpu-layers = 99
 batch-size = 256
 ubatch-size = 256
 # lower this value if you don't have the full 16GB available for the model
-kv-stream-arena-mib = 3264
+kv-stream-arena-mib = 4352
 cache-type-k = q8_0
 cache-type-v = q4_0
-spec-type = draft-mtp
-spec-draft-n-max = 3
+spec-type = draft-dflash
+spec-draft-n-max = 5
 kv-stream-spec-dynamic = on
-kv-stream-spec-keep-pages = 330
+kv-stream-spec-keep-pages = 334
 kv-stream-spec-reenable-pages = 8
 kv-stream-spec-stable-decodes = 4
 fit = off
@@ -356,7 +348,8 @@ the model leaves.
   condensed-vocabulary target (129006 tokens) does not work with the
   full-vocabulary DFlash2 draft (248320 tokens). The results above use a
   condensed-vocabulary DFlash2 draft built by
-  `gguf-py/gguf/scripts/gguf_condense_dflash.py`.
+  `gguf-py/gguf/scripts/gguf_condense_dflash.py`. A pre-built pair ships in
+  [the model repo](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed).
 - The DFlash2 draft is pinned by its weights plus the widened recurrent-state
   cache. Its five KV layers are all sliding-window (window 2048), so the draft
   KV is only about 40 MB; it stays in ordinary VRAM rather than the pinned
