@@ -1,4 +1,4 @@
-# llama.cpp adaptive KV streaming - fork notes
+# llama.cpp adaptive KV streaming - spec fork notes
 
 This repository is a fork of
 [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming).
@@ -9,15 +9,17 @@ in pinned host memory while one bounded CUDA arena is shared between
 phase-specific compute buffers, resident KV pages, and the transfer ring. The
 upstream README (linked below) covers that design, its build, and its benchmarks.
 
-This fork keeps that implementation and adds speculative-decoding support and
-memory management for the MTP draft context. Everything below is experimental.
+This fork keeps that implementation and adds speculative decoding on top of the
+phase arena: both MTP and DFlash2 drafts work, with the draft weights pinned in
+the target arena and a dynamic eject that trades the draft for decode capacity
+as the context grows. Everything below is experimental.
 
 ## Sync status
 
 - ggml-org/llama.cpp: master `1af554f8f` (2026-09-19)
 - RaymondHuang210129/llama.cpp-adaptive-kv-streaming: master `f280b2698` (2026-08-24)
 
-## TLDR
+## TLDR - recommended setup
 
 If you have a 16GB CUDA GPU - just do the following:
 
@@ -28,11 +30,11 @@ cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=O
 cmake --build build --config Release -j
 ```
 
--DGGML_CUDA_FA_QUANTS selects which K/V cache type combinations get Flash Attention kernels compiled: `type_K-type_V` pairs separated by `;` (legal types `f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0`; f16-f16 is always compiled). Include the combinations your `cache-type-k`/`cache-type-v` and the draft's `-ctkd`/`-ctvd` use, or use `all` to compile every combination (much slower build). Combinations not in the list still work: Flash Attention falls back to the f16-f16 kernel with a one-time warning, and the KV streaming direct path uses a slower F16 conversion path. `GGML_CUDA_FA_ALL_QUANTS` is a deprecated alias for `=all`.
+-DGGML_CUDA_FA_QUANTS selects which K/V cache type combinations get Flash Attention kernels compiled: `type_K-type_V` pairs separated by `;` (legal types `f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0`; f16-f16 is always compiled). `GGML_CUDA_FA_ALL_QUANTS` is a deprecated alias for `=all`.
 
-* Download the model and its DFlash2 draft
+* Download a suitably small Qwen model and a tiny DFlash2 draft
 
-[the ASCII condensed IQ4_XS target and the condensed DFlash2 draft](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed)
+[ASCII condensed Qwen 3.8 27B ByteShape IQ4_XS and matching condensed DFlash2](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed)
 
 * Use the following parameters (models-preset.ini format) when launching llama-server
 
@@ -72,119 +74,69 @@ load-mode = none
 flash-attn = on
 ```
 
+MTP works as well if you prefer that to DFlash2.
+
+## Speculative decoding
+
+Both MTP and DFlash2 drafts work with the phase arena, on the same pinned-draft
+machinery: the draft weights (and, for MTP, the draft KV) are reserved in the
+target arena, and the dynamic eject below trades the draft for decode capacity
+as the working set grows. Only one pinned draft type can be active at a time:
+if `--spec-type` mixes MTP or DFlash2 with a non-pinned speculator (for example
+`draft-mtp,ngram-mod`), the server disables dynamic eject with a warning and
+keeps the draft pinned for the whole run. You likely don't want that.
+
+| draft | `--spec-type` | draft source | notes |
+|---|---|---|---|
+| DFlash2 | `draft-dflash` | [the condensed DFlash2 draft](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed) (the TLDR model) | the draft has no token embedding and embeds through the target's `token_embd`, so its vocabulary must match the target's; its five KV layers are all sliding-window (window 2048) and stay in ordinary VRAM, so the pin is only the weights plus the widened recurrent-state cache |
+| MTP | `draft-mtp` | the MTP block extracted from the target GGUF (see [Creating a separate MTP model](#creating-a-separate-mtp-model)), or a separate MTP GGUF via `-md` | the MTP block weights and the nextn KV are pinned in the target arena |
+
+ngram-map and ngram-simple currently produce zero drafts in this configuration.
+
 ## Results
 
-Measured on an RTX 5060 Ti 16 GB with Qwen3.8-27B (Q8_0 K cache, Q4_0 V
-cache), `-ngl 99`, `--flash-attn on`, and `--parallel 1`. The model used is
-[bsaleh03's ASCII condensed version of Unsloth UD-IQ4_XS](https://huggingface.co/bsaleh03/Qwen3.8-27B-ASCII-Condensed).
-
-### Upstream vs Speculative decoding (this fork)
-
-This build with speculative decoding disabled (`--spec-type none`) against MTP
-and DFlash2, each at the largest `--kv-stream-arena-mib` that decodes on the
-16 GB card (3072 MiB upstream, 3136 MiB MTP, 3200 MiB DFlash2). All run
-`--ctx-size 160000`; the prompt is a source tree followed by a review
-instruction, with 256 tokens generated at temperature 0. The draft KV is
-quantized (`-ctkd q8_0 -ctvd q4_0`), which is why the MTP arena is smaller here
-than in the F16 configuration below.
+Measured on an RTX 5060 Ti 16 GB with Q8_0 K cache, Q4_0 V cache, `-ngl 99`,
+`--flash-attn on`, `--parallel 1`, `--ctx-size 160000`, a source-tree prompt
+followed by a review instruction, and 256 tokens generated at temperature 0.
+The model is [bsaleh03's ASCII condensed version of Unsloth UD-IQ4_XS](https://huggingface.co/bsaleh03/Qwen3.8-27B-ASCII-Condensed),
+not the TLDR one: the runs compare `--spec-type none` against MTP and DFlash2,
+each at the largest `--kv-stream-arena-mib` that decodes on the 16 GB card
+(3072 MiB upstream, 3136 MiB MTP, 3200 MiB DFlash2). The draft KV is
+quantized (`-ctkd q8_0 -ctvd q4_0`).
 
 ![MTP and DFlash2 decode throughput vs context](media/draft-thresholds-decode.png)
 
-Decode t/s:
-
-| ctx | upstream | MTP eject | MTP keep | DFlash2 eject | DFlash2 keep |
-|---:|---:|---:|---:|---:|---:|
-| 8K | 27.6 | 73.3 | 72.5 | 54.6 | 54.3 |
-| 16K | 26.3 | 64.5 | 63.1 | 58.8 | 58.8 |
-| 24K | 25.2 | 50.3 | 49.9 | 39.9 | 39.6 |
-| 32K | 23.9 | 58.7 | 58.3 | 43.5 | 45.0 |
-| 40K | 23.1 | 55.7 | 55.6 | 42.3 | 41.9 |
-| 49K | 22.2 | 22.2 | 47.2 | 40.4 | 40.2 |
-| 57K | 21.4 | 21.4 | 22.9 | 21.5 | 39.1 |
-| 65K | 20.7 | 20.6 | 22.7 | 20.7 | 21.2 |
-| 73K | 19.9 | 19.9 | 21.4 | 20.0 | 17.3 |
-| 81K | 19.3 | 19.4 | 22.7 | 19.5 | 21.2 |
-| 90K | 18.7 | 18.8 | 16.6 | 18.7 | 14.3 |
-| 98K | 18.1 | 18.2 | 10.0 | 18.1 | 10.3 |
-| 106K | 17.5 | 17.6 | 15.4 | 17.5 | 13.0 |
-| 114K | 17.0 | 17.2 | 14.3 | 17.1 | 13.2 |
-| 122K | 15.9 | 15.8 | | 16.0 | 11.3 |
-| 131K | 15.1 | 15.0 | 7.6 | 15.2 | 7.7 |
-| 139K | 14.5 | 14.3 | 9.9 | 14.6 | 9.3 |
-| 147K | 13.2 | 13.5 | 8.8 | 13.7 | 8.0 |
-| 155K | 12.1 | 12.5 | 11.2 | 13.2 | 10.8 |
-| 160K | 10.8 | 11.8 | 6.4 | 13.1 | 5.9 |
-
 ![MTP and DFlash2 prefill throughput vs context](media/draft-thresholds-prefill.png)
 
-Prefill t/s:
-
-| ctx | upstream | MTP eject | MTP keep | DFlash2 eject | DFlash2 keep |
-|---:|---:|---:|---:|---:|---:|
-| 8K | 997 | 835 | 826 | 899 | 892 |
-| 16K | 965 | 810 | 804 | 882 | 875 |
-| 24K | 925 | 778 | 774 | 852 | 848 |
-| 32K | 889 | 745 | 742 | 819 | 818 |
-| 40K | 857 | 713 | 713 | 795 | 789 |
-| 49K | 827 | 699 | 686 | 768 | 763 |
-| 57K | 798 | 694 | 662 | 745 | 740 |
-| 65K | 772 | 684 | 637 | 726 | 718 |
-| 73K | 747 | 674 | 617 | 709 | 691 |
-| 81K | 723 | 661 | 593 | 691 | 667 |
-| 90K | 702 | 649 | 575 | 673 | 646 |
-| 98K | 682 | 636 | 552 | 657 | 624 |
-| 106K | 663 | 623 | 533 | 640 | 601 |
-| 114K | 643 | 607 | 515 | 623 | 581 |
-| 122K | 624 | 592 | | 608 | 566 |
-| 131K | 604 | 576 | 483 | 590 | 547 |
-| 139K | 585 | 560 | 472 | 572 | 531 |
-| 147K | 566 | 544 | 458 | 556 | 514 |
-| 155K | 549 | 529 | 445 | 542 | 499 |
-| 160K | 540 | 521 | 438 | 534 | 490 |
-
-Keep divided by eject (decode): above 1.0 the draft should stay.
-
-| ctx | MTP | DFlash2 |
-|---:|---:|---:|
-| 8K-40K | 0.98-1.00x | 0.99-1.04x |
-| 49K | 2.12x | 0.99x |
-| 57K | 1.07x | 1.82x |
-| 65K-81K | 1.07-1.17x | 0.87-1.09x |
-| 90K | 0.88x | 0.76x |
-| 98K-160K | 0.51-0.90x | 0.45-0.82x |
-
-Findings:
+Findings (eject = the default controller, keep = a high `--kv-stream-spec-keep-pages`):
 
 - The draft is never ejected while the working set fits, so eject and keep are
   identical up to the streaming onset: about 49K tokens for MTP, 57K for DFlash2.
-- The default controller ejects at that onset, which is earlier than the data
-  supports. At the onset, keeping the draft is 1.8 to 2.1x faster (MTP 49K: 47.2
-  vs 22.2 t/s; DFlash2 57K: 39.1 vs 21.5 t/s).
-- Keeping wins through about 81K and loses from about 90K on. The keep/eject
-  crossover is about 85K, or about 330 pages/layer, for both drafts.
+- At the onset the default controller ejects, which is earlier than the data
+  supports: keeping is 1.8 to 2.1x faster there, and keeping wins through about
+  81K. The keep/eject crossover is about 85K tokens for both drafts; the keep
+  arm is noisy, so a robust eject threshold is about 300 pages/layer.
 - After ejection the decode rate matches upstream (49K: 22.2 vs 22.2; 98K: 18.2
-  vs 18.1), so the draft is cleanly disabled.
-- DFlash2 trails MTP at short context (its draft is five layers, not one) but its
-  eject curve stays ahead of MTP at long context (160K: 13.1 vs 11.8 t/s).
-- The keep arm is noisy (DFlash2 dips to 17.3 t/s at 73K), so a robust eject
-  threshold is about 300 pages/layer rather than the exact crossover.
+  vs 18.1 t/s), so the draft is cleanly disabled.
+- DFlash2 trails MTP at short context (its draft is five layers, not one) but
+  its eject curve stays ahead at long context (160K: 13.1 vs 11.8 t/s).
 
 Both drafts would gain from moving the default eject point from streaming onset
 (about 180 to 224 pages/layer) to about 300 pages/layer: that recovers the 1.8
-to 2.1x decode advantage across the 49K to 80K band and still ejects before keep
-turns negative. The MTP keep point at 122880 is missing because a pre-existing
-streaming-kernel launch timeout aborts that configuration; it reproduces on a
-build without any of this work, so it is unrelated to the draft generalization.
+to 2.1x decode advantage across the 49K to 80K band and still ejects before
+keep turns negative.
 
+Full numbers: [benchmarks/results/draft-thresholds.csv](benchmarks/results/draft-thresholds.csv).
 Reproduce with `benchmarks/benchmark_mtp_streaming.py` (MTP and DFlash2),
 `benchmarks/benchmark_upstream_vs_mtp.py` (upstream), and
 `benchmarks/plot_draft_thresholds.py` (combined table and figure).
 
 ### MTP KV quantization
 
-The MTP draft KV defaults to F16 and does not inherit the target `-ctk`/`-ctv`.
-Pass `-ctkd`/`-ctvd` to quantize it. The automatic pin now sizes the pinned MTP
-KV from the draft types, so the saved bytes become decode window:
+The MTP draft KV defaults to F16 and does not inherit the target `-ctk`/`-ctv`;
+pass `-ctkd`/`-ctvd` to quantize it. The automatic pin sizes the pinned MTP KV
+from the draft types, so quantizing shrinks the pin and grows the decode window
+(arena 3072, ctx 160000, auto pin):
 
 | MTP KV type | MTP KV pin | decode window |
 |---|---|---|
@@ -192,15 +144,11 @@ KV from the draft types, so the saved bytes become decode window:
 | q8_0 K / q4_0 V | 178 pages / 45568 tokens | 178 pages |
 | q4_0 K / q4_0 V | 182 pages / 46592 tokens | 181 pages |
 
-Measured at arena 3072, ctx 160000, ub 256, auto pin. The window grows by 14 to
-18 pages, which moves the MTP crossover from about 39K to about 42K tokens.
-Prefill loses 1.5 to 4 percent versus F16. Quantizing shrinks the pin, so the
-shared arena compute region grows and the init peak rises: at arena 3264 the MTP
-context can fail to allocate its compute buffer. Details and the throughput
-table are in
+The window grows by 14 to 18 pages, which moves the MTP crossover from about
+39K to about 42K tokens; prefill loses 1.5 to 4 percent versus F16. Details in
 [docs/next-steps/01-mtp-kv-quantization.md](docs/next-steps/01-mtp-kv-quantization.md).
 
-## Differences from upstream
+## Differences from Raymond's fork
 
 ### Phase arena: speculative verify batches
 - Upstream rejected generation batches whose token count was not exactly
@@ -219,22 +167,23 @@ table are in
   "phase arena decode batch too wide".
 - `n_max_spec_draft = 0` reproduces the original behaviour.
 
-### MTP draft context
-- The MTP draft context's `n_ubatch` is capped to
+### Pinned draft context (MTP and DFlash2)
+- The draft context's `n_ubatch` is capped to
   `max(8, draft.n_max + 2) * n_seq_max` so its compute graph stays small.
   `n_batch` is left unchanged, because the Qwen3.5 MTP path runs a prefill
   catch-up decode into its own KV.
 - The MTP context's KV cache can be allocated from a pinned region inside the
-  target's phase arena instead of a separate full-length F16 `cudaMalloc`.
-- The MTP block weights can be allocated from the same pinned region, so an
-  evicted MTP context returns both its KV and its weights to the arena pool.
+  target's phase arena instead of a separate full-length F16 `cudaMalloc`
+  (DFlash2's sliding-window KV stays in ordinary VRAM).
+- The draft block weights can be allocated from the same pinned region, so an
+  evicted draft returns both its KV and its weights to the arena pool.
 - A separate MTP-only GGUF can be supplied with `-md` while using
   `--spec-type draft-mtp`. The target then skips its embedded MTP tensors
   (`load_mtp = false`), and the draft borrows the target's LM head.
 - The pin, window cap, and dynamic eject are generalized to any pinned draft
   (MTP or DFlash2). A pinned draft reserves its weights and the widened
   recurrent-state cache in the target arena; MTP additionally pins its nextn
-  KV. DFlash2's five sliding-window KV layers stay in ordinary VRAM.
+  KV.
 
 ### New arena and context API
 - ggml-cuda: `ggml_backend_cuda_phase_arena_set_pinned()`,
@@ -258,13 +207,20 @@ table are in
 ## Configuration
 
 ### Phase arena (upstream)
-- `--kv-stream-arena-mib N` (alias `--kv-stream-stage-mib`): size of the shared CUDA arena in MiB; `0` disables it. The phase arena requires `--parallel 1`, `--flash-attn on`, KV offload, and a Qwen3.5-family target.
+- `--kv-stream-arena-mib N` (alias `--kv-stream-stage-mib`): size of the shared
+  CUDA arena in MiB; `0` disables it. The phase arena requires `--parallel 1`,
+  `--flash-attn on`, KV offload, and a Qwen3.5-family target.
 
 ### Speculative decoding
-- `--spec-type draft-mtp`: enable MTP speculative decoding.
-- `-md <file>`: optional separate MTP-only GGUF; the target then skips its embedded MTP tensors (`load_mtp = false`) and the draft borrows the target LM head.
-- `--spec-draft-n-max N`: number of draft tokens. It also widens the target recurrent-state cache and the decode compute slab.
-- `--spec-draft-type-k T` / `--spec-draft-type-v T`: draft KV cache types (default F16). The main `--cache-type-k`/`--cache-type-v` do not affect the draft.
+- `--spec-type draft-mtp` / `--spec-type draft-dflash`: enable the MTP or
+  DFlash2 draft.
+- `-md <file>`: separate draft GGUF. For MTP the target then skips its embedded
+  MTP tensors (`load_mtp = false`) and the draft borrows the target LM head.
+- `--spec-draft-n-max N`: number of draft tokens. It also widens the target
+  recurrent-state cache and the decode compute slab.
+- `--spec-draft-type-k T` / `--spec-draft-type-v T`: draft KV cache types
+  (default F16). The main `--cache-type-k`/`--cache-type-v` do not affect the
+  draft.
 
 ### Creating a separate MTP model
 
@@ -282,67 +238,33 @@ The output keeps the target vocab metadata (`token_embd`, `output_norm`) and the
 the target LM head; pass `--with-lm-head` to keep it. Use the result with
 `-md <file>`; the target then skips its embedded MTP tensors, saving their VRAM.
 
-### Dynamic MTP eject (this fork, opt-in)
-- `--kv-stream-spec-dynamic`: eject MTP when the decode working set exceeds the MTP-active decode capacity, and re-enable it when it fits again (default: disabled).
-- `--kv-stream-spec-keep-pages N`: the single eject threshold: keep MTP active until the target's decode working set exceeds `N` 256-token pages, then eject. `0` (default) ejects at streaming onset; use a large value to keep MTP active throughout. The draft KV slides to follow the target. Requires `--kv-stream-spec-dynamic`.
-- `--kv-stream-spec-reenable-pages N`: re-enable once the active pages fit at least `N` pages below the eject threshold (default: 8).
-- `--kv-stream-spec-stable-decodes N`: consecutive decode batches required before a transition (default: 4).
-- `--kv-stream-spec-kv-pages N`: size of the pinned MTP KV reservation, in 256-token pages. `0` (default) sizes the pin to the MTP-active decode window automatically; a positive `N` pins exactly `N` pages and caps the window there. Requires `--kv-stream-spec-dynamic`.
+### Dynamic draft eject (unique to this fork, opt-in)
+- `--kv-stream-spec-dynamic`: eject the draft when the decode working set
+  exceeds the draft-active decode capacity, and re-enable it when it fits again
+  (default: disabled).
+- `--kv-stream-spec-keep-pages N`: the single eject threshold: keep the draft
+  active until the target's decode working set exceeds `N` 256-token pages,
+  then eject. `0` (default) ejects at streaming onset; use a large value to
+  keep the draft active throughout. The draft KV slides to follow the target.
+  Requires `--kv-stream-spec-dynamic`.
+- `--kv-stream-spec-reenable-pages N`: re-enable once the active pages fit at
+  least `N` pages below the eject threshold (default: 8).
+- `--kv-stream-spec-stable-decodes N`: consecutive decode batches required
+  before a transition (default: 4).
+- `--kv-stream-spec-kv-pages N`: size of the pinned draft KV reservation, in
+  256-token pages. `0` (default) sizes the pin to the draft-active decode
+  window automatically; a positive `N` pins exactly `N` pages and caps the
+  window there. Requires `--kv-stream-spec-dynamic`.
 
-Both `--kv-stream-spec-*` and the older `--kv-stream-mtp-*` spellings are accepted; the options were renamed to cover any speculative draft.
+Ejecting returns the draft weights, the draft KV cache, and the widened
+recurrent-state cache to the arena pool; re-enabling restores them.
 
-The `LLAMA_ARG_KV_STREAM_SPEC_*` environment variables mirror these options. Ejecting returns the draft weights, the draft KV cache, and the widened recurrent-state cache to the arena pool; re-enabling restores them. (The DFlash2 draft has no pinned KV, so ejection returns its weights and the recurrent-state widening.) The default configuration ejects at streaming onset; `--kv-stream-spec-keep-pages` sets the eject threshold and `--kv-stream-spec-reenable-pages` the hysteresis band.
-
-**One pinned draft type only.** Dynamic eject changes only the configured draft (MTP or DFlash2). If `--spec-type` mixes MTP with DFlash2 or a non-pinned speculator (for example `--spec-type draft-mtp,ngram-mod`), the server disables dynamic eject with a warning and keeps the draft pinned for the whole run.
-
-### Tuning the dynamic MTP window
-
-MTP is kept while the decode working set fits the MTP-active decode pool, which
-is what remains of the arena after the pinned reservation (MTP weights,
-recurrent-state cache, MTP KV) and the phase compute slab. A larger
-`--ctx-size` reserves more and shrinks the window.
-
-The pinned MTP KV is the largest term, and a full-context pin reserves about
-4 MiB per 1000 context tokens. MTP only runs while the working set fits the
-decode pool, so the MTP KV never needs the full context. The default sizes the
-pin to that decode window instead. The two are coupled: a smaller pin leaves
-more arena for KV and grows the window, which in turn needs a larger pin. The
-default solves that fixed point directly, so the pin matches the decode
-capacity with no wasted reservation. Measured at `--kv-stream-arena-mib 3264`
-with this model and draft:
-
-| `--ctx-size` | prefill resident pages/layer | decode resident pages/layer | MTP-active window   |
-|-------------:|-----------------------------:|----------------------------:|---------------------|
-|        32768 |                          267 |                         276 | full context (~32k) |
-|        65536 |                          228 |                         239 | full context (~61k) |
-|       160000 |                          172 |                         190 | ~49k tokens         |
-
-A page is 256 tokens, so the window is `decode resident pages/layer * 256`
-tokens, bounded by `--ctx-size`. When the whole context fits the decode pool,
-as at `--ctx-size 32768`, no cap is applied and MTP stays active throughout.
-
-- `--kv-stream-spec-kv-pages N` overrides the automatic pin and reserves exactly
-  `N` pages of MTP KV. The window is then capped at `N` pages minus a small
-  catch-up margin (the MTP context decodes every target batch, so it must absorb
-  a few batches past the nominal window before the eject lands). Requires
-  `--kv-stream-spec-dynamic`. Use it to trade MTP reach against pool size, or to
-  bound a known working set. `--kv-stream-spec-kv-pages 0` restores the
-  automatic sizing.
-- `--kv-stream-spec-keep-pages N` sets the eject threshold directly: MTP is kept
-  until the active pages exceed `N`. `N = 0` keeps MTP as long as possible
-  (eject at streaming onset). It cannot extend the window past the pool
-  capacity.
-- `--kv-stream-spec-reenable-pages N` is the hysteresis: MTP is re-enabled once
-  the active pages fall `N` pages below the threshold; a larger value makes
-  re-enable later and less
-  prone to flapping. Default 8.
-- `--kv-stream-spec-stable-decodes N` debounces a transition until `N` consecutive
-  decode batches agree. Default 4. Raise it if a mixed workload flaps.
-
-Set `--ctx-size` to the longest prompt you need; beyond that MTP ejects and
-generation returns to the baseline rate. Keep `--spec-draft-n-max` small (the
-recurrent cache is `149.6 MiB * (1 + n_max)`) and give the arena as much room as
-the model leaves.
+The draft is kept while the decode working set fits the draft-active decode
+pool, which is what remains of the arena after the pinned reservation (draft
+weights, recurrent-state cache, MTP KV) and the phase compute slab. A full
+context pin would reserve about 4 MiB per 1000 context tokens, so the default
+sizes the pin to the decode window instead; `--kv-stream-spec-kv-pages`
+overrides that and caps the window at `N` pages minus a small catch-up margin.
 
 ## Scope and status
 
@@ -350,24 +272,18 @@ the model leaves.
   cache, one server slot (`-np 1`), and Flash Attention enabled.
 - Single GPU and `llama-server` only. The phase arena requires
   `n_seq_max == 1`, Flash Attention, KV offload, and a Qwen3.5-family target.
-- DFlash2 requires a draft whose vocabulary matches the target: the draft has no
-  token embedding and embeds through the target's `token_embd`. A
-  condensed-vocabulary target (129006 tokens) does not work with the
-  full-vocabulary DFlash2 draft (248320 tokens). The results above use a
-  condensed-vocabulary DFlash2 draft built by
-  `gguf-py/gguf/scripts/gguf_condense_dflash.py`. A pre-built pair ships in
-  [the model repo](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed).
-- The DFlash2 draft is pinned by its weights plus the widened recurrent-state
-  cache. Its five KV layers are all sliding-window (window 2048), so the draft
-  KV is only about 40 MB; it stays in ordinary VRAM rather than the pinned
-  region.
-- ngram-map and ngram-simple currently produce zero drafts in this configuration.
+- DFlash2 requires a draft whose vocabulary matches the target (see
+  [Speculative decoding](#speculative-decoding)). A condensed-vocabulary target
+  (129006 tokens) does not work with the full-vocabulary DFlash2 draft
+  (248320 tokens). The pre-built condensed pair ships in
+  [the model repo](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed),
+  built by `gguf-py/gguf/scripts/gguf_condense_dflash.py`.
 - Quantizing the MTP draft KV (`-ctkd`/`-ctvd`) shrinks the pin, which grows the
-  arena compute side and raises the init peak. At arena 3264 with `-ub 256` this
-  can fail to allocate the MTP context's compute buffer. Use arena 3072 or
-  `-ub 128` at 3264 for now.
+  arena compute side and raises the init peak. At arena 3264 with `-ub 256`
+  this can fail to allocate the MTP context's compute buffer. Use arena 3072
+  or `-ub 128` at 3264 for now.
 - Research code, no upstream guarantees.
 
-## Upstream
+## Upstream KV cache streaming fork
 
 [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
