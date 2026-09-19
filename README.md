@@ -12,6 +12,11 @@ upstream README (linked below) covers that design, its build, and its benchmarks
 This fork keeps that implementation and adds speculative-decoding support and
 memory management for the MTP draft context. Everything below is experimental.
 
+## Sync status
+
+- ggml-org/llama.cpp: master `1af554f8f` (2026-09-19)
+- RaymondHuang210129/llama.cpp-adaptive-kv-streaming: master `f280b2698` (2026-08-24)
+
 ## TLDR
 
 If you have a 16GB CUDA GPU - just do the following:
@@ -19,9 +24,11 @@ If you have a 16GB CUDA GPU - just do the following:
 * Clone this repo, build with these parameters
 
 ```sh
-cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA=ON
+cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_CUDA_FA_QUANTS=q8_0-q4_0 -DGGML_CUDA=ON
 cmake --build build --config Release -j
 ```
+
+-DGGML_CUDA_FA_QUANTS selects which K/V cache type combinations get Flash Attention kernels compiled: `type_K-type_V` pairs separated by `;` (legal types `f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0`; f16-f16 is always compiled). Include the combinations your `cache-type-k`/`cache-type-v` and the draft's `-ctkd`/`-ctvd` use, or use `all` to compile every combination (much slower build). Combinations not in the list still work: Flash Attention falls back to the f16-f16 kernel with a one-time warning, and the KV streaming direct path uses a slower F16 conversion path. `GGML_CUDA_FA_ALL_QUANTS` is a deprecated alias for `=all`.
 
 * Download the model and its DFlash2 draft
 
