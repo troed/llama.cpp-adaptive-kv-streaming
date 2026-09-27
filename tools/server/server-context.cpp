@@ -944,34 +944,71 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
-    bool spec_create(llama_progress_callback progress_cb = nullptr, void * progress_ud = nullptr) {
+    // implementations that keep drafting after the pinned draft is ejected:
+    // they need no draft context, only host memory
+    static bool spec_type_survives_eject(common_speculative_type type) {
+        switch (type) {
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+            case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool spec_create(llama_progress_callback progress_cb = nullptr, void * progress_ud = nullptr, bool with_draft_model = true) {
         const bool has_draft = params_base.speculative.has_dft();
 
-        common_params params_dft = common_base_params_to_speculative(params_base);
+        if (with_draft_model) {
+            common_params params_dft = common_base_params_to_speculative(params_base);
 
-        params_dft.load_progress_callback           = progress_cb;
-        params_dft.load_progress_callback_user_data = progress_ud;
+            params_dft.load_progress_callback           = progress_cb;
+            params_dft.load_progress_callback_user_data = progress_ud;
 
-        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
-        model_dft = spec_init->model();
-        ctx_dft   = spec_init->context();
+            spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+            model_dft = spec_init->model();
+            ctx_dft   = spec_init->context();
 
-        if (has_draft && model_dft == nullptr) {
-            SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-            return false;
+            if (has_draft && model_dft == nullptr) {
+                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                return false;
+            }
+
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create MTP context\n");
+                return false;
+            }
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft;
+        } else {
+            // eject path: no draft model, no ctx_dft; keep only the survivors
+            model_dft = nullptr;
+            ctx_dft   = nullptr;
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = nullptr;
         }
-
-        if (ctx_dft == nullptr) {
-            SRV_ERR("%s", "failed to create MTP context\n");
-            return false;
-        }
-
-        params_base.speculative.draft.ctx_tgt = ctx_tgt;
-        params_base.speculative.draft.ctx_dft = ctx_dft;
 
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                if (with_draft_model) {
+                    spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                } else {
+                    // the filtered list is local: --spec-type must stay intact
+                    // for the re-enable path
+                    common_params_speculative params_spec = params_base.speculative;
+                    params_spec.types.clear();
+                    for (const auto type : params_base.speculative.types) {
+                        if (spec_type_survives_eject(type)) {
+                            params_spec.types.push_back(type);
+                        }
+                    }
+                    SRV_INF("keeping %s for the ejected draft\n", common_speculative_type_name_str(params_spec.types).c_str());
+                    spec.reset(common_speculative_init(params_spec, params_base.n_parallel));
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -1118,19 +1155,11 @@ private:
         const bool pin_draft = spec_mtp || spec_dflash || spec_dspark;
         spec_draft_enabled_dynamic = pin_draft;
         spec_draft_is_mtp = spec_mtp;
-        const bool has_other_spec = std::any_of(params_base.speculative.types.begin(),
-            params_base.speculative.types.end(),
-            [](common_speculative_type t) {
-                return t != COMMON_SPECULATIVE_TYPE_NONE &&
-                       t != COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
-                       t != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
-                       t != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-            });
         // only one pinned draft family at a time; mixing MTP with DFlash would
         // reserve the wrong weights
         if (params_base.speculative.kv_stream_spec_dynamic && pin_draft &&
-                (has_other_spec || (spec_mtp && (spec_dflash || spec_dspark)))) {
-            SRV_WRN("%s", "dynamic draft ejection requires a single pinned draft type, disabling\n");
+                (spec_mtp && (spec_dflash || spec_dspark))) {
+            SRV_WRN("%s", "dynamic draft ejection requires a single pinned draft family, disabling\n");
             spec_draft_enabled_dynamic = false;
         }
 
@@ -3005,6 +3034,40 @@ private:
         const bool toggled = llama_kv_stream_draft_set(ctx_tgt, false);
         if (!toggled) {
             return false;
+        }
+
+        // keep the implementations that need no draft context, so decoding
+        // keeps drafting while the draft is out
+        try {
+            spec_create(nullptr, nullptr, /*with_draft_model=*/false);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to rebuild the speculative context after the eject: %s\n", e.what());
+            spec_destroy();
+        }
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) == 0) {
+            // the unpin removed the bounded rollback the RS type relies on; the
+            // draft verify path falls back to target checkpoints
+            ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        }
+        if (spec) {
+            // the eject zeroed the decode verify width; without it the survivor's
+            // verify batch is rejected, so drop the survivors rather than arm them
+            const int32_t n_max_survivor = common_speculative_n_max(spec.get());
+            const bool width_ok = n_max_survivor <= 0 ||
+                llama_kv_stream_set_spec_draft_width(ctx_tgt, (uint32_t) n_max_survivor);
+            if (!width_ok) {
+                SRV_ERR("%s", "failed to restore the decode draft width, dropping the ejected-draft survivors\n");
+                llama_kv_stream_set_spec_draft_width(ctx_tgt, 0);
+                spec_destroy();
+                spec_rewire_slots(false);
+            } else {
+                spec_rewire_slots(true);
+                for (auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_GENERATING) {
+                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    }
+                }
+            }
         }
         mtp_ejected = true;
 

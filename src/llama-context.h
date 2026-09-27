@@ -67,6 +67,8 @@ struct llama_context {
 
     bool kv_stream_draft_set(bool draft_active);
 
+    bool kv_stream_set_spec_draft_width(uint32_t n_max);
+
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
