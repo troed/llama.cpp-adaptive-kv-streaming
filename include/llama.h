@@ -637,6 +637,12 @@ extern "C" {
     // afterwards so its weights and KV cache allocate from the pinned buft.
     LLAMA_API bool llama_kv_stream_draft_set(struct llama_context * ctx, bool draft_active);
 
+    // Set the max speculative draft width the phase arena decode layout must
+    // tolerate while no draft model is pinned (0 = one token per sequence).
+    // Fails when a draft is pinned, or when n_max exceeds the configured
+    // n_max_spec_draft from the context parameters.
+    LLAMA_API bool llama_kv_stream_set_spec_draft_width(struct llama_context * ctx, uint32_t n_max);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
