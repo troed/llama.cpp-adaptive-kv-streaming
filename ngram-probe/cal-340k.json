@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Here are the concrete bugs and design problems found in the provided code, ordered by severity.\n\n### 1. Critical: Incorrect Draft Model Path in `common_speculative_init_result`\n**File:** `speculative.h` (implied, based on context)\n**Function:** `common_speculative_init_result"
+      }
+    }
+  ],
+  "created": 1790539502,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 64,
+    "prompt_tokens": 84196,
+    "total_tokens": 84260,
+    "prompt_tokens_details": {
+      "cached_tokens": 62264
+    }
+  },
+  "id": "chatcmpl-x5ZSj8SM26CUzY3nOGBJnJ2pLVrEcXTU",
+  "timings": {
+    "cache_n": 62264,
+    "prompt_n": 21932,
+    "prompt_ms": 40061.253,
+    "prompt_per_token_ms": 1.8266119368958598,
+    "prompt_per_second": 547.4616582761404,
+    "predicted_n": 64,
+    "predicted_ms": 2249.683,
+    "predicted_per_token_ms": 35.70925396825397,
+    "predicted_per_second": 28.003945444758216,
+    "draft_n": 123,
+    "draft_n_accepted": 38
+  }
+}

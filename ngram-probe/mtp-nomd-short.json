@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code snippet, here is a review of the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical Logic Bug: Incorrect Vocab Compatibility Check\n**Location:** `common_speculative_are_compatible`\n**Issue:** The loop checking token text equality uses `std::strcmp` on pointers returned by `llama_vocab_get_text`.\n```cpp\nconst char * token_text_tgt = llama_vocab_get_text(vocab_tgt, i);\nconst char * token_text_dft = llama_vocab_get_text(vocab_dft, i);\n\nif (std::strcmp(token_text_tgt, token"
+      }
+    }
+  ],
+  "created": 1790544567,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 128,
+    "prompt_tokens": 2230,
+    "total_tokens": 2358,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-Pk9ahZ5PJwwYxyJc5nVN7EoAJA9Ealfv",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 2230,
+    "prompt_ms": 2675.427,
+    "prompt_per_token_ms": 1.1997430493273544,
+    "prompt_per_second": 833.5118095167612,
+    "predicted_n": 128,
+    "predicted_ms": 2146.183,
+    "predicted_per_token_ms": 16.89907874015748,
+    "predicted_per_second": 59.17482339576821,
+    "draft_n": 131,
+    "draft_n_accepted": 83
+  }
+}

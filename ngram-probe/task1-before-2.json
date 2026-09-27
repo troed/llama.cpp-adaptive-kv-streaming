@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code, here are the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical: Use-After-Free / Dangling Pointer in `common_speculative_impl_draft_eagle3`\n**File:** `speculative.h` (implied, based on includes) / `common_speculative_impl_draft_eagle3` constructor\n**Function:** `common_speculative_impl_draft_eagle3::common_speculative_impl_draft_eagle3`\n\n**Bug:**\nThe constructor allocates memory for `batch.token` manually using `malloc` because `llama_batch_init` only allocates one of `token` or `embd`.\n```cpp\nbatch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_dec, /*n_seq_max=*/ 1);\n// llama_batch_init allocates only one of token/embd; eagle3 decoder needs both.\n// TODO: fix, how to call without malloc\nbatch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);\n```\nHowever, the destructor calls `llama_batch_free(batch)`.\n```cpp\n~common_speculative_impl_draft_eagle3() override {\n    //"
+      }
+    }
+  ],
+  "created": 1790539714,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 256,
+    "prompt_tokens": 88891,
+    "total_tokens": 89147,
+    "prompt_tokens_details": {
+      "cached_tokens": 88887
+    }
+  },
+  "id": "chatcmpl-hCHEMI5eVVYzePtikAtQlZJJSlAQyfCT",
+  "timings": {
+    "cache_n": 88887,
+    "prompt_n": 4,
+    "prompt_ms": 376.372,
+    "prompt_per_token_ms": 94.093,
+    "prompt_per_second": 10.627783150712592,
+    "predicted_n": 256,
+    "predicted_ms": 13186.853,
+    "predicted_per_token_ms": 51.71314901960784,
+    "predicted_per_second": 19.337441617040852,
+    "draft_n": 614,
+    "draft_n_accepted": 167
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "#include \"speculative.h\"\n\n#include \"common.h\"\n#include \"ggml.h\"\n#include \"ggml-cpp.h\"\n#include \"llama.h\"\n#include \"log.h\"\n#include \"ngram-cache.h\"\n#include \"ngram-map.h\"\n#include \"ngram-mod.h\"\n#include \"sampling.h\"\n\n#include \"../src/llama-ext.h\" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)\n\n#include <algorithm>\n#include <cassert>\n#include <cmath>\n#include <cstring>\n#include <iomanip>\n#include <map>\n#include <cinttypes>\n\n#define SPC_DBG(fmt, ...) LOG_DBG(\"spec %12.*s: \" fmt, 12, __func__, __VA_ARGS__)\n#define SPC_TRC(fmt, ...) LOG_TRC(\"spec %12.*s: \" fmt, 12, __func__, __VA_ARGS__)\n#define SPC_INF(fmt, ...) LOG_INF(\"spec %12.*s: \" fmt, 12, __func__, __VA_ARGS__)\n#define SPC_WRN(fmt, ...) LOG_WRN(\"spec %12"
+      }
+    }
+  ],
+  "created": 1790536699,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11171-683d99358",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 256,
+    "prompt_tokens": 2251,
+    "total_tokens": 2507,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-ABiwOzWNmnznBHpxGqghBh103BAlBeAQ",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 2251,
+    "prompt_ms": 2341.697,
+    "prompt_per_token_ms": 1.0402918702798756,
+    "prompt_per_second": 961.2686867686126,
+    "predicted_n": 256,
+    "predicted_ms": 1161.268,
+    "predicted_per_token_ms": 4.553992156862745,
+    "predicted_per_second": 219.5875542940992,
+    "draft_n": 281,
+    "draft_n_accepted": 237
+  }
+}

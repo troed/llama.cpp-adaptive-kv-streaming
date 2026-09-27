@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code, here are the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical: Use-After-Free / Dangling Pointer in `common_speculative_impl_draft_eagle3`\n**File:** `speculative.h` (implied, based on includes) / `common_speculative_impl_draft_eagle3`\n**Function:** `process()`\n\nIn the `process` method of `common_speculative_impl_draft_eagle3`, the code iterates over sequences and attempts to bridge a \"deferred boundary\" from a previous ubatch.\n\n```cpp\n// Inside process()\nfor (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {\n    // ...\n    const llama_pos pending_pos = pending_pos_last[seq_id];\n    if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg]) {\n        const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);\n        if (pending_pos > dft_pos_max) {\n            common_batch_add(batch, batch_in.token[beg], pending_pos, {"
+      }
+    }
+  ],
+  "created": 1790539903,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 256,
+    "prompt_tokens": 88906,
+    "total_tokens": 89162,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-qo38Ck1IwN8mdhOCdU2a7LXLYKLCx6Pn",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 88906,
+    "prompt_ms": 134506.327,
+    "prompt_per_token_ms": 1.5129049445481744,
+    "prompt_per_second": 660.9800593246443,
+    "predicted_n": 256,
+    "predicted_ms": 12893.554,
+    "predicted_per_token_ms": 50.5629568627451,
+    "predicted_per_second": 19.777324390156508
+  }
+}

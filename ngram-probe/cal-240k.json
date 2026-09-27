@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code, here are the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical: Use-After-Free / Double Free in `common_speculative_impl_draft_eagle3` Destructor\n**File:** `speculative.h` (implied, based on includes) / `"
+      }
+    }
+  ],
+  "created": 1790539377,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 64,
+    "prompt_tokens": 62520,
+    "total_tokens": 62584,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-jwumjPQrYKVr3y9A22yFtWnsrocRQhJP",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 62520,
+    "prompt_ms": 86204.01,
+    "prompt_per_token_ms": 1.3788229366602687,
+    "prompt_per_second": 725.2562844814296,
+    "predicted_n": 64,
+    "predicted_ms": 2463.621,
+    "predicted_per_token_ms": 39.10509523809524,
+    "predicted_per_second": 25.572115191419456,
+    "draft_n": 140,
+    "draft_n_accepted": 33
+  }
+}

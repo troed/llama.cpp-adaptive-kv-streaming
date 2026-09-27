@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code, here are the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical: Use-After-Free / Dangling Pointer in `common_speculative_impl_draft_eagle3`\n**File:** `speculative.h` (implied, based on includes) / `common_speculative_impl_draft_eagle3`\n**Function:** `process()`\n\nIn the `process` method of `common_speculative_impl_draft_eagle3`, the code iterates over sequences and attempts to write to `batch.embd`.\n\n```cpp\n// Inside process()\nfor (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {\n    // ...\n    // cross-ubatch bridge\n    if (pending_pos >= 0 && pending_pos + 1 == batch_in.pos[beg]) {\n        // ...\n        common_batch_add(batch, batch_in.token[beg], pending_pos, { seq_id }, /*logits=*/ false);\n        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,\n                    pending_g_last[seq_id].data"
+      }
+    }
+  ],
+  "created": 1790540948,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 256,
+    "prompt_tokens": 88813,
+    "total_tokens": 89069,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-gOzGpIH6yhayFXVfPUUW01ESdWOSVIWD",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 88813,
+    "prompt_ms": 134275.369,
+    "prompt_per_token_ms": 1.511888676207312,
+    "prompt_per_second": 661.4243599658251,
+    "predicted_n": 256,
+    "predicted_ms": 12911.175,
+    "predicted_per_token_ms": 50.63205882352941,
+    "predicted_per_second": 19.750332560746795
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code, here are the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical: Use-After-Free / Dangling Pointer in `common_speculative_impl_draft_eagle3`\n**File:** `speculative.h` (implied, based on includes) / `"
+      }
+    }
+  ],
+  "created": 1790539526,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 64,
+    "prompt_tokens": 88891,
+    "total_tokens": 88955,
+    "prompt_tokens_details": {
+      "cached_tokens": 83940
+    }
+  },
+  "id": "chatcmpl-mnRIx8SBu8grI2mxduzZleARbgN1qhKT",
+  "timings": {
+    "cache_n": 83940,
+    "prompt_n": 4951,
+    "prompt_ms": 9904.512,
+    "prompt_per_token_ms": 2.000507372248031,
+    "prompt_per_second": 499.8731891081559,
+    "predicted_n": 64,
+    "predicted_ms": 3278.352,
+    "predicted_per_token_ms": 52.03733333333333,
+    "predicted_per_second": 19.21697243005022
+  }
+}

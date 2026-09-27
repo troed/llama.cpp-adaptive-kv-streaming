@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Based on the provided code snippet, here is a review of the concrete bugs and design problems, ordered by severity.\n\n### 1. Critical Logic Bug:"
+      }
+    }
+  ],
+  "created": 1790544757,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11172-95ed6b4b2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 32,
+    "prompt_tokens": 2230,
+    "total_tokens": 2262,
+    "prompt_tokens_details": {
+      "cached_tokens": 2226
+    }
+  },
+  "id": "chatcmpl-5IzpgG7fZRUWKl00FBvnPsH4C7hdY0z4",
+  "timings": {
+    "cache_n": 2226,
+    "prompt_n": 4,
+    "prompt_ms": 156.413,
+    "prompt_per_token_ms": 39.10325,
+    "prompt_per_second": 25.573321910582877,
+    "predicted_n": 32,
+    "predicted_ms": 524.264,
+    "predicted_per_token_ms": 16.91174193548387,
+    "predicted_per_second": 59.130514397326536,
+    "draft_n": 29,
+    "draft_n_accepted": 20
+  }
+}

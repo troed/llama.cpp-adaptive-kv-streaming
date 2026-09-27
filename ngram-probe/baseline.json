@@ -1,0 +1,39 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need answer user's request: review code above, list concrete bugs and design problems, most important first, specific about file and function. Need analyze provided C++ code. It's truncated at end: virtual void set_state(llama_ ... incomplete. Need identify bugs/design issues.\n\nWe need produce final answer. Need think thoroughly.\n\nCode includes speculative.h, common.h, ggml, llama, log, ngram-cache, ngram-map, ngram-mod, sampling, ../src/llama-ext.h staging API. Defines macros, constants, map, functions, struct config, compatibility check, impl base.\n\nNeed list concrete bugs and design problems, most important first. Specific file and function. File likely speculative.cpp? The code includes \"speculative.h\" and likely in common/speculative.cpp? We can refer to file as speculative.cpp (or the shown file). Functions: common_speculative_get_devices_str, common_speculative_are_compatible, common_speculative_impl, etc.\n\nNeed identify concrete bugs:\n\n1. common_speculative_are_compatible: token text comparison uses std::strcmp on llama_vocab_get_text. If token text can be nullptr? In llama.cpp, llama_vocab_get_text returns const char* maybe nullptr for special tokens?"
+      }
+    }
+  ],
+  "created": 1790536091,
+  "model": "Qwen3.8-27B",
+  "system_fingerprint": "b11171-683d99358",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 256,
+    "prompt_tokens": 2270,
+    "total_tokens": 2526,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-uSRuwWpENjh2fyl1mfBWZWsjzCsjzh32",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 2270,
+    "prompt_ms": 2652.56,
+    "prompt_per_token_ms": 1.1685286343612336,
+    "prompt_per_second": 855.7770606508429,
+    "predicted_n": 256,
+    "predicted_ms": 5503.788,
+    "predicted_per_token_ms": 21.583482352941175,
+    "predicted_per_second": 46.33172644004457,
+    "draft_n": 504,
+    "draft_n_accepted": 153
+  }
+}

@@ -1587,6 +1587,60 @@ bool llama_context::kv_stream_draft_set(bool draft_active) {
     return true;
 }
 
+// Resize the decode verify batch the phase arena tolerates. The draft toggle
+// zeroes the width on eject; a speculator that survives the eject (an ngram
+// implementation needs no draft context) needs the room back, or its verify
+// batch is rejected as too wide.
+bool llama_context::kv_stream_set_spec_draft_width(uint32_t n_max) {
+    auto & arena = kv_stream_phase_arena;
+
+    if (!arena.configured) {
+        return false;
+    }
+    if (cparams.spec_draft) {
+        // a pinned draft owns the layout width
+        return false;
+    }
+    if (n_max > spec_n_max_spec_draft) {
+        return false;
+    }
+    if (cparams.n_max_spec_draft == n_max) {
+        return true;
+    }
+    if (arena.backend_index >= backend_ptrs.size()) {
+        LLAMA_LOG_ERROR("%s: invalid phase-arena backend index\n", __func__);
+        return false;
+    }
+
+    synchronize();
+    if (sched && !arena.graph_reset_fn(backend_ptrs[arena.backend_index])) {
+        LLAMA_LOG_ERROR("%s: failed to invalidate CUDA graphs before the draft width change\n", __func__);
+        return false;
+    }
+    for (auto & prev_res : gf_res_prev) {
+        if (prev_res) {
+            prev_res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+    gf_res_reserve->reset();
+    sched.reset();
+
+    cparams.n_max_spec_draft = n_max;
+
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: failed to re-reserve for the draft width: %s\n", __func__, e.what());
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: draft width = %u, arena = %.2f MiB\n", __func__,
+            n_max, arena.arena_bytes/1024.0/1024.0);
+    return true;
+}
+
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
@@ -5268,6 +5322,15 @@ bool llama_kv_stream_draft_set(llama_context * ctx, bool draft_active) {
         return ctx->kv_stream_draft_set(draft_active);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: exception during draft toggle: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+bool llama_kv_stream_set_spec_draft_width(llama_context * ctx, uint32_t n_max) {
+    try {
+        return ctx->kv_stream_set_spec_draft_width(n_max);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: exception during draft width change: %s\n", __func__, e.what());
         return false;
     }
 }
