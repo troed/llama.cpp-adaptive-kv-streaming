@@ -81,17 +81,25 @@ MTP works as well if you prefer that to DFlash2.
 Both MTP and DFlash2 drafts work with the phase arena, on the same pinned-draft
 machinery: the draft weights (and, for MTP, the draft KV) are reserved in the
 target arena, and the dynamic eject below trades the draft for decode capacity
-as the working set grows. Only one pinned draft type can be active at a time:
-if `--spec-type` mixes MTP or DFlash2 with a non-pinned speculator (for example
-`draft-mtp,ngram-mod`), the server disables dynamic eject with a warning and
-keeps the draft pinned for the whole run. You likely don't want that.
+as the working set grows. Only one pinned draft family can be active at a time.
+
+A pinned draft can be mixed with an ngram speculator (for example
+`draft-dflash,ngram-simple`). The pinned draft is still ejected when the working
+set grows, but the ngram speculator keeps drafting through the eject: it needs
+no draft model and no pinned arena bytes, so decode keeps a small draft win at
+long context instead of losing speculation entirely. The ngram speculator is
+first in the priority chain and the pinned draft fills the remaining draft
+rounds.
 
 | draft | `--spec-type` | draft source | notes |
 |---|---|---|---|
 | DFlash2 | `draft-dflash` | [the condensed DFlash2 draft](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed) (the TLDR model) | the draft has no token embedding and embeds through the target's `token_embd`, so its vocabulary must match the target's; its five KV layers are all sliding-window (window 2048) and stay in ordinary VRAM, so the pin is only the weights plus the widened recurrent-state cache |
-| MTP | `draft-mtp` | the MTP block extracted from the target GGUF (see [Creating a separate MTP model](#creating-a-separate-mtp-model)), or a separate MTP GGUF via `-md` | the MTP block weights and the nextn KV are pinned in the target arena |
+| MTP | `draft-mtp` | the target's own embedded MTP block, with no `-md` (see [MTP uses the target's embedded block](#mtp-uses-the-targets-embedded-block)) | the MTP block weights and the nextn KV are pinned in the target arena |
 
-ngram-map and ngram-simple currently produce zero drafts in this configuration.
+The ngram speculators draft from the model's own token history, so they pay off
+when the output repeats text (quoting, copying, structured edits) and stay close
+to idle on fresh prose. `ngram-mod` needs a 24-token match and drafts least;
+`ngram-simple` and `ngram-map-k` share a 12-token key.
 
 ## Results
 
@@ -130,6 +138,14 @@ Full numbers: [benchmarks/results/draft-thresholds.csv](benchmarks/results/draft
 Reproduce with `benchmarks/benchmark_mtp_streaming.py` (MTP and DFlash2),
 `benchmarks/benchmark_upstream_vs_mtp.py` (upstream), and
 `benchmarks/plot_draft_thresholds.py` (combined table and figure).
+
+### Drafting after the eject
+
+With `spec-type = draft-dflash,ngram-simple` the pinned draft is ejected at the
+same working-set threshold as above, and the ngram speculator keeps drafting.
+Measured at the same prompt and 256 generated tokens, the pinned-only arm stops
+drafting after the eject while the mix arm keeps a nonzero draft count, and
+decode runs at 20.4 t/s against 19.4 t/s with `spec-type = none`.
 
 ### MTP KV quantization
 
@@ -177,9 +193,12 @@ The window grows by 14 to 18 pages, which moves the MTP crossover from about
   (DFlash2's sliding-window KV stays in ordinary VRAM).
 - The draft block weights can be allocated from the same pinned region, so an
   evicted draft returns both its KV and its weights to the arena pool.
-- A separate MTP-only GGUF can be supplied with `-md` while using
-  `--spec-type draft-mtp`. The target then skips its embedded MTP tensors
-  (`load_mtp = false`), and the draft borrows the target's LM head.
+- MTP needs no separate model: `--spec-type draft-mtp` alone makes the target
+  keep its embedded MTP block, and the draft context is created against the
+  target model. A separate MTP-only GGUF via `-md` makes the target skip its
+  embedded MTP tensors (`load_mtp = false`) instead; measured here that route
+  accepted none of its draft tokens (see
+  [MTP uses the target's embedded block](#mtp-uses-the-targets-embedded-block)).
 - The pin, window cap, and dynamic eject are generalized to any pinned draft
   (MTP or DFlash2). A pinned draft reserves its weights and the widened
   recurrent-state cache in the target arena; MTP additionally pins its nextn
@@ -214,18 +233,30 @@ The window grows by 14 to 18 pages, which moves the MTP crossover from about
 ### Speculative decoding
 - `--spec-type draft-mtp` / `--spec-type draft-dflash`: enable the MTP or
   DFlash2 draft.
-- `-md <file>`: separate draft GGUF. For MTP the target then skips its embedded
-  MTP tensors (`load_mtp = false`) and the draft borrows the target LM head.
+- `-md <file>`: separate draft GGUF. Use it for DFlash2 drafts. For MTP it makes
+  the target skip its embedded MTP tensors (`load_mtp = false`) and the draft
+  borrows the target LM head, but measured acceptance of that route is zero, so
+  run MTP without `-md`.
 - `--spec-draft-n-max N`: number of draft tokens. It also widens the target
   recurrent-state cache and the decode compute slab.
 - `--spec-draft-type-k T` / `--spec-draft-type-v T`: draft KV cache types
   (default F16). The main `--cache-type-k`/`--cache-type-v` do not affect the
   draft.
 
-### Creating a separate MTP model
+### MTP uses the target's embedded block
 
-The MTP block can be split out of a merged GGUF with
-`gguf-py/gguf/scripts/gguf_extract_mtp.py`:
+`--spec-type draft-mtp` needs no `-md`: the target loads its own MTP block and
+the draft context is created against the target model, which also donates the
+LM head. Measured on this stack with `spec-draft-n-max = 3`: 83 of 131 draft
+tokens accepted on a 2230-token prompt, and 178 of 228 at 91K prompt tokens.
+An extracted MTP file passed through `-md` accepted 0 of 375, for both
+`Qwen3.8-27B-IQ4_XS-ASCII-Condensed-MTP.gguf` and
+`Qwen3.8-27B-UD-IQ4_XS-ASCII-Condensed-MTP.gguf`; `-md` also makes the target
+skip the MTP tensors it already carries.
+
+The MTP block can still be split out of a merged GGUF with
+`gguf-py/gguf/scripts/gguf_extract_mtp.py`, but do not pass the result as `-md`
+for an MTP draft:
 
 ```sh
 python3 gguf-py/gguf/scripts/gguf_extract_mtp.py \
@@ -235,8 +266,9 @@ python3 gguf-py/gguf/scripts/gguf_extract_mtp.py \
 
 The output keeps the target vocab metadata (`token_embd`, `output_norm`) and the
 `blk.<mtp>.` block. It deliberately drops `output.weight` so the draft borrows
-the target LM head; pass `--with-lm-head` to keep it. Use the result with
-`-md <file>`; the target then skips its embedded MTP tensors, saving their VRAM.
+the target LM head; pass `--with-lm-head` to keep it. That file is the `-md`
+route measured above: it loads and drafts, but it accepted nothing on this
+stack, so prefer the target's embedded block.
 
 ### Dynamic draft eject (unique to this fork, opt-in)
 - `--kv-stream-spec-dynamic`: eject the draft when the decode working set
