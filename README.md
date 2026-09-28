@@ -32,18 +32,24 @@ cmake --build build --config Release -j
 
 -DGGML_CUDA_FA_QUANTS selects which K/V cache type combinations get Flash Attention kernels compiled: `type_K-type_V` pairs separated by `;` (legal types `f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0`; f16-f16 is always compiled). `GGML_CUDA_FA_ALL_QUANTS` is a deprecated alias for `=all`.
 
-* Download a suitably small Qwen model and a tiny DFlash2 draft
+* Download a suitably small Qwen model
 
-[ASCII condensed Qwen 3.8 27B ByteShape IQ4_XS and matching condensed DFlash2](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed)
+[ASCII condensed Qwen 3.8 27B ByteShape IQ4_XS](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed)
+
+The MTP draft is the target's own embedded block, so no separate draft model is
+needed. A condensed DFlash2 draft is in the same repo if you prefer that.
 
 * Use the following parameters (models-preset.ini format) when launching llama-server
 
 ```
 m = Qwen3.8-27B-ASCII-Condensed-IQ4_XS-3.84bpw.gguf
-md = Qwen3.8-27B-ASCII-Condensed-DFlash2-Q2_K_S-MIX.gguf
+spec-type = ngram-simple,draft-mtp
+spec-draft-n-max = 5
+# stop the MTP draft early when its top-1 probability drops below this
+spec-draft-p-min = 0.7
 device-draft = CUDA0
 n-gpu-layers-draft = all
-ctx-size = 160000
+ctx-size = 200000
 n-gpu-layers = 99
 batch-size = 256
 ubatch-size = 256
@@ -51,10 +57,8 @@ ubatch-size = 256
 kv-stream-arena-mib = 4352
 cache-type-k = q8_0
 cache-type-v = q4_0
-spec-type = draft-dflash
-spec-draft-n-max = 5
 kv-stream-spec-dynamic = on
-kv-stream-spec-keep-pages = 334
+kv-stream-spec-keep-pages = 450
 kv-stream-spec-reenable-pages = 8
 kv-stream-spec-stable-decodes = 4
 fit = off
@@ -72,9 +76,14 @@ no-mmproj-offload = on
 mmproj = Qwen3.8-mmproj-BF16.gguf
 load-mode = none
 flash-attn = on
+threads = 16
+threads-batch = 16
 ```
 
-MTP works as well if you prefer that to DFlash2.
+DFlash2 works as well if you prefer it: point `md` at a condensed DFlash2
+draft and set `spec-type = draft-dflash` instead. The ngram speculator in the
+mix above keeps drafting after the pinned draft is ejected (see
+[Drafting after the eject](#drafting-after-the-eject)).
 
 ## Speculative decoding
 
@@ -93,8 +102,8 @@ rounds.
 
 | draft | `--spec-type` | draft source | notes |
 |---|---|---|---|
-| DFlash2 | `draft-dflash` | [the condensed DFlash2 draft](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed) (the TLDR model) | the draft has no token embedding and embeds through the target's `token_embd`, so its vocabulary must match the target's; its five KV layers are all sliding-window (window 2048) and stay in ordinary VRAM, so the pin is only the weights plus the widened recurrent-state cache |
-| MTP | `draft-mtp` | the target's own embedded MTP block, with no `-md` (see [MTP uses the target's embedded block](#mtp-uses-the-targets-embedded-block)) | the MTP block weights and the nextn KV are pinned in the target arena |
+| MTP | `draft-mtp` | the target's own embedded MTP block, with no `-md` (the TLDR model; see [MTP uses the target's embedded block](#mtp-uses-the-targets-embedded-block)) | the MTP block weights and the nextn KV are pinned in the target arena |
+| DFlash2 | `draft-dflash` | [the condensed DFlash2 draft](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed) | the draft has no token embedding and embeds through the target's `token_embd`, so its vocabulary must match the target's; its five KV layers are all sliding-window (window 2048) and stay in ordinary VRAM, so the pin is only the weights plus the widened recurrent-state cache |
 
 The ngram speculators draft from the model's own token history, so they pay off
 when the output repeats text (quoting, copying, structured edits) and stay close
@@ -242,6 +251,8 @@ The window grows by 14 to 18 pages, which moves the MTP crossover from about
 - `--spec-draft-type-k T` / `--spec-draft-type-v T`: draft KV cache types
   (default F16). The main `--cache-type-k`/`--cache-type-v` do not affect the
   draft.
+- `--spec-draft-p-min P`: stop drafting early once the draft's top-1
+  probability drops below P (default 0.0: disabled).
 
 ### MTP uses the target's embedded block
 
