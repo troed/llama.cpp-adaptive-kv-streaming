@@ -19,7 +19,7 @@ cache streaming results.
 
 ## Upstream sync status
 
-- ggml-org/llama.cpp: master `1af554f8f` (2026-09-19)
+- ggml-org/llama.cpp: master `6c7a87f7e` (2026-09-28)
 - RaymondHuang210129/llama.cpp-adaptive-kv-streaming: master `f280b2698` (2026-08-24)
 
 ## Performance
