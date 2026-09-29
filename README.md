@@ -1,3 +1,9 @@
+# SUPERSEDED
+
+The point of this fork was to add speculative decoding to Raymond's KV cache
+streaming work. Since they have now released their own implementation of MTP
+upstream should be used instead of this.
+
 # llama.cpp adaptive KV streaming - spec fork notes
 
 This repository is a fork of
