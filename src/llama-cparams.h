@@ -17,6 +17,7 @@ struct llama_cparams {
     size_t kv_stream_pool_bytes = 0;
     size_t shared_device_memory_bytes = 0;
     uint32_t kv_stream_auxiliary_layers = 0;
+    uint32_t kv_stream_verify_width = 1;
     bool kv_streaming() const noexcept {
         return kv_stream_pool_bytes || shared_device_memory_bytes;
     }

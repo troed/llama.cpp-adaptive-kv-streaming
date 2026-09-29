@@ -286,6 +286,16 @@ llama_context::llama_context(
     if (cparams.kv_stream_pool_bytes && cparams.shared_device_memory_bytes) {
         throw std::runtime_error("kv_stream_pool_bytes and shared_device_memory_bytes are mutually exclusive");
     }
+    cparams.kv_stream_verify_width = std::max(1u, params.kv_stream_verify_width);
+    const uint32_t verify_limit = std::min(cparams.n_ctx, cparams.n_ubatch);
+    if (cparams.kv_stream_verify_width > verify_limit) {
+        LLAMA_LOG_WARN("%s: streamed verify width %u clamped to %u\n", __func__,
+            cparams.kv_stream_verify_width, verify_limit);
+        cparams.kv_stream_verify_width = verify_limit;
+    }
+    if (cparams.kv_streaming()) {
+        LLAMA_LOG_INFO("%s: streamed verify width %u\n", __func__, cparams.kv_stream_verify_width);
+    }
     if (params.kv_stream_pool_bytes || params.shared_device_memory_bytes) {
         if (model.arch != LLM_ARCH_QWEN35 || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_other ||
                 hparams.no_alloc || hparams.vocab_only || model.devices.size() != 1 || cparams.n_seq_max != 1 ||
@@ -489,6 +499,7 @@ llama_context::llama_context(
             params_mem.kv_stream_auxiliary_layers = cparams.kv_stream_auxiliary_layers;
             params_mem.kv_stream_rs_rollback = streamed_rs_rollback;
             params_mem.kv_stream_max_rows = cparams.n_ubatch;
+            params_mem.kv_stream_verify_width = cparams.kv_stream_verify_width;
             for (auto & backend : backends) if (ggml_backend_get_device(backend.get()) == model.devices.front().dev) {
                 params_mem.kv_stream_backend = backend.get(); break;
             }
@@ -884,10 +895,9 @@ void llama_context::sched_reserve() {
             }
         }
         // A verify batch runs a wider decode graph than the single-token TG path; include it in the
-        // decode-phase grant at the width the streamed span path can serve.
-        const uint32_t verify_width = cparams.kv_streaming() ?
-            std::min<uint32_t>(KV_STREAM_SPAN_QUERY_WIDTH, LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1) :
-            LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
+        // decode-phase grant at the width the streamed path will actually serve.
+        const uint32_t verify_width = cparams.kv_streaming() || cparams.mtp_publish_host ?
+            cparams.kv_stream_verify_width : LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
         if ((cparams.kv_streaming() || cparams.mtp_publish_host) && n_seqs == 1 && verify_width > 1) {
             const uint32_t width = std::min(n_tokens, verify_width);
             std::vector<size_t> verify_one(backend_ptrs.size());
@@ -2360,9 +2370,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 return -2;
             }
         }
-        const bool supported_verify = cparams.kv_stream_auxiliary_layers == 1 &&
-            text_phase == llama_memory_text_phase::decode &&
-            n_tokens_all >= 2 && n_tokens_all <= 4;
+        const bool supported_verify = text_phase == llama_memory_text_phase::decode &&
+            n_tokens_all >= 2 && n_tokens_all <= cparams.kv_stream_verify_width;
         const auto transitions = compute_memory->phase_transition_count();
         const auto phase_result = compute_memory->signal_text_phase({
             text_phase,
@@ -2379,8 +2388,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         if (compute_memory->phase_transition_count() != transitions || shared_workspace_replanned) {
             auto reserve_context = memory->init_full();
-            const uint32_t decode_width = cparams.kv_stream_auxiliary_layers ?
-                std::min(4u, std::min(cparams.n_ctx, cparams.n_ubatch)) : cparams.n_seq_max;
+            const uint32_t decode_width = std::max(cparams.n_seq_max,
+                std::min(cparams.kv_stream_verify_width, std::min(cparams.n_ctx, cparams.n_ubatch)));
             const uint32_t reserve_tokens = text_phase == llama_memory_text_phase::decode ?
                 decode_width : std::min(cparams.n_ctx,cparams.n_ubatch);
             const uint32_t reserve_outputs = text_phase == llama_memory_text_phase::decode ?
@@ -4496,6 +4505,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_stream_pool_bytes        =*/ 0,
         /*.shared_device_memory_bytes   =*/ 0,
         /*.kv_stream_auxiliary_layers   =*/ 0,
+        /*.kv_stream_verify_width       =*/ 1,
     };
 
     return result;

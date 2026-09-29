@@ -1769,6 +1769,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_stream_pool_bytes = params.kv_stream_pool_bytes;
     cparams.shared_device_memory_bytes = params.shared_device_memory_bytes;
     cparams.kv_stream_auxiliary_layers = params.kv_stream_auxiliary_layers;
+    const int32_t verify_draft = common_speculative_n_max(&params.speculative);
+    const bool verify_streams = cparams.kv_stream_pool_bytes || cparams.shared_device_memory_bytes;
+    cparams.kv_stream_verify_width = verify_streams && verify_draft > 0 ?
+        uint32_t(verify_draft) + 1 : 1;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;

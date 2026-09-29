@@ -633,7 +633,7 @@ std::unique_ptr<llama_kv_stream_session> llama_kv_stream_session::create(ggml_ba
 bool llama_kv_stream_session::begin(size_t active, uint32_t queries, bool decode) {
     auto & s = *impl;
     if (s.busy || s.transition_closed || s.running || s.poisoned || !s.publications || s.publications->failed() || s.publication.pending() || !s.leases[2] ||
-            !queries || queries > s.config.max_batch_rows || (decode && queries > 4) ||
+            !queries || queries > s.config.max_batch_rows || (decode && queries > s.config.verify_width) ||
             active < s.committed || active-s.committed != queries || active > s.content->host()->config().context_tokens) return false;
     session_operation guard(s.busy);
     if (s.content->generation() != s.expected_generation) { s.drain(); s.poisoned = true; return false; }
