@@ -1,3 +1,4 @@
+#include "llama.h"
 #include "kv-stream-block-test.h"
 #include "../src/llama-kv-stream-model.h"
 #include "../src/llama-kv-stream-logical-cache.h"
@@ -1430,23 +1431,24 @@ int main(int argc,char ** argv) {
                 mtp->publish_host(write) && mtp->finish())) return;
         ggml_backend_buffer_clear(model->buffer(), 0);
         if (!t.assert_true(model->restore(258))) return;
-        t.assert_true(model->acquire_mtp_layer(4));
-        t.assert_equal(size_t(262), model->mtp_reserved_tokens());
+        t.assert_true(model->acquire_mtp_layer(LLAMA_KV_STREAM_MTP_DRAFT_MAX));
+        t.assert_equal(size_t(263), model->mtp_reserved_tokens());
         t.assert_true(model->has_mtp_layer());
         t.assert_true(!model->truncate(256));
         t.assert_true(!model->prepare_shared_memory());
         const auto copied = model->mtp_layer_population();
         t.assert_true(copied.bytes > 0 && copied.calls > 0);
-        for (uint32_t width = 1; width <= 4; ++width) {
+        for (uint32_t width = 1; width <= KV_STREAM_SPAN_QUERY_WIDTH; ++width) {
             t.assert_true(model->mtp_layer_plan(width) != nullptr);
             t.assert_equal(copied.bytes, model->mtp_layer_population().bytes);
         }
+        t.assert_true(model->mtp_layer_plan(KV_STREAM_SPAN_QUERY_WIDTH + 1) == nullptr);
         auto get = reinterpret_cast<ggml_kv_stream_partial_ops_get>(
             ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(dev), "ggml_backend_kv_stream_partial_ops"));
         const auto * ops = get ? get() : nullptr;
         if (!t.assert_true(ops && ops->version >= 7 && ops->spans && ops->spans_workspace)) return;
-        for (uint32_t width = 1; width <= 4; ++width) {
+        for (uint32_t width = 1; width <= KV_STREAM_SPAN_QUERY_WIDTH; ++width) {
             block_inputs input(f, 257, width);
             const auto expected = stock_attention(f, input, 0);
             ggml_context_ptr ctx(ggml_init({65536, nullptr, true}));
@@ -1490,13 +1492,13 @@ int main(int argc,char ** argv) {
         if (!t.assert_true(model->advance_mtp_layer_tail())) return;
         const auto extended = model->mtp_layer_population();
         t.assert_equal(copied.bytes + layout.k_token_bytes + layout.v_token_bytes, extended.bytes);
-        for (uint32_t width = 1; width <= 4; ++width) {
+        for (uint32_t width = 1; width <= KV_STREAM_SPAN_QUERY_WIDTH; ++width) {
             ggml_kv_stream_span_plan_view renewed;
             if (!t.assert_true(ggml_kv_stream_span_plan_get_view(
                     model->mtp_layer_plan(width), renewed))) return;
             t.assert_equal(size_t(258), renewed.active_tokens);
         }
-        for (size_t token = 258; token < 262; ++token) {
+        for (size_t token = 258; token < 263; ++token) {
             std::vector<uint8_t> next_k(static_cast<const uint8_t *>(seed.k) +
                     token*layout.k_token_bytes,
                 static_cast<const uint8_t *>(seed.k) + (token + 1)*layout.k_token_bytes);
@@ -1524,7 +1526,7 @@ int main(int argc,char ** argv) {
         if (!t.assert_true(model->truncate_mtp_layer(260))) return;
         t.assert_equal(size_t(260), mtp->tokens());
         t.assert_true(model->has_mtp_layer());
-        t.assert_equal(size_t(262), model->mtp_reserved_tokens());
+        t.assert_equal(size_t(263), model->mtp_reserved_tokens());
         t.assert_equal(before_reject.bytes, model->mtp_layer_population().bytes);
         ggml_kv_stream_span_plan_view accepted_plan;
         if (!t.assert_true(ggml_kv_stream_span_plan_get_view(

@@ -533,9 +533,15 @@ int main(int argc,char ** argv) {
             context_ptr unsafe(llama_init_from_model(model.get(),invalid),llama_free);
             t.assert_true(!unsafe);
             invalid=p;
-            invalid.n_rs_seq=4;
+            invalid.n_rs_seq=LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
             context_ptr too_deep(llama_init_from_model(model.get(),invalid),llama_free);
             t.assert_true(!too_deep);
+            {
+                auto widest=p;
+                widest.n_rs_seq=LLAMA_KV_STREAM_MTP_DRAFT_MAX;
+                context_ptr deep(llama_init_from_model(model.get(),widest),llama_free);
+                t.assert_true(bool(deep));
+            }
             context_ptr ctx(llama_init_from_model(model.get(),p),llama_free);
             if (!t.assert_true(bool(ctx))) return;
             t.assert_equal(uint32_t(3),llama_n_rs_seq(ctx.get()));

@@ -271,30 +271,18 @@ static void test(void) {
         common_params full_checkpoint;
         assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),full_checkpoint,LLAMA_EXAMPLE_SERVER));
         assert(common_context_params_to_llama(full_checkpoint).n_rs_seq == 0);
-        common_params automatic_mtp;
-        argv = {"binary_name","--kv-stream-arena-mib","2240",
-            "--spec-type","draft-mtp","--spec-draft-n-max","3"};
-        assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),automatic_mtp,LLAMA_EXAMPLE_SERVER));
-        assert(automatic_mtp.kv_stream_auxiliary_layers == 0);
-        assert(common_kv_stream_auxiliary_layers(automatic_mtp,1) == 1);
-        assert(common_context_params_to_llama(automatic_mtp).n_rs_seq == 3);
-        argv.push_back("--no-kv-stream-rs-rollback");
-        common_params automatic_full_checkpoint;
-        assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),automatic_full_checkpoint,LLAMA_EXAMPLE_SERVER));
-        assert(common_context_params_to_llama(automatic_full_checkpoint).n_rs_seq == 0);
-        common_params multiple_heads;
-        argv = {"binary_name","--kv-stream-arena-mib","2240",
-            "--kv-stream-auxiliary-layers","3","--spec-type","draft-mtp"};
-        assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),multiple_heads,LLAMA_EXAMPLE_SERVER));
-        assert(common_kv_stream_auxiliary_layers(multiple_heads,3) == 3);
+        for (const char * accepted : {"4", "5"}) {
+            common_params wide;
+            argv = {"binary_name","--shared-device-memory-mib","4096",
+                "--kv-stream-auxiliary-layers","1","--spec-type","draft-mtp",
+                "--spec-draft-n-max",accepted};
+            assert(common_params_parse(argv.size(),list_str_to_char(argv).data(),wide,LLAMA_EXAMPLE_SERVER));
+            assert(common_context_params_to_llama(wide).n_rs_seq == uint32_t(std::stoi(accepted)));
+        }
         for (const std::vector<std::string> & invalid_rollback : {
                 std::vector<std::string>{"binary_name","--shared-device-memory-mib","4096",
                     "--kv-stream-auxiliary-layers","1","--spec-type","draft-mtp",
-                    "--spec-draft-n-max","4"},
-                std::vector<std::string>{"binary_name","--kv-stream-arena-mib","2240",
-                    "--spec-type","draft-mtp","--spec-draft-n-max","4"},
-                std::vector<std::string>{"binary_name","--spec-type","draft-mtp",
-                    "--no-kv-stream-rs-rollback"}}) {
+                    "--spec-draft-n-max","6"}}) {
             common_params rejected;
             argv = invalid_rollback;
             assert(!common_params_parse(argv.size(),list_str_to_char(argv).data(),rejected,LLAMA_EXAMPLE_SERVER));

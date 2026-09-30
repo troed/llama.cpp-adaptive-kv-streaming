@@ -1387,6 +1387,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// A positive per-round ceiling overrides the configured draft length.
+static int32_t mtp_effective_n_max(const common_speculative_draft_params & dp, int32_t configured) {
+    return dp.n_max > 0 ? std::min(configured, dp.n_max) : configured;
+}
+
+// A streamed target narrows the draft chain to the span width until it becomes resident.
+static int32_t mtp_streamed_draft_max(int32_t cap, bool streamed, bool fully_resident, uint32_t narrow) {
+    return streamed && !fully_resident ? std::min(cap, int32_t(narrow)) : cap;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1622,7 +1632,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             bool ok = true;
             if (n_tokens <= 4 && !llama_kv_stream_mtp_prepare(ctx_tgt,
-                    uint32_t(std::clamp(params.n_max, 0, 4)))) {
+                    uint32_t(std::clamp(params.n_max, 0, LLAMA_KV_STREAM_MTP_DRAFT_MAX)))) {
                 SPC_ERR("%s", "failed to acquire the adaptive MTP KV lease for catch-up\n");
                 return false;
             }
@@ -1720,10 +1730,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
         }
-        if (n_drafting > 0 && !llama_kv_stream_mtp_prepare(params.ctx_tgt,
-                uint32_t(std::clamp(params.n_max, 0, 4)))) {
-            SPC_ERR("%s", "failed to acquire the adaptive MTP KV lease for drafting\n");
-            return;
+        bool streamed = false, fully_resident = true;
+        uint32_t narrow_draft_max = 0;
+        streamed = llama_kv_stream_residency(params.ctx_tgt, &fully_resident, &narrow_draft_max);
+        const auto effective_cap = [&](const common_speculative_draft_params & dp) {
+            return mtp_streamed_draft_max(mtp_effective_n_max(dp, params.n_max), streamed, fully_resident, narrow_draft_max);
+        };
+        if (n_drafting > 0) {
+            int32_t effective = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (drafting[seq_id]) {
+                    effective = std::max(effective, effective_cap(dparams[seq_id]));
+                }
+            }
+            if (!llama_kv_stream_mtp_prepare(params.ctx_tgt, uint32_t(std::clamp(effective, 0, LLAMA_KV_STREAM_MTP_DRAFT_MAX)))) {
+                SPC_ERR("%s", "failed to acquire the adaptive MTP KV lease for drafting\n");
+                return;
+            }
         }
 
 
@@ -1793,11 +1816,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
-
-                if (params.n_max <= (int) result.size()) {
+                if (effective_cap(dp) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

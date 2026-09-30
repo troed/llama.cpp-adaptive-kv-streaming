@@ -434,6 +434,9 @@ extern "C" {
         uint32_t kv_stream_auxiliary_layers;
     };
 
+// Widest attached-MTP draft chain the streamed KV lease supports.
+#define LLAMA_KV_STREAM_MTP_DRAFT_MAX 5
+
     struct llama_model_tensor_override {
         const char * pattern;
         enum ggml_type type;
@@ -1125,6 +1128,12 @@ extern "C" {
     LLAMA_API bool llama_kv_stream_mtp_prepare(struct llama_context * ctx, uint32_t future_tokens);
     LLAMA_API bool llama_kv_stream_mtp_release(struct llama_context * ctx);
 
+    // Streamed KV decode residency. Returns false when the context has no streamed KV state.
+    // fully_resident: the active token range fits the resident region, so a verify batch wider
+    //   than the span shapes stays on the no-copy direct attention path.
+    // narrow_draft_max: the draft ceiling that keeps a verify batch within the span shapes.
+    LLAMA_API bool llama_kv_stream_residency(struct llama_context * ctx,
+            bool * fully_resident, uint32_t * narrow_draft_max);
 
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);

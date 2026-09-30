@@ -33,6 +33,9 @@ struct llama_kv_stream_runtime_diagnostics {
     bool streaming_active = false;
 };
 
+// Span execution covers query widths 1-2 (vector) and 3-4 (MMA); a wider verify gathers.
+constexpr uint32_t KV_STREAM_SPAN_QUERY_WIDTH = 4;
+
 struct llama_kv_stream_model_config {
     ggml_backend_t backend = nullptr;
     llama_kv_stream_host_config host;

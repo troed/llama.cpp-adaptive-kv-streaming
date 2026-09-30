@@ -272,9 +272,9 @@ llama_context::llama_context(
     cparams.shared_device_memory_bytes = params.shared_device_memory_bytes;
     cparams.kv_stream_auxiliary_layers = params.kv_stream_auxiliary_layers;
     const bool streamed_rs_rollback = cparams.kv_stream_auxiliary_layers == 1 &&
-        cparams.n_rs_seq > 0 && cparams.n_rs_seq <= 3;
-    if (cparams.kv_stream_auxiliary_layers && cparams.n_rs_seq > 3) {
-        throw std::runtime_error("KV-stream recurrent rollback supports depth 1-3");
+        cparams.n_rs_seq > 0 && cparams.n_rs_seq <= LLAMA_KV_STREAM_MTP_DRAFT_MAX;
+    if (cparams.kv_stream_auxiliary_layers && cparams.n_rs_seq > LLAMA_KV_STREAM_MTP_DRAFT_MAX) {
+        throw std::runtime_error("KV-stream recurrent rollback supports depth 1-5");
     }
     if (cparams.kv_stream_auxiliary_layers > 1) {
         throw std::runtime_error("model requests " + std::to_string(cparams.kv_stream_auxiliary_layers) +
@@ -883,21 +883,22 @@ void llama_context::sched_reserve() {
                 }
             }
         }
-        // Target verification and attached MTP catch-up both execute TG1-TG4.
-        // Include these graphs in their respective decode-phase grants.
-        if ((cparams.kv_stream_auxiliary_layers || cparams.mtp_publish_host) && n_seqs == 1) {
-            const uint32_t width = std::min(n_tokens, 4u);
-            if (width > 1) {
-                std::vector<size_t> verify_one(backend_ptrs.size());
-                std::vector<size_t> verify_all(backend_ptrs.size());
-                if (!graph_reserve(width, 1, 1, mctx.get(), true, verify_one.data()) ||
-                        !graph_reserve(width, 1, std::min(width, cparams.n_outputs_max),
-                            mctx.get(), true, verify_all.data())) return false;
-                for (size_t i = 0; i < backend_ptrs.size(); ++i)
-                    measurements[backend_ptrs.size() + i] = std::max(
-                        measurements[backend_ptrs.size() + i],
-                        std::max(verify_one[i], verify_all[i]));
-            }
+        // A verify batch runs a wider decode graph than the single-token TG path; include it in the
+        // decode-phase grant at the width the streamed span path can serve.
+        const uint32_t verify_width = cparams.kv_streaming() ?
+            std::min<uint32_t>(KV_STREAM_SPAN_QUERY_WIDTH, LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1) :
+            LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
+        if ((cparams.kv_streaming() || cparams.mtp_publish_host) && n_seqs == 1 && verify_width > 1) {
+            const uint32_t width = std::min(n_tokens, verify_width);
+            std::vector<size_t> verify_one(backend_ptrs.size());
+            std::vector<size_t> verify_all(backend_ptrs.size());
+            if (!graph_reserve(width, 1, 1, mctx.get(), true, verify_one.data()) ||
+                    !graph_reserve(width, 1, std::min(width, cparams.n_outputs_max),
+                        mctx.get(), true, verify_all.data())) return false;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i)
+                measurements[backend_ptrs.size() + i] = std::max(
+                    measurements[backend_ptrs.size() + i],
+                    std::max(verify_one[i], verify_all[i]));
         }
         return prepare_compute_arenas(measurements, 2);
     };
@@ -2265,7 +2266,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const auto text_phase = cparams.kv_streaming() ?
         (cparams.kv_stream_decode ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
         (cparams.mtp_publish_host ?
-            (n_tokens_all <= 4 ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
+            (n_tokens_all <= LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1 ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
             llama_memory_text_phase::unspecified);
 
     if (output_all) {
@@ -4699,7 +4700,7 @@ static llama_kv_stream_model * llama_mtp_target_stream(llama_context * ctx) {
 }
 
 bool llama_kv_stream_mtp_prepare(llama_context * ctx, uint32_t future_tokens) {
-    if (!ctx || future_tokens > 4) return false;
+    if (!ctx || future_tokens > LLAMA_KV_STREAM_MTP_DRAFT_MAX) return false;
     if (!ctx->get_cparams().kv_stream_auxiliary_layers) return true;
     auto * stream = llama_mtp_target_stream(ctx);
     const auto cache = stream ? stream->auxiliary_cache() : nullptr;
@@ -4735,6 +4736,23 @@ bool llama_kv_stream_mtp_release(llama_context * ctx) {
     if (!ctx->get_cparams().kv_stream_auxiliary_layers) return true;
     auto * stream = llama_mtp_target_stream(ctx);
     return stream && stream->release_mtp_layer();
+}
+
+bool llama_kv_stream_residency(llama_context * ctx,
+        bool * fully_resident, uint32_t * narrow_draft_max) {
+    if (!ctx || !fully_resident || !narrow_draft_max) return false;
+    auto * stream = llama_mtp_target_stream(ctx);
+    if (!stream) return false;
+    llama_kv_stream_runtime_diagnostics diagnostics;
+    if (!stream->runtime_diagnostics(diagnostics)) return false;
+    const size_t page = stream->host()->config().shape.page_tokens;
+    if (!page) return false;
+    // The policy counts pages per layer; the active range is resident when its page
+    // count fits the per-layer resident capacity.
+    const size_t active_pages = (stream->tokens() + page - 1)/page;
+    *fully_resident = active_pages <= diagnostics.resident_pages_per_layer;
+    *narrow_draft_max = KV_STREAM_SPAN_QUERY_WIDTH - 1;
+    return true;
 }
 
 

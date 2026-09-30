@@ -1151,14 +1151,33 @@ private:
             SRV_ERR("%s", "KV streaming requires --fit off and embedded draft-mtp for text speculation\n");
             return false;
         }
+        // Embedded draft-mtp may run alongside ngram self-speculation; any other draft type would
+        // need a draft model or a different streamed verify shape.
+        const auto unsupported_type = [](auto type) {
+            return type != COMMON_SPECULATIVE_TYPE_NONE &&
+                type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                type != COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE &&
+                type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K &&
+                type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
+                type != COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
+                type != COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+        };
         if (streamed_mtp && (!streaming || !spec_mtp || has_draft ||
                 std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-                    [](auto type) { return type != COMMON_SPECULATIVE_TYPE_NONE &&
-                        type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP; }) || params.n_parallel != 1 ||
-                params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 3 ||
+                    unsupported_type) || params.n_parallel != 1 ||
+                params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > LLAMA_KV_STREAM_MTP_DRAFT_MAX ||
                 params.cache_type_k != GGML_TYPE_Q8_0 || params.cache_type_v != GGML_TYPE_Q4_0)) {
-            SRV_ERR("%s", "adaptive MTP currently requires serial embedded Qwen MTP, 1-3 draft tokens, Q8_0 K/Q4_0 V, and a KV stream pool or arena\n");
+            SRV_ERR("%s", "adaptive MTP currently requires serial embedded Qwen MTP with optional ngram self-speculation, 1-5 draft tokens, Q8_0 K/Q4_0 V, and an explicit KV stream pool or arena\n");
             return false;
+        }
+        if (streaming) {
+            // A streamed verify batch is one ubatch; a wider draft is rejected after the load.
+            const int32_t draft_max = common_speculative_n_max(&params_base.speculative);
+            const uint32_t ubatch = params_base.n_ubatch ? params_base.n_ubatch : params_base.n_batch;
+            if (draft_max > 0 && uint32_t(draft_max) + 1 > ubatch) {
+                SRV_ERR("%s", "KV streaming cannot verify a draft wider than one ubatch; raise the ubatch size\n");
+                return false;
+            }
         }
 
         if (callback_state) {
