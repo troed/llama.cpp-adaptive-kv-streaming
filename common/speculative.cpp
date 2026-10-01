@@ -1631,8 +1631,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
-            if (n_tokens <= 4 && !llama_kv_stream_mtp_prepare(ctx_tgt,
-                    uint32_t(std::clamp(params.n_max, 0, LLAMA_KV_STREAM_MTP_DRAFT_MAX)))) {
+            // the lease must span the whole decode batch: a verify batch is wider than the
+            // drafted chain, and the round-back truncation after drafting releases the lease
+            // before this decode, so re-acquire at the batch's own width
+            if (n_tokens <= int(LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1) && !llama_kv_stream_mtp_prepare(ctx_tgt,
+                    uint32_t(std::clamp(n_tokens, 0, LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1)))) {
                 SPC_ERR("%s", "failed to acquire the adaptive MTP KV lease for catch-up\n");
                 return false;
             }
@@ -1743,7 +1746,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     effective = std::max(effective, effective_cap(dparams[seq_id]));
                 }
             }
-            if (!llama_kv_stream_mtp_prepare(params.ctx_tgt, uint32_t(std::clamp(effective, 0, LLAMA_KV_STREAM_MTP_DRAFT_MAX)))) {
+            // the lease must span the whole verify batch: the anchor plus the drafted rows
+            if (!llama_kv_stream_mtp_prepare(params.ctx_tgt, uint32_t(std::clamp(effective + 1, 0, LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1)))) {
                 SPC_ERR("%s", "failed to acquire the adaptive MTP KV lease for drafting\n");
                 return;
             }
@@ -2703,6 +2707,11 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // the draft's verify graph is only ever as wide as the chain it drafts; granting the
+    // widest admitted chain instead forces the gather shape and its large workspace
+    cparams.kv_stream_verify_width = std::min<uint32_t>(
+        params.speculative.need_n_rs_seq(), LLAMA_KV_STREAM_MTP_DRAFT_MAX) + 1;
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

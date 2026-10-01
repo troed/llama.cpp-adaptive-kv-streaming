@@ -5,9 +5,10 @@
 #include <limits>
 #include <vector>
 
-// Widest query batch the streamed span kernels serve as one span. The alloc-size gate treats a batch
-// up to this width as streamed, so it must never exceed what the span path can actually dispatch.
-#define GGML_KV_STREAM_SPAN_QUERY_WIDTH 4
+// Widest streamed query batch the span MMA kernels cover. The vector span path covers 1-2; a
+// wider batch gathers the whole layer layout into the grant instead of a tile workspace. The
+// alloc-size gate treats a batch up to this width as streamed, so the two must agree.
+#define GGML_KV_STREAM_SPAN_QUERY_WIDTH 8
 
 // Natural-exponential coordinates: numerator=sum(exp(score-max_logit)*V), normalizer=sum(exp(score-max_logit)).
 // Matches the two-float CUDA metadata record without depending on CUDA headers.

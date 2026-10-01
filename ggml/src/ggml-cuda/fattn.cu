@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 #include "kv-stream-attention-dispatch.h"
 #include "kv-stream-dispatch.cuh"
+#include "../ggml-kv-stream-partial.h"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -550,7 +551,7 @@ static bool mma_span_launch_make(
             q->type != GGML_TYPE_F32 ||
             !ggml_cuda_kv_stream_kernel(k->type,v->type) ||
             dst->type != GGML_TYPE_F32 || q->ne[0] != 256 || v->ne[0] != 256 ||
-            k->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > 4 ||
+            k->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > GGML_KV_STREAM_SPAN_QUERY_WIDTH ||
             k->ne[2] <= 0 || v->ne[2] != k->ne[2] || q->ne[2] <= 0 ||
             q->ne[2]%k->ne[2] ||
             (q->ne[2]/k->ne[2] != 2 && q->ne[2]/k->ne[2] != 6 && q->ne[2]/k->ne[2] != 8) ||
@@ -784,9 +785,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_spans(
             ggml_row_size(k->type,k->ne[0]),ggml_row_size(v->type,v->ne[0]))) return false;
     if (plan.ncols1 == 1) return ggml_cuda_flash_attn_ext_mma_f16_spans_case<1,8>(ctx,dst,spans,count,workspace,plan);
     if (plan.ncols1 == 2) return ggml_cuda_flash_attn_ext_mma_f16_spans_case<2,8>(ctx,dst,spans,count,workspace,plan);
-    return plan.ncols2 == 8 ?
+    if (plan.ncols1 == 4) return plan.ncols2 == 8 ?
         ggml_cuda_flash_attn_ext_mma_f16_spans_case<4,8>(ctx,dst,spans,count,workspace,plan) :
         ggml_cuda_flash_attn_ext_mma_f16_spans_case<4,2>(ctx,dst,spans,count,workspace,plan);
+    if (plan.ncols1 == 8 && plan.ncols2 == 2) return
+        ggml_cuda_flash_attn_ext_mma_f16_spans_case<8,2>(ctx,dst,spans,count,workspace,plan);
+    // Geometry the span kernels do not cover; the caller falls back to stock attention.
+    return false;
 }
 
 template<ggml_type type>

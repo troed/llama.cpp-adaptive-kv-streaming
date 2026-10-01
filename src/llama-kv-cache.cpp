@@ -1392,6 +1392,9 @@ bool llama_kv_cache::complete_mtp_publication() {
 size_t llama_kv_cache::mtp_span_attention_calls() const noexcept {
     return mtp_proxy ? mtp_proxy->attention_calls() : 0;
 }
+bool llama_kv_cache::mtp_span_active() const noexcept {
+    return mtp_proxy && mtp_proxy->active();
+}
 
 
 uint32_t llama_kv_cache::get_size() const {
@@ -3169,7 +3172,7 @@ bool llama_kv_cache_context::kv_stream_begin(const llama_ubatch & ubatch, bool d
 }
 bool llama_kv_cache_context::mtp_span_append(const llama_ubatch & ubatch) const {
     const auto cache = kv->mtp_auxiliary_cache();
-    if (!cache || i_cur >= sinfos.size() || !ubatch.n_tokens || ubatch.n_tokens > 4 ||
+    if (!cache || i_cur >= sinfos.size() || !ubatch.n_tokens || ubatch.n_tokens > KV_STREAM_SPAN_QUERY_WIDTH ||
             ubatch.n_seqs_unq != 1 || !ubatch.seq_id_unq || ubatch.seq_id_unq[0] != 0 ||
             !ubatch.pos) return false;
     const auto & info = sinfos[i_cur];

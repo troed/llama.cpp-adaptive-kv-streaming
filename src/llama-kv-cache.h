@@ -129,6 +129,7 @@ public:
     bool set_mtp_span_mode(bool enable, size_t first = 0, uint32_t rows = 0);
     bool complete_mtp_publication();
     size_t mtp_span_attention_calls() const noexcept;
+    bool mtp_span_active() const noexcept;
     std::shared_ptr<llama_kv_stream_logical_cache> mtp_auxiliary_cache() const noexcept {
         return attached_mtp_cache;
     }

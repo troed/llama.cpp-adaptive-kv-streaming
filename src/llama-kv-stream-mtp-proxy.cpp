@@ -378,7 +378,7 @@ bool llama_kv_stream_mtp_proxy::complete_publication() {
 
 bool llama_kv_stream_mtp_proxy::arm(size_t first, uint32_t rows) {
     if (!impl || impl->failed || !impl->target || !impl->target->has_mtp_layer() ||
-            !rows || rows > 4 || first != impl->cache->tokens() ||
+            !rows || rows > KV_STREAM_SPAN_QUERY_WIDTH || first != impl->cache->tokens() ||
             first > impl->target->mtp_reserved_tokens() || rows > impl->target->mtp_reserved_tokens() - first ||
             impl->target->mtp_layer_plan(1) == nullptr) return false;
     impl->first = first;

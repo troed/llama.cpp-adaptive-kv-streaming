@@ -527,7 +527,7 @@ bool llama_kv_stream_model::acquire_mtp_layer(size_t future_tokens) {
     const size_t target_tokens = s.session->tokens();
     const size_t mtp_tokens = mtp->tokens();
     if (mtp_tokens < 4 || mtp_tokens > target_tokens) return false;
-    if (target_tokens > s.config.host.context_tokens || future_tokens > LLAMA_KV_STREAM_MTP_DRAFT_MAX ||
+    if (target_tokens > s.config.host.context_tokens || future_tokens > KV_STREAM_SPAN_QUERY_WIDTH ||
             future_tokens > s.config.host.context_tokens - target_tokens) return false;
     const size_t reserved_tokens = target_tokens + future_tokens;
     const uint32_t physical_layer = s.config.host.layers;

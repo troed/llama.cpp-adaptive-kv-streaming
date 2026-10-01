@@ -1,6 +1,7 @@
 #pragma once
 #include "llama-kv-stream-session.h"
 #include "llama-kv-stream-layer-lease.h"
+#include "../ggml/src/ggml-kv-stream-partial.h"
 class llama_kv_stream_logical_cache;
 
 
@@ -33,8 +34,8 @@ struct llama_kv_stream_runtime_diagnostics {
     bool streaming_active = false;
 };
 
-// Span execution covers query widths 1-2 (vector) and 3-4 (MMA); a wider verify gathers.
-constexpr uint32_t KV_STREAM_SPAN_QUERY_WIDTH = 4;
+// Span execution covers query widths 1-2 (vector) and 3-8 (MMA); a wider verify gathers.
+constexpr uint32_t KV_STREAM_SPAN_QUERY_WIDTH = GGML_KV_STREAM_SPAN_QUERY_WIDTH;
 
 struct llama_kv_stream_model_config {
     ggml_backend_t backend = nullptr;

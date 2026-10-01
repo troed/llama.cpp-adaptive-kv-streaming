@@ -4700,7 +4700,7 @@ static llama_kv_stream_model * llama_mtp_target_stream(llama_context * ctx) {
 }
 
 bool llama_kv_stream_mtp_prepare(llama_context * ctx, uint32_t future_tokens) {
-    if (!ctx || future_tokens > LLAMA_KV_STREAM_MTP_DRAFT_MAX) return false;
+    if (!ctx || future_tokens > KV_STREAM_SPAN_QUERY_WIDTH) return false;
     if (!ctx->get_cparams().kv_stream_auxiliary_layers) return true;
     auto * stream = llama_mtp_target_stream(ctx);
     const auto cache = stream ? stream->auxiliary_cache() : nullptr;
