@@ -278,7 +278,8 @@ struct llama_kv_stream_model::implementation {
     }
     // Answer with the tile figure the arena already reserved, for an attention op this owner streams.
     size_t attention_alloc_size(const ggml_tensor * t) const {
-        if (t->op != GGML_OP_FLASH_ATTN_EXT || !supports(t) || t->src[0]->ne[1] > config.max_batch_rows) return 0;
+        if (t->op != GGML_OP_FLASH_ATTN_EXT || !supports(t) ||
+                t->src[0]->ne[1] > KV_STREAM_SPAN_QUERY_WIDTH) return 0;
         return decode_bytes;
     }
     // Validate actual SET_ROWS coordinates once per input buffer per append, not once per layer.
@@ -495,8 +496,8 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
             [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); },
             [](void * p,ggml_backend_buffer_type_t buft,const ggml_tensor * t) -> size_t {
                 auto & s = **static_cast<std::shared_ptr<implementation> *>(p);
-                const size_t bytes = s.attention_alloc_size(t);
-                return bytes ? bytes : ggml_backend_buft_get_alloc_size(buft,t);
+                GGML_UNUSED(buft);
+                return s.attention_alloc_size(t);
             }
         };
         auto owner = std::make_unique<std::shared_ptr<implementation>>(s);
