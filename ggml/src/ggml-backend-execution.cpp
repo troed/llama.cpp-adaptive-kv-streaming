@@ -115,3 +115,8 @@ ggml_status ggml_backend_execution_compute(ggml_backend_buffer_t owner,ggml_back
     if (metadata_only(op)) return GGML_STATUS_SUCCESS;
     return storage(owner).ops.compute(storage(owner).context,backend,op);
 }
+size_t ggml_backend_execution_alloc_size(ggml_backend_buffer_t owner,ggml_backend_buffer_type_t buft,const ggml_tensor * op) {
+    if (!owner || !ggml_backend_buft_is_execution(owner->buft) || !op) return 0;
+    const auto & s = storage(owner);
+    return s.ops.alloc_size ? s.ops.alloc_size(s.context,buft,op) : 0;
+}

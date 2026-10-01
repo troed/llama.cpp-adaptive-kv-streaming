@@ -177,6 +177,11 @@ int main(int argc, char ** argv) {
         execution_probe probe;
         auto managed_ops = ops;
         managed_ops.supports = [](void *, const ggml_tensor * op) { return op->op == GGML_OP_FLASH_ATTN_EXT; };
+        // Answer only for a streamed query height, so the stock path stays observable for prefill.
+        managed_ops.alloc_size = [](void *, ggml_backend_buffer_type_t, const ggml_tensor * op) -> size_t {
+            if (!op->src[0] || op->src[0]->ne[1] > 8) return 0;
+            return 4096;
+        };
         ggml_backend_buffer_ptr backing(ggml_backend_alloc_buffer(backend.get(), 1 << 20));
         ggml_backend_buffer_ptr managed(ggml_backend_execution_buffer_new(dev, backing.get(), managed_ops, &probe));
         if (!t.assert_true(bool(managed))) return;
