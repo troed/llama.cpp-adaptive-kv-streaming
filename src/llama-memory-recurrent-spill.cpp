@@ -449,6 +449,9 @@ bool llama_recurrent_spill_bank::enable_publication(
             [](void *) { return false; },
             [](void *) {},
             [](void *) {},
+            [](void *,ggml_backend_buffer_type_t buft,const ggml_tensor * op) -> size_t {
+                return ggml_backend_buft_get_alloc_size(buft,op);
+            },
         };
         next->execution=ggml_backend_execution_buffer_new(device,s.host,ops,&s);
         if (!next->execution) return false;
