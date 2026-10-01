@@ -227,6 +227,24 @@ int main(int argc, char ** argv) {
         k->buffer = v->buffer = nullptr;
         unsupported.reset(); managed.reset();
         t.assert_equal(2, probe.frees);
+        // A fresh owner supports every op, so only the hook's attention guard can exclude CPY.
+        auto owned_ops = ops;
+        owned_ops.supports = [](void *, const ggml_tensor *) { return true; };
+        owned_ops.alloc_size = [](void *, ggml_backend_buffer_type_t, const ggml_tensor *) -> size_t {
+            return 4096;
+        };
+        ggml_backend_buffer_ptr delegating(ggml_backend_execution_buffer_new(dev, backing.get(), owned_ops, &probe));
+        if (!t.assert_true(bool(delegating))) return;
+        auto * cpy_src = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 4);
+        auto * cpy_dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 4);
+        auto * cpy = ggml_cpy(ctx.get(), cpy_src, cpy_dst);
+        t.assert_true(cpy && cpy->op == GGML_OP_CPY);
+        if (!t.assert_true(ggml_backend_tensor_alloc(delegating.get(), k, base) == GGML_STATUS_SUCCESS &&
+                ggml_backend_tensor_alloc(delegating.get(), v, base + ggml_nbytes(k)) == GGML_STATUS_SUCCESS)) return;
+        t.assert_true(ggml_backend_buft_get_alloc_size(buft, cpy) != size_t(4096));
+        k->buffer = v->buffer = nullptr;
+        delegating.reset();
+        t.assert_equal(3, probe.frees);
     });
     return t.summary();
 }
