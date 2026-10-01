@@ -20,8 +20,12 @@ static const ggml_backend_execution_ops ops{
     [](void * p,ggml_backend_t,ggml_tensor *) { ++static_cast<execution_probe *>(p)->computes; return GGML_STATUS_SUCCESS; },
     [](void *) { return true; },
     [](void * p) { ++static_cast<execution_probe *>(p)->writes; },
-    [](void * p) { ++static_cast<execution_probe *>(p)->frees; }
+    [](void * p) { ++static_cast<execution_probe *>(p)->frees; },
+    [](void *, ggml_backend_buffer_type_t, const ggml_tensor *) { return size_t(0); }
 };
+static_assert(std::is_same_v<decltype(ggml_backend_execution_ops::alloc_size),
+    size_t (*)(void *, ggml_backend_buffer_type_t, const ggml_tensor *)>,
+    "execution ops must expose a trailing alloc_size callback");
 int main(int argc, char ** argv) {
     testing t;
     ggml_backend_ptr backend(ggml_backend_cpu_init());

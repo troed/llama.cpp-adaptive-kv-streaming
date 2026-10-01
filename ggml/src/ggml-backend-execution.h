@@ -8,6 +8,10 @@ struct ggml_backend_execution_ops {
     bool (*can_write)(void * context);
     void (*modified)(void * context);
     void (*destroy)(void * context);
+    // Bytes this owner needs to execute the op, including internal scratch. Return 0 to decline
+    // or when the op is not claimed; the caller then uses stock sizing. Last field on purpose:
+    // owners initialize this struct positionally.
+    size_t (*alloc_size)(void * context, ggml_backend_buffer_type_t buft, const ggml_tensor * op);
 };
 
 // Retain stateless host backing and adopt context only on success; native reset state is not bypassed.
