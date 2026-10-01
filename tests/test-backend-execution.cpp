@@ -227,7 +227,8 @@ int main(int argc, char ** argv) {
         k->buffer = v->buffer = nullptr;
         unsupported.reset(); managed.reset();
         t.assert_equal(2, probe.frees);
-        // A fresh owner supports every op, so only the hook's attention guard can exclude CPY.
+        // CPY has no execution owner, so the hook's attention guard keeps it off the stock
+        // attention path. A widened guard aborts there on the op assert, not returns 4096.
         auto owned_ops = ops;
         owned_ops.supports = [](void *, const ggml_tensor *) { return true; };
         owned_ops.alloc_size = [](void *, ggml_backend_buffer_type_t, const ggml_tensor *) -> size_t {
