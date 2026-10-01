@@ -65,6 +65,14 @@ struct llama_kv_stream_mtp_proxy::implementation {
             op->src[3]->type == GGML_TYPE_F16;
     }
 
+    // Answer with the workspace an armed span validates against, the storage the
+    // kernel runs from. Decline anything else so the caller uses stock sizing.
+    size_t attention_alloc_size(const ggml_tensor * op) const {
+        if (!supports(op)) return 0;
+        auto * workspace = target ? target->mtp_attention_workspace() : nullptr;
+        return workspace ? ggml_backend_buffer_get_size(workspace) : 0;
+    }
+
     ggml_status write(ggml_backend_t backend, ggml_tensor * op) {
         bool value = false;
         if (!plane(op->src[2], value)) return GGML_STATUS_FAILED;
@@ -324,6 +332,11 @@ std::unique_ptr<llama_kv_stream_mtp_proxy> llama_kv_stream_mtp_proxy::create(
         [](void *) { return false; },
         [](void *) {},
         [](void * p) { delete static_cast<std::shared_ptr<implementation> *>(p); },
+        [](void * p, ggml_backend_buffer_type_t buft, const ggml_tensor * op) -> size_t {
+            auto & state = **static_cast<std::shared_ptr<implementation> *>(p);
+            GGML_UNUSED(buft);
+            return state.attention_alloc_size(op);
+        },
     };
     auto holder = std::make_unique<std::shared_ptr<implementation>>(result->impl);
     result->proxy.reset(ggml_backend_execution_buffer_new(device, state.cache->host()->buffer(),
