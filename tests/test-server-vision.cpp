@@ -31,7 +31,7 @@ int main() {
         check([](auto & p) { p.cache_type_k = GGML_TYPE_F16; });
         check([](auto & p) { p.cache_type_v = GGML_TYPE_Q8_0; });
         check([](auto & p) { p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; });
-        check([](auto & p) { p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; p.speculative.draft.n_max = 4; });
+        check([](auto & p) { p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; p.speculative.draft.n_max = LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1; });
         check([](auto & p) { p.speculative.types = {COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE}; });
         check([](auto & p) { p.kv_stream_auxiliary_layers = 1; });
         check([](auto & p) { p.embedding = true; });
@@ -67,10 +67,12 @@ int main() {
     t.test("serial_embedded_mtp_vision_is_admitted_only_with_bounded_drafting", [](testing & t) {
         auto p = qualified();
         p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
-        for (int length = 1; length <= 3; ++length) {
+        for (int length = 1; length <= LLAMA_KV_STREAM_MTP_DRAFT_MAX; ++length) {
             p.speculative.draft.n_max = length;
             t.assert_true(server_vision_arena_config_error(p) == nullptr);
         }
+        p.speculative.draft.n_max = LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
+        t.assert_true(server_vision_arena_config_error(p) != nullptr);
         p.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         t.assert_true(server_vision_arena_config_error(p) != nullptr);
         p.speculative.types = {COMMON_SPECULATIVE_TYPE_NONE}; p.kv_stream_auxiliary_layers = 1;
@@ -82,9 +84,9 @@ int main() {
         t.assert_true(!server_vision_arena_request_error(task));
         task.params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
         t.assert_true(server_vision_arena_request_error(task) != nullptr);
-        task.params.speculative.draft.n_max = 3;
+        task.params.speculative.draft.n_max = LLAMA_KV_STREAM_MTP_DRAFT_MAX;
         t.assert_true(server_vision_arena_request_error(task, true) == nullptr);
-        task.params.speculative.draft.n_max = 4;
+        task.params.speculative.draft.n_max = LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
         t.assert_true(server_vision_arena_request_error(task, true) != nullptr);
         task.params.speculative.types = {COMMON_SPECULATIVE_TYPE_NONE}; task.params.lora[0] = 1.0f;
         t.assert_true(server_vision_arena_request_error(task) != nullptr);

@@ -73,7 +73,7 @@ def server(args, mode, extra=(), reject=False, env_extra=None):
             if reject:
                 assert process.wait(timeout=30) != 0, f"unsupported startup admitted: {extra}"
                 diagnostic = log_path.read_text().lower()
-                assert "vision arena" in diagnostic or "attached mtp kv streaming supports at most 3 draft tokens" in diagnostic, log_path
+                assert "vision arena" in diagnostic or "attached mtp kv streaming supports at most 5 draft tokens" in diagnostic, log_path
                 yield None
                 return
             deadline = time.monotonic() + 120
@@ -193,7 +193,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--ubatch-size", type=int, default=64)
     parser.add_argument("--decode", type=int, default=16)
-    parser.add_argument("--mtp-length", type=int, choices=(0,1,2,3), default=0)
+    parser.add_argument("--mtp-length", type=int, choices=(0,1,2,3,4,5), default=0)
     parser.add_argument("--cache-ram-mib", type=int, default=2048)
     parser.add_argument("--background-tokens", type=int, default=128)
     parser.add_argument("--mode", choices=("arena", "stock", "compare"), default="compare")
@@ -221,7 +221,7 @@ def main():
         cases = [("parallel", ("--parallel", "2")), ("mtp", ("--spec-type", "draft-mtp")),
                  ("cpu-projector", ("--no-mmproj-offload",)), ("kv-quant", ("-ctk", "f16")),
                  ("fit", ("--fit", "on")), ("embedding", ("--embedding",))]
-        cases[1] = ("mtp-length",("--spec-type","draft-mtp","--spec-draft-n-max","4"))
+        cases[1] = ("mtp-length",("--spec-type","draft-mtp","--spec-draft-n-max","6"))
         for name, extra in cases:
             with server(args, f"arena-reject-{name}", extra, reject=True):
                 print("startup rejected:", name)

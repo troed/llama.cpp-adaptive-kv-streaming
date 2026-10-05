@@ -50,8 +50,8 @@ const char * server_vision_arena_config_error(const common_params & params) {
         return "vision arena is currently qualified with -fa on, Q8_0 K and Q4_0 V";
     const bool mtp = common_params_uses_streamed_mtp(params);
     if (params.speculative.has_dft() || (params.kv_stream_auxiliary_layers && !mtp) ||
-            params.kv_stream_auxiliary_layers > 1 || (mtp && (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 3)))
-        return "vision arena supports only serial embedded MTP with 1-3 draft tokens";
+            params.kv_stream_auxiliary_layers > 1 || (mtp && (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > LLAMA_KV_STREAM_MTP_DRAFT_MAX)))
+        return "vision arena supports only serial embedded MTP with 1-5 draft tokens";
     for (auto type : params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
         return "vision arena does not support this speculation mode";
     return nullptr;
@@ -61,7 +61,7 @@ const char * server_vision_arena_request_error(const server_task & task, bool em
     if (task.type != SERVER_TASK_TYPE_COMPLETION || !task.params.lora.empty()) return "vision arena supports completion requests without LoRA";
     if (task.params.speculative.has_dft()) return "vision arena request cannot enable a draft model";
     for (auto type : task.params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE &&
-            !(embedded_mtp && type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && task.params.speculative.draft.n_max >= 1 && task.params.speculative.draft.n_max <= 3))
+            !(embedded_mtp && type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && task.params.speculative.draft.n_max >= 1 && task.params.speculative.draft.n_max <= LLAMA_KV_STREAM_MTP_DRAFT_MAX))
         return "vision arena request cannot change the qualified speculation mode";
     try {
         for (size_t i = 0; i < task.tokens.size();) {

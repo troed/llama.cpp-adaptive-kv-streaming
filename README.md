@@ -92,7 +92,7 @@ This requires a shared arena, not the legacy fixed KV-pool flag. To enable the s
 --spec-draft-type-k q8_0 --spec-draft-type-v q4_0
 ```
 
-Draft lengths 1-3 are qualified. MTP consumes the raw image embeddings and shifted target hidden rows as separate inputs; its cache tracks physical rows independently of image M-RoPE positions. Vision suspends both text schedulers and retires the MTP ring lease before borrowing the parent. Pending hidden rows also survive checkpoint and RAM prompt-cache restoration.
+Draft lengths 1-5 are qualified (the 5-draft case was verified on an RTX 5060 Ti with a 3840 MiB shared arena; MTP5 costs only ~13 MiB more than MTP3, but the image projector's device grant needs that little extra headroom). MTP consumes the raw image embeddings and shifted target hidden rows as separate inputs; its cache tracks physical rows independently of image M-RoPE positions. Vision suspends both text schedulers and retires the MTP ring lease before borrowing the parent. Pending hidden rows also survive checkpoint and RAM prompt-cache restoration.
 
 Parallel slots, separate draft models, other speculation modes, CPU projector offload, LoRA, embeddings and unqualified KV pairs are rejected. The draft must fit the target's borrowable scratch; a separate-workspace fallback is not admitted for vision. A batch that exceeds the arena returns an error; reduce image size/token limits or choose a suitable arena. The example budget was tested on the RTX 5070 Ti, not guaranteed for other models/cards. Target/MTP weights, persistent recurrent state and CUDA housekeeping remain outside the arena.
 

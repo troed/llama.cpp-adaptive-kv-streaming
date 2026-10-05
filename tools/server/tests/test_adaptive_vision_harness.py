@@ -78,7 +78,7 @@ class Launch(unittest.TestCase):
         self.assertNotIn('GGML_CUDA_ENABLE_UNIFIED_MEMORY', self.commands[1][1]['env'])
 
     def test_mtp_cli_rejection_is_accepted_before_vision_admission(self):
-        with self.launch('error: attached MTP KV streaming supports at most 3 draft tokens'), \
+        with self.launch('error: attached MTP KV streaming supports at most 5 draft tokens'), \
                 patch.object(harness.os, 'killpg', create=True):
             with harness.server(self.args, 'arena-reject-mtp-length', reject=True):
                 pass

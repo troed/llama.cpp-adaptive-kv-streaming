@@ -170,7 +170,7 @@ def main():
     parser.add_argument("--images", type=int, default=1)
     parser.add_argument("--background-tokens", type=int, default=6000)
     parser.add_argument("--decode", type=int, default=16)
-    parser.add_argument("--mtp-length", type=int, choices=(0, 1, 2, 3), default=0)
+    parser.add_argument("--mtp-length", type=int, choices=(0, 1, 2, 3, 4, 5), default=0)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--sample-ms", type=int, default=50)
     parser.add_argument("--gpu", type=int, default=0)
