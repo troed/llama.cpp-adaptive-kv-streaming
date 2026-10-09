@@ -963,10 +963,11 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         // A streamed decode batch runs from the stream model's own tile workspace, so it needs no
         // K/V extras: that covers the vector path (1-2 rows) and the span path (up to the span
         // width). A batch wider than the span tile is also free of extras when its execution owner
-        // claims it and answers with the workspace it will run from. Query width alone cannot
-        // distinguish short prefill from bounded decode, so also require that the graph marked this
-        // op's workspace external; plain prefill is therefore never owned here and keeps the stock
-        // extras it needs.
+        // claims it and answers with the workspace it will run from -- the tile figure for an owner
+        // that tiles a wide batch, or the whole-layer gather figure for one that gathers. Query
+        // width alone cannot distinguish short prefill from bounded decode, so also require that the
+        // graph marked this op's workspace external; plain prefill is therefore never owned here and
+        // keeps the stock extras it needs.
         const bool streamed = tensor->src[0] &&
             tensor->src[0]->ne[1] <= int64_t(GGML_KV_STREAM_SPAN_QUERY_WIDTH);
         const bool owned = tensor->src[0] &&

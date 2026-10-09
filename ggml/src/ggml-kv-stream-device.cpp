@@ -1,5 +1,7 @@
 #include "ggml-kv-stream-device.h"
 
+#include <algorithm>
+
 bool ggml_kv_stream_resume_layout_make(
         uint32_t heads, uint32_t queries, uint32_t splits, uint32_t values,
         ggml_kv_stream_resume_plan & output) {
@@ -25,6 +27,22 @@ bool ggml_kv_stream_query_tile_make(size_t queries, size_t heads, size_t first, 
     if (!heads || first >= queries || queries > SIZE_MAX/heads) return false;
     const size_t count = queries-first < 256 ? queries-first : 256;
     output = {count,first*heads,count*heads};
+    return true;
+}
+
+// A verify batch wider than the span tile is attended as consecutive row tiles.
+size_t ggml_kv_stream_verify_tile_count(size_t rows, size_t tile) {
+    if (!rows || !tile) return 0;
+    return (rows + tile - 1)/tile;
+}
+
+bool ggml_kv_stream_verify_tile_make(size_t rows, size_t tile, size_t index,
+        size_t & first_row, size_t & tile_rows) {
+    const size_t count = ggml_kv_stream_verify_tile_count(rows, tile);
+    if (index >= count) return false;
+    const size_t first = index*tile;
+    first_row = first;
+    tile_rows = std::min(tile, rows - first);
     return true;
 }
 

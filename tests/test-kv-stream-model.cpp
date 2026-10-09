@@ -323,6 +323,30 @@ int main(int argc,char ** argv) {
             t.assert_true(allocations.calls > 0);
         }
     });
+    t.test("wide_verify_grant_stays_tile_sized_when_the_stream_can_tile", [&](testing & t) {
+        // A tileable stream serves a width-49 verify from the same span tile workspace as width 1,
+        // so its decode attention grant must not grow to the whole-layer gather; a config that
+        // cannot tile (Q8_0 K with Q8_0 V is outside the span shapes) still pays for the gather.
+        const auto decode_grant = [&](ggml_type k, ggml_type v, uint32_t width) -> size_t {
+            fixture f(backend.get(),true,k,v,513,false,1);
+            llama_kv_stream_model_config config;
+            config.backend = backend.get(); config.host = f.host->config();
+            config.pool_bytes = f.policy.pool_bytes; config.max_batch_rows = 256; config.query_heads = 4;
+            config.verify_width = width;
+            auto model = llama_kv_stream_model::create(config);
+            if (!model) return 0;
+            llama_kv_stream_memory_requirements requirements;
+            if (!model->memory_requirements(requirements)) return 0;
+            return requirements.attention_decode_bytes;
+        };
+        const size_t tile = decode_grant(GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,1);
+        const size_t wide = decode_grant(GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,49);
+        const size_t gather = decode_grant(GGML_TYPE_Q8_0,GGML_TYPE_Q8_0,49);
+        if (!t.assert_true(tile > 0 && wide > 0 && gather > 0)) return;
+        t.assert_equal(tile,wide);       // tiled: the grant stays at the span tile figure
+        t.assert_true(gather > wide);    // gathering: the whole-layer layout enters the grant
+    });
+
     t.test("serial_draft_growth_covers_independent_phase_maxima", [&](testing & t) {
         for (const auto & sizes : {std::pair<size_t,size_t>{3,1},{2,3},{3,4},{4,2},{2,1},{3,3}}) {
             serial_workspace_fixture f(backend.get());
