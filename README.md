@@ -245,6 +245,28 @@ Recent compatibility checks retain stock-equivalent MMA outputs in the tested ca
 
 The arena quota bounds its participating buffers, **not all process memory**. Weights, host KV, persistent recurrent storage and CUDA driver/native-executable allocations also need space. Startup admission now distinguishes missing native kernels, arena minima, host allocation/registration and device allocation/binding failures. Precise all-phase minimum sizing and additional-byte diagnostics are the next workstream; passing today's startup checks is not a guarantee against every later OOM.
 
+### If you still hit a CUDA out-of-memory
+
+A long-context run can exhaust VRAM even with a valid arena, most often when llama.cpp
+instantiates the **decode CUDA graph**:
+
+```
+CUDA error: out of memory
+  in function ggml_cuda_graph_evaluate_and_capture ...: cudaGraphInstantiate(...)
+```
+
+That allocation is outside the arena, and a tight card (weights + arena close to total VRAM)
+can leave too little for it — the process aborts and the router reloads the model. Free some
+VRAM (a smaller `--shared-device-memory-mib`, fewer `--n-gpu-layers`), or **turn CUDA graphs off
+at runtime** — no rebuild:
+
+```sh
+export GGML_CUDA_DISABLE_GRAPHS=1
+```
+
+Graphs are a decode-speed optimisation, not a correctness requirement. `GGML_CUDA_GRAPHS=OFF`
+is the compile-time equivalent; prefer the environment variable since it needs no rebuild.
+
 ## Image requests, with optional MTP
 
 The server can now share its arena with the matching Qwen3.8 F16 vision projector. Projector weights start unloaded. For an image batch, authoritative host KV is retained while device mirrors are suspended. The projector and its compute workspace borrow separate arena regions, and host embeddings are retained. The projector then unloads and text regains the arena before image-embedding prefill and generation. Compatible media batching and prompt-prefix caching keep their existing server behavior.
