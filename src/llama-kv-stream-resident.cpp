@@ -55,6 +55,7 @@ struct llama_kv_stream_resident::implementation {
     std::unique_ptr<llama_kv_stream_writer> writer;
     llama_kv_stream_write_stats write_stats;
     const ggml_kv_stream_copy_ops * copy_ops = nullptr;
+    std::shared_ptr<void> prepared_copies;
     ggml_backend_buffer_t copy_host = nullptr;
     struct prefetch_sequence {
         llama_kv_stream_prefetch_plan plan;
@@ -187,7 +188,11 @@ struct llama_kv_stream_resident::implementation {
         auto get = reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_copy_ops"));
         copy_ops = get ? get() : nullptr;
         if (!copy_ops || copy_ops->version < 2 || !copy_ops->enqueue_span || !copy_ops->stats) return false;
-        copies = decltype(copies)(copy_ops->create(backend,binding.buffer,content->host()->buffer(),binding.config.shape,slots),copy_ops->free);
+        if (prepared_copies && (copy_ops->version < 11 || !copy_ops->create_prepared)) return false;
+        void * queue = prepared_copies ? copy_ops->create_prepared(backend,prepared_copies.get(),
+            binding.buffer,content->host()->buffer(),binding.config.shape,slots) :
+            copy_ops->create(backend,binding.buffer,content->host()->buffer(),binding.config.shape,slots);
+        copies = decltype(copies)(queue,copy_ops->free);
         if (!copies) return false;
         if (measuring && (copy_ops->version < 10 || !copy_ops->measure || !copy_ops->acquire_span || !copy_ops->release_span ||
                 !copy_ops->feedback_id || !copy_ops->poll_feedback ||
@@ -535,7 +540,7 @@ llama_kv_stream_prefetch_stats llama_kv_stream_resident::sequence_stats() const 
 // Construct only metadata and borrowed tensor bindings; do not copy or clear device memory in the factory.
 std::unique_ptr<llama_kv_stream_resident> llama_kv_stream_resident::create(
         const llama_kv_stream_binding_view & binding, std::shared_ptr<llama_kv_stream_content> content, ggml_backend_t backend,
-        const llama_kv_stream_policy_state * placement) {
+        const llama_kv_stream_policy_state * placement, std::shared_ptr<void> prepared_copies) {
     if (!content || !backend || !binding.lease || !binding.buffer || !binding.base || binding.capacity != binding.config.pool_bytes ||
             binding.capacity > ggml_backend_buffer_get_size(binding.buffer) ||
             binding.base != ggml_backend_buffer_get_base(binding.buffer) ||
@@ -548,6 +553,7 @@ std::unique_ptr<llama_kv_stream_resident> llama_kv_stream_resident::create(
         result->impl = std::make_unique<implementation>();
         auto & s = *result->impl;
         s.binding = binding; s.content = std::move(content); s.backend = backend;
+        s.prepared_copies = std::move(prepared_copies);
         s.pool_lease.reset(ggml_backend_memory_lease_retain(binding.lease));
         if (!s.pool_lease) return {};
         if (placement) s.binding.initial_policy = *placement;
@@ -566,6 +572,13 @@ std::unique_ptr<llama_kv_stream_resident> llama_kv_stream_resident::create(
         }
         if (s.physical_layers.size() != host_layers) return {};
         s.fallback = state.budget.page.attention == ggml_kv_stream_attention::f16;
+        if (s.fallback) {
+            LLAMA_LOG_WARN("%s: KV attention mode f16-convert (fallback=1): native KV attention kernels are missing for this build. "
+                "Rebuild with -DGGML_CUDA_FA_ALL_QUANTS=ON, or a GGML_CUDA_FA_QUANTS list containing the K-V pair and each side "
+                "(e.g. \"q8_0-q4_0,q8_0-q8_0,q4_0-q4_0\"). Fully resident streaming decodes will fail at the prefill->decode transition.\n",__func__);
+        } else {
+            LLAMA_LOG_INFO("%s: KV attention mode native-direct (fallback=0)\n",__func__);
+        }
         s.conversion = state.budget.page.conversion;
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         s.query_capture = reinterpret_cast<ggml_backend_cuda_graph_is_capturing_t>(
