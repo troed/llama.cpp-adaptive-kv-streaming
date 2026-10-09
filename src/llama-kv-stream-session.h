@@ -22,6 +22,8 @@ struct llama_kv_stream_session_config {
     // Widest admitted decode batch; the session rejects anything wider.
     uint32_t verify_width = 1;
     llama_memory_stage_id suspend_stage = 0;
+    // Context-owned backend resources contain no KV views and survive serial layout replacement.
+    std::shared_ptr<void> prepared_copies;
 };
 
 // Serial append-only device consumer. The backend outlives the session; recurrent state belongs to the text model.
