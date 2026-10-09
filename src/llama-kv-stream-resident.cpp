@@ -572,6 +572,13 @@ std::unique_ptr<llama_kv_stream_resident> llama_kv_stream_resident::create(
         }
         if (s.physical_layers.size() != host_layers) return {};
         s.fallback = state.budget.page.attention == ggml_kv_stream_attention::f16;
+        if (s.fallback) {
+            LLAMA_LOG_WARN("%s: KV attention mode f16-convert (fallback=1): native KV attention kernels are missing for this build. "
+                "Rebuild with -DGGML_CUDA_FA_ALL_QUANTS=ON, or a GGML_CUDA_FA_QUANTS list containing the K-V pair and each side "
+                "(e.g. \"q8_0-q4_0,q8_0-q8_0,q4_0-q4_0\"). Fully resident streaming decodes will fail at the prefill->decode transition.\n",__func__);
+        } else {
+            LLAMA_LOG_INFO("%s: KV attention mode native-direct (fallback=0)\n",__func__);
+        }
         s.conversion = state.budget.page.conversion;
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         s.query_capture = reinterpret_cast<ggml_backend_cuda_graph_is_capturing_t>(

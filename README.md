@@ -9,9 +9,15 @@ Download this [ASCII condensed version of ByteShape Qwen3.8-27B-IQ4_XS](https://
 Clone and compile this repo:
 
 ```
-cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_CUDA_FA_QUANTS=q8_0-q4_0 -DGGML_CUDA=ON
+cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_CUDA=ON \
+  -DGGML_CUDA_FA_QUANTS=q8_0-q4_0,q8_0-q8_0,q4_0-q4_0
 cmake --build build --config Release -j
 ```
+
+> **Do not drop the extra `GGML_CUDA_FA_QUANTS` entries.** The `q8_0-q8_0` and `q4_0-q4_0`
+> kernels are required for native KV-stream attention; a pair-only list (`q8_0-q4_0` alone)
+> builds but makes long streaming requests fail at the prefill→decode transition. See
+> [Required FlashAttention kernels](#required-flashattention-kernels).
 
 Put this in your models-preset.ini:
 
@@ -203,7 +209,37 @@ Streaming follows stock's attention-family selection for the device, build and t
 
 Forward-JIT runs older-target code on a newer GPU. It does not reproduce an older card's resource limits, VRAM capacity or performance. This table is not a pass for every card in a family, Windows/MSVC or every intervening compute capability. See [build and device-check commands](docs/build.md#adaptive-kv-cuda-qualification-and-startup-errors) and the [qualification ledger](DEVICE_MEMORY_CONSUMERS_ROADMAP.md#phase-c6-end-to-end-acceptance-and-handoff).
 
-For mixed Q8_0 K / Q4_0 V, **keep `-DGGML_CUDA_FA_ALL_QUANTS=ON`**. `GGML_CUDA_FA_QUANTS=...` does not replace that option in this fork. CUDA 13 cannot compile the pre-SM75 targets; use an isolated CUDA 12.9 or earlier toolkit for those builds. A startup error naming a missing native attention query width is a kernel/build/geometry admission failure, not evidence that a larger arena will fix it.
+### Required FlashAttention kernels
+
+Native KV-stream attention needs, besides the K–V pair kernel itself, a **same-type (or
+f16-paired) kernel for each side**. Compile them with `-DGGML_CUDA_FA_ALL_QUANTS=ON`, or a
+`GGML_CUDA_FA_QUANTS` list that contains the pair *and* each side. For mixed Q8_0 K / Q4_0 V:
+
+```sh
+-DGGML_CUDA_FA_QUANTS="q8_0-q4_0,q8_0-q8_0,q4_0-q4_0"
+```
+
+If a required kernel is missing, the backend reports native direct attention as unavailable and
+the policy **silently falls back to the F16 conversion path** — this is *not* a startup error. A
+fully resident **decode** then needs a full-layer gather (~143 MiB at 90 Ki tokens) that the
+decode attention grant does not hold, and the request dies at the prefill→decode transition:
+
+```
+compute: target attention failed at layer 0, rows 1
+ggml_backend_cuda_graph_compute: managed node ... failed with status -1
+srv decode: Compute error.
+```
+
+The resolved mode is logged at load: `KV attention mode native-direct (fallback=0)` is correct;
+`f16-convert` means the kernels are missing and long streaming decodes will fail. (This is a
+real trap: a pair-only list such as `-DGGML_CUDA_FA_QUANTS=q8_0-q4_0` compiles cleanly and
+starts fine, then dies only once decode begins.)
+
+`GGML_CUDA_FA_QUANTS` is the current mechanism; `GGML_CUDA_FA_ALL_QUANTS` is deprecated in
+current ggml but still maps to `FA_QUANTS=all`. CUDA 13 cannot compile the pre-SM75 targets; use
+an isolated CUDA 12.9 or earlier toolkit for those builds. A startup error naming a missing
+native attention query width is a kernel/build/geometry admission failure, not evidence that a
+larger arena will fix it.
 
 Recent compatibility checks retain stock-equivalent MMA outputs in the tested cases; regional vector reductions have a measured maximum difference of 7.45e-9 with a 1e-8 regression guard. Matched 8K/96K/128K/160K IQ4_XS, MTP=3, fixed-2,240-MiB comparisons retain all 256 output token IDs and show no material throughput regression (prefill -0.14% to -0.03%; decode +0.08% to +0.75%). These single-pair differences are not claimed as speed improvements or universal output equivalence. The opening figure is the earlier V2 MTP sweep, not this compatibility A/B test.
 
