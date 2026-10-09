@@ -1067,7 +1067,7 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
         (s.binding.config.shape.type_k == GGML_TYPE_Q8_0 && s.binding.config.shape.type_v == GGML_TYPE_Q4_0) ||
         (s.binding.config.shape.type_k == GGML_TYPE_F16 && s.binding.config.shape.type_v == GGML_TYPE_F16);
     const bool segmented = span_shape && s.native_graph_attention && cross && !prefill && !s.fallback &&
-        q->ne[1] <= int64_t(GGML_KV_STREAM_SPAN_QUERY_WIDTH) && blocks <= slots && ops->version >= 8 && ops->spans && ops->spans_workspace &&
+        blocks <= slots && ops->version >= 8 && ops->spans && ops->spans_workspace &&
         (q->ne[1] != 2 || resumed ||
          (s.binding.config.shape.type_k == GGML_TYPE_Q8_0 && s.binding.config.shape.type_v == GGML_TYPE_Q4_0)) &&
         (prefix == padded || !resumed) && (!resumed || !resume_plan.resume_resident);
@@ -1080,7 +1080,11 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
         lease(ggml_backend_memory_lease_retain(workspace),ggml_backend_memory_lease_free);
     auto * wb = ggml_backend_memory_lease_buffer(lease.get());
     ggml_backend_memory_region region;
-    const size_t required_workspace = (native || (resumed && !resume_plan.resume_resident)) && !s.fallback && prefix == padded ?
+    // The segmented span path sizes its scratch per tile (the spans_workspace check below), so it
+    // does not charge the partial/gathered layout figures here; `work.bytes` would reject a streamed
+    // wide verify (segmented with prefix < padded) before the real per-tile requirement is known.
+    // The `native && !segmented` and `work.bytes` terms serve only the non-segmented paths.
+    const size_t required_workspace = (native || (resumed && !resume_plan.resume_resident)) && !s.fallback && (prefix == padded || segmented) ?
         0 : resumed ? resume_plan.bytes : native && !segmented ? gathered.bytes : work.bytes;
     if (!wb || !ggml_backend_memory_lease_get_region(lease.get(),&region) ||
             region.size != ggml_backend_buffer_get_size(wb) || region.size < required_workspace ||
@@ -1299,28 +1303,45 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
         k.buffer=v.buffer=s.binding.buffer;
         if (!k.data) k.data=s.binding.base;
         if (!v.data) v.data=s.binding.base;
-        slice=*mask; slice.ne[0]=int64_t(padded);
-        op=*output; op.op=GGML_OP_FLASH_ATTN_EXT;
-        std::memset(op.src,0,sizeof(op.src)); std::memset(op.op_params,0,sizeof(op.op_params));
-        std::memcpy(op.op_params,&scale,sizeof(scale)); ggml_flash_attn_ext_set_prec(&op,GGML_PREC_F32);
-        ggml_backend_execution_set_external_workspace(&op, ggml_backend_execution_has_external_workspace(output));
-        op.src[0]=q; op.src[1]=&k; op.src[2]=&v; op.src[3]=&slice;
-        ggml_kv_stream_span_plan_t raw=nullptr;
-        if (ggml_kv_stream_span_plan_make(s.binding.config.shape,sources.data(),sources.size(),
-                padded,size_t(q->ne[1]),raw).status != ggml_kv_stream_status::success) return false;
-        resident_span_plan_ptr plan(raw,ggml_kv_stream_span_plan_free);
-        size_t required=0;
-        if (!ops->spans_workspace(s.backend,&op,plan.get(),required) || required > region.size) {
-            LLAMA_LOG_WARN("%s: layer %u span workspace rejected required=%zu available=%zu\n",
-                __func__, layer, required, region.size);
-            return false;
+        // A verify wider than the span tile is attended as consecutive row tiles over the same KV
+        // span, so a wide verify never assembles the whole layer (the gathered path).
+        const size_t tiles=ggml_kv_stream_verify_tile_count(size_t(q->ne[1]),size_t(GGML_KV_STREAM_SPAN_QUERY_WIDTH));
+        if (!tiles) return false;
+        for (size_t index=0;index<tiles;++index) {
+            size_t first_row=0,tile_rows=0;
+            if (!ggml_kv_stream_verify_tile_make(size_t(q->ne[1]),size_t(GGML_KV_STREAM_SPAN_QUERY_WIDTH),
+                    index,first_row,tile_rows)) return false;
+            ggml_tensor qt=*q, mt=*mask, ot=*output;
+            qt.ne[1]=int64_t(tile_rows);
+            qt.data=static_cast<char *>(q->data)+first_row*q->nb[1];
+            mt.ne[1]=int64_t(tile_rows);
+            mt.data=static_cast<char *>(mask->data)+first_row*mask->nb[1];
+            ot.ne[2]=int64_t(tile_rows);
+            ot.data=static_cast<char *>(output->data)+first_row*output->nb[2];
+            slice=mt; slice.ne[0]=int64_t(padded);
+            op=ot; op.op=GGML_OP_FLASH_ATTN_EXT;
+            std::memset(op.src,0,sizeof(op.src)); std::memset(op.op_params,0,sizeof(op.op_params));
+            std::memcpy(op.op_params,&scale,sizeof(scale)); ggml_flash_attn_ext_set_prec(&op,GGML_PREC_F32);
+            ggml_backend_execution_set_external_workspace(&op, ggml_backend_execution_has_external_workspace(output));
+            op.src[0]=&qt; op.src[1]=&k; op.src[2]=&v; op.src[3]=&slice;
+            ggml_kv_stream_span_plan_t raw=nullptr;
+            if (ggml_kv_stream_span_plan_make(s.binding.config.shape,sources.data(),sources.size(),
+                    padded,tile_rows,raw).status != ggml_kv_stream_status::success) return false;
+            resident_span_plan_ptr plan(raw,ggml_kv_stream_span_plan_free);
+            size_t required=0;
+            if (!ops->spans_workspace(s.backend,&op,plan.get(),required) || required > region.size) {
+                LLAMA_LOG_WARN("%s: layer %u span workspace rejected required=%zu available=%zu\n",
+                    __func__, layer, required, region.size);
+                return false;
+            }
+            if (!ops->spans(s.backend,&op,plan.get(),wb)) {
+                LLAMA_LOG_WARN("%s: layer %u span kernel rejected with %zu sources\n",
+                    __func__, layer, sources.size());
+                return false;
+            }
+            ++s.attention_calls;
+            s.sequence->span_plans.push_back(std::move(plan));
         }
-        if (!ops->spans(s.backend,&op,plan.get(),wb)) {
-            LLAMA_LOG_WARN("%s: layer %u span kernel rejected with %zu sources\n",
-                __func__, layer, sources.size());
-            return false;
-        }
-        s.sequence->span_plans.push_back(std::move(plan));
         for (const auto & request : requests) {
             if (!s.copy_ops->release_span(s.copies.get(),request.slot,request.pages)) return false;
             if (!s.sequence->plan.consume(request.pages)) return false;
@@ -1329,7 +1350,7 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
             LLAMA_LOG_WARN("%s: layer %u postconsume prefetch admission failed\n", __func__, layer);
             return false;
         }
-        ++s.attention_calls; direct_result=true; return finish();
+        direct_result=true; return finish();
     }
     // Assemble one full logical layer, without changing its encoded bytes or native reduction order.
     const auto gather = [&](const void * key,const void * value,size_t first,size_t count) {

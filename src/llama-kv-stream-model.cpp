@@ -70,6 +70,8 @@ struct llama_kv_stream_model::implementation {
     model_arena_ptr attention_arena{nullptr,ggml_backend_memory_arena_free};
     size_t decode_bytes = 0;
     size_t span_bytes = 0;
+    // True when a wide verify batch can be served as span tiles, so the layer layout stays out of the grant.
+    bool tileable = false;
     std::array<model_lease_ptr,3> leases{{{nullptr,ggml_backend_memory_lease_free},{nullptr,ggml_backend_memory_lease_free},{nullptr,ggml_backend_memory_lease_free}}};
     std::shared_ptr<void> prepared_copies;
     size_t prepared_copy_capacity = 0;
@@ -279,9 +281,11 @@ struct llama_kv_stream_model::implementation {
         }
     }
     // Answer with the tile figure the arena already reserved, for an attention op this owner streams.
+    // A wide op is declined unless this config can serve it as span tiles; a config that gathers a
+    // wide batch keeps its whole-layer grant and the caller then uses stock sizing.
     size_t attention_alloc_size(const ggml_tensor * t) const {
-        if (t->op != GGML_OP_FLASH_ATTN_EXT || !supports(t) ||
-                t->src[0]->ne[1] > KV_STREAM_SPAN_QUERY_WIDTH) return 0;
+        if (t->op != GGML_OP_FLASH_ATTN_EXT || !supports(t)) return 0;
+        if (!tileable && t->src[0]->ne[1] > KV_STREAM_SPAN_QUERY_WIDTH) return 0;
         return decode_bytes;
     }
     // Validate actual SET_ROWS coordinates once per input buffer per append, not once per layer.
@@ -475,8 +479,20 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
                 s->decode_bytes=std::max(s->decode_bytes,mma_bytes);
             }
         }
-        // A batch above the span shapes gathers the whole layer layout into the grant.
-        if (s->config.verify_width > KV_STREAM_SPAN_QUERY_WIDTH) {
+        // This model's session config always enables native graph attention, so the tileable
+        // predicate turns on the span shape, the absence of the F16-conversion fallback, and the
+        // resident's segmented-path capability (version 8 spans + workspace). No ring guard: the
+        // resident refreshes its slots from the installed placement, and the session's KV-layout
+        // admission keeps blocks <= slots, so a wide batch the owner claims really does tile.
+        const bool span_shape =
+            (config.host.shape.type_k == GGML_TYPE_F16 && config.host.shape.type_v == GGML_TYPE_F16) ||
+            (config.host.shape.type_k == GGML_TYPE_Q8_0 && config.host.shape.type_v == GGML_TYPE_Q4_0);
+        const bool fallback = initial.budget.page.attention == ggml_kv_stream_attention::f16;
+        s->tileable = s->config.resume_decode && span_shape && !fallback && partial_ops &&
+            partial_ops->version >= 8 && partial_ops->spans && partial_ops->spans_workspace;
+        // A batch above the span shapes gathers the whole layer layout into the grant, unless this
+        // config can serve it as span tiles, in which case the tile workspace already covers it.
+        if (s->config.verify_width > KV_STREAM_SPAN_QUERY_WIDTH && !s->tileable) {
             s->decode_bytes = std::max(s->decode_bytes, s->host->layout().bytes);
         }
         // No legal ring can exceed the entire configured device budget in encoded pages.

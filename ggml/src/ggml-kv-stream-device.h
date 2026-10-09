@@ -19,6 +19,12 @@ struct ggml_kv_stream_query_tile {
 GGML_API bool ggml_kv_stream_query_tile_make(
         size_t queries, size_t heads, size_t first, ggml_kv_stream_query_tile & output);
 
+// A verify batch wider than the span tile is attended as consecutive row tiles.
+// first_row/tile_rows are plain row units of the batch, not head-scaled element offsets.
+GGML_API size_t ggml_kv_stream_verify_tile_count(size_t rows, size_t tile);
+GGML_API bool ggml_kv_stream_verify_tile_make(size_t rows, size_t tile, size_t index,
+        size_t & first_row, size_t & tile_rows);
+
 // Optional registry extension "ggml_backend_kv_stream_partial_ops". Partial/conversion calls complete before returning;
 // version 6 resume/span calls enqueue work and require the caller's stream/event lifetime fence.
 // Getter may return null when disabled. Call outside active capture; CUDA execution errors follow backend error handling.

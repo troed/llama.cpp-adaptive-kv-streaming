@@ -1,4 +1,5 @@
 #include "../ggml/src/ggml-kv-stream.h"
+#include "../ggml/src/ggml-kv-stream-device.h"
 #include "../src/llama-kv-stream-config.h"
 #include "testing.h"
 
@@ -346,6 +347,29 @@ int main() {
         t.assert_true(graph.validate(output).status == status::overflow);
         graph.limits.key_token_multiple = 0;
         t.assert_true(graph.validate(output).status == status::invalid_shape);
+    });
+
+    t.test("verify_tiles_split_row_ranges_at_the_span_tile", [](testing & t) {
+        t.assert_equal(size_t(1), ggml_kv_stream_verify_tile_count(8, 8));
+        t.assert_equal(size_t(2), ggml_kv_stream_verify_tile_count(9, 8));
+        t.assert_equal(size_t(2), ggml_kv_stream_verify_tile_count(13, 8));
+        t.assert_equal(size_t(2), ggml_kv_stream_verify_tile_count(16, 8));
+        t.assert_equal(size_t(7), ggml_kv_stream_verify_tile_count(49, 8));
+        t.assert_equal(size_t(8), ggml_kv_stream_verify_tile_count(64, 8));
+        t.assert_equal(size_t(9), ggml_kv_stream_verify_tile_count(65, 8));
+        t.assert_equal(size_t(0), ggml_kv_stream_verify_tile_count(0, 8));
+        t.assert_equal(size_t(0), ggml_kv_stream_verify_tile_count(9, 0));
+
+        size_t first = 0, rows = 0;
+        t.assert_true(ggml_kv_stream_verify_tile_make(13, 8, 0, first, rows));
+        t.assert_equal(size_t(0), first); t.assert_equal(size_t(8), rows);
+        t.assert_true(ggml_kv_stream_verify_tile_make(13, 8, 1, first, rows));
+        t.assert_equal(size_t(8), first); t.assert_equal(size_t(5), rows);
+        t.assert_true(ggml_kv_stream_verify_tile_make(49, 8, 6, first, rows));
+        t.assert_equal(size_t(48), first); t.assert_equal(size_t(1), rows);
+        t.assert_true(!ggml_kv_stream_verify_tile_make(13, 8, 2, first, rows));
+        t.assert_true(!ggml_kv_stream_verify_tile_make(0, 8, 0, first, rows));
+        t.assert_true(!ggml_kv_stream_verify_tile_make(9, 0, 0, first, rows));
     });
 
     return t.summary();

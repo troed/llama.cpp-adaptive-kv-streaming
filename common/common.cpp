@@ -1201,9 +1201,20 @@ uint32_t common_kv_stream_auxiliary_layers(const common_params & params, int32_t
         throw std::invalid_argument("adaptive KV requires embedded MTP, not a separate draft model");
     }
     if (std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto type) {
-            return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            switch (type) {
+                case COMMON_SPECULATIVE_TYPE_NONE:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                    return false;
+                default:
+                    return true;
+            }
         })) {
-        throw std::invalid_argument("adaptive KV speculation supports only draft-mtp");
+        throw std::invalid_argument("adaptive KV speculation supports only draft-mtp and ngram-*");
     }
     if (model_nextn_layers <= 0) {
         throw std::invalid_argument("the loaded model reports no MTP layers");
