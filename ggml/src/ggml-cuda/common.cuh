@@ -1462,6 +1462,15 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // The compute graph is rebuilt for every ubatch, so its tensors - and thus the
+    // cache key here - change from one batch to the next. A long prefill therefore
+    // creates thousands of one-shot graph executables faster than the idle sweep
+    // below can retire them, and their device memory drains the process headroom
+    // until a later cudaGraphInstantiate fails (OOM) - observed as a free-VRAM drop
+    // from ~340 MiB to ~8 MiB across a 52k-token prefill. Bound the cache so the
+    // number of live executables, and their memory, stays flat.
+    static constexpr size_t max_cached_graphs = 96;
+
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
@@ -1480,6 +1489,20 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            // Evict least-recently-used entries so a churning key set cannot grow the
+            // cache without bound. The entry just inserted (and any key a caller still
+            // holds, which is always the most recent) is never the victim.
+            while (cuda_graphs.size() > max_cached_graphs) {
+                auto victim = cuda_graphs.end();
+                for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
+                    if (jt == it) continue;
+                    if (victim == cuda_graphs.end() || jt->second->last_used_time < victim->second->last_used_time) {
+                        victim = jt;
+                    }
+                }
+                if (victim == cuda_graphs.end()) break;
+                cuda_graphs.erase(victim);
+            }
         }
         it->second->last_used_time = time_now;
         return it->second.get();
