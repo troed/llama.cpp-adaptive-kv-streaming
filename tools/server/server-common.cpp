@@ -38,6 +38,18 @@
 bool server_uses_vision_arena(const common_params & params) {
     return !params.mmproj.path.empty() && (params.kv_stream_pool_bytes || params.shared_device_memory_bytes);
 }
+bool spec_type_is_ngram(enum common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
 const char * server_vision_arena_config_error(const common_params & params) {
     if (!server_uses_vision_arena(params)) return nullptr;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes)
@@ -52,7 +64,7 @@ const char * server_vision_arena_config_error(const common_params & params) {
     if (params.speculative.has_dft() || (params.kv_stream_auxiliary_layers && !mtp) ||
             params.kv_stream_auxiliary_layers > 1 || (mtp && (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > LLAMA_KV_STREAM_MTP_DRAFT_MAX)))
         return "vision arena supports only serial embedded MTP with 1-5 draft tokens";
-    for (auto type : params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+    for (auto type : params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP && !spec_type_is_ngram(type))
         return "vision arena does not support this speculation mode";
     return nullptr;
 }
@@ -60,9 +72,13 @@ const char * server_vision_arena_config_error(const common_params & params) {
 const char * server_vision_arena_request_error(const server_task & task, bool embedded_mtp) {
     if (task.type != SERVER_TASK_TYPE_COMPLETION || !task.params.lora.empty()) return "vision arena supports completion requests without LoRA";
     if (task.params.speculative.has_dft()) return "vision arena request cannot enable a draft model";
-    for (auto type : task.params.speculative.types) if (type != COMMON_SPECULATIVE_TYPE_NONE &&
-            !(embedded_mtp && type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && task.params.speculative.draft.n_max >= 1 && task.params.speculative.draft.n_max <= LLAMA_KV_STREAM_MTP_DRAFT_MAX))
-        return "vision arena request cannot change the qualified speculation mode";
+    for (auto type : task.params.speculative.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_NONE) continue;
+        const bool mtp_ok = type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                task.params.speculative.draft.n_max >= 1 && task.params.speculative.draft.n_max <= LLAMA_KV_STREAM_MTP_DRAFT_MAX;
+        if (!(embedded_mtp && (mtp_ok || spec_type_is_ngram(type))))
+            return "vision arena request cannot change the qualified speculation mode";
+    }
     try {
         for (size_t i = 0; i < task.tokens.size();) {
             if (task.tokens[i] != LLAMA_TOKEN_NULL) { ++i; continue; }
