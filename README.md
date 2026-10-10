@@ -23,7 +23,7 @@ Put this in your models-preset.ini:
 
 ```
 [Qwen3.8-27B]
-spec-type = draft-mtp
+spec-type = ngram-simple,draft-mtp
 spec-draft-n-max = 5
 spec-draft-p-min = 0.8
 device-draft = CUDA0
