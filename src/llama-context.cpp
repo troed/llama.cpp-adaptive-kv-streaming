@@ -4610,7 +4610,10 @@ bool llama_kv_stream_mtp_prepare(llama_context * ctx, uint32_t future_tokens) {
     LLAMA_LOG_DEBUG("%s: target=%zu mtp=%zu future=%u active=%d reserved=%zu\n",
         __func__, stream->tokens(), cache->tokens(), future_tokens,
         int(stream->has_mtp_layer()), stream->mtp_reserved_tokens());
-    if (cache->tokens() < 4) return true; // ordinary short-prefix MTP path
+    // The adaptive lease builds one complete-layer plan per span query width
+    // (1..KV_STREAM_SPAN_QUERY_WIDTH); an MTP history shorter than that cannot
+    // cover every width, so keep the ordinary short-prefix MTP path.
+    if (cache->tokens() < KV_STREAM_SPAN_QUERY_WIDTH) return true; // ordinary short-prefix MTP path
     const size_t frontier = stream->tokens();
     if (frontier > ctx->n_ctx()) return false;
     const size_t reserve = std::min<size_t>(future_tokens, ctx->n_ctx() - frontier);
