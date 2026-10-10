@@ -56,6 +56,9 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// spec_type_is_ngram() lives in server-common.cpp so the vision arena admission
+// and the streamed-MTP admission share one ngram allowance.
+
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
 static std::vector<llama_token> server_accept_replay(
         common_sampler * smpl,
@@ -80,21 +83,8 @@ static std::vector<llama_token> server_accept_replay(
 
     return result;
 }
-
-// The ngram speculators draft from token history, so they may share one target
-// with an attached MTP layer.
-static bool spec_type_is_ngram(common_speculative_type type) {
-    switch (type) {
-        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
-        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
-            return true;
-        default:
-            return false;
-    }
-}
+// spec_type_is_ngram() lives in server-common.cpp so the vision arena admission
+// and the streamed-MTP admission share one ngram allowance.
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
