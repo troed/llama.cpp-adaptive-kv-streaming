@@ -66,53 +66,51 @@ flash-attn = on
 - ngram speculators can run alongside attached MTP on a streamed context:
   `--spec-type ngram-simple,draft-mtp` (any `ngram-*` type works) lets the ngram
   drafter propose the wide round and the MTP head the narrow one, sharing one
-  target pool [^1]. This is not yet speed optimized, see table further down.
+  target pool [^1]. A draft wider than the span tile runs as span-width row tiles,
+  so it no longer reserves the whole-layer gather shape, and the vision projector
+  loads with the combination too [^3].
 - Attached MTP accepts more than three draft tokens: `--spec-draft-n-max` may be
   raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
 
 Previous fork of Raymond's v1 + ejectable MTP/DFlash2 and ngram-* is on [this branch](https://github.com/troed/llama.cpp-adaptive-kv-streaming/tree/feature/kv-stream-phase-arena-spec)
 ## Attached MTP depth: MTP3, MTP5, and MTP5 with ngram
 
-All columns from the same build, the same single GPU arena, and the
-same model, measured at temperature 0. MTP5 means `--spec-draft-n-max 5`; MTP3 is
-the depth Raymond's branch supports. The third column adds an ngram drafter
-alongside MTP5 (`--spec-type ngram-simple,draft-mtp`), which is currently slower
-at depth for memory reasons rather than drafting [^3]. All use
-`--spec-draft-p-min 0.7` [^2].
+All columns come from the same build, the same single GPU, and the same model,
+measured at temperature 0 on one serial request. MTP5 means
+`--spec-draft-n-max 5`; MTP3 is the depth Raymond's branch supports. The third
+column adds an ngram drafter alongside MTP5
+(`--spec-type ngram-simple,draft-mtp`), which the vision projector now loads with
+too [^3].
+
+These rows use the [installation preset](#installation-tldr-if-you-have-a-16gb-cuda-card):
+the Qwen3.8 vision projector loaded (`mmproj`), `shared-device-memory-mib 3904`,
+`--spec-draft-p-min 0.8` [^2], Q8_0 K / Q4_0 V and Flash Attention, on an
+RTX 5060 Ti with CUDA graphs enabled. Each row is a single run over the frozen
+corpus, so treat a few percent as noise; acceptance is prompt-dependent.
 
 Decode, tokens per second:
 
 | Context | MTP3 | MTP5 | MTP5 + ngram |
 | --- | --- | --- | --- |
-| 40k | 62.74 | 59.75 | 74.01 |
-| 80k | 41.83 | 44.93 | 38.30 |
-| 120k | 36.43 | 37.24 | 28.48 |
-| 160k | 40.50 | 48.56 | 33.99 |
+| 40k | 46.66 | 50.39 | 92.13 |
+| 80k | 39.14 | 52.43 | 36.81 |
+| 120k | 32.21 | 29.88 | 31.05 |
+| 160k | 24.28 | 21.36 | 20.72 |
 
 Prefill, tokens per second - the depth does not reach this path:
 
 | Context | MTP3 | MTP5 | MTP5 + ngram |
 | --- | --- | --- | --- |
-| 40k | 761.6 | 759.2 | 762.6 |
-| 80k | 657.0 | 653.4 | 653.0 |
-| 120k | 558.6 | 558.0 | 558.6 |
-| 160k | 481.7 | 480.8 | 481.8 |
+| 40k | 764.9 | 757.4 | 754.8 |
+| 80k | 657.0 | 652.4 | 652.2 |
+| 120k | 559.8 | 555.3 | 555.3 |
+| 160k | 479.4 | 475.9 | 476.9 |
 
-Decode memory and draft quality at 160k:
-
-| | MTP3 | MTP5 | MTP5 + ngram |
-| --- | --- | --- | --- |
-| Decode compute lease | 17.6 MiB | 24.6 MiB | 808.6 MiB |
-| Resident KV pages | 575 | 574 | 402 |
-| Decode KV pool | 3978 MiB | 3971 MiB | 2874 MiB |
-| Draft acceptance | 0.981 | 1.000 | 1.000 |
-| Realized verify width | 3.85 | 5.95 | 5.95 |
-| Cost per forward | 93.72 ms | 122.40 ms | 174.84 ms |
-
-Two extra MTP draft levels cost 7 MiB. Accepted tokens decide the rate, not
-width: MTP5 spends more per forward and only wins where the extra rows are
-accepted, so at 40k it accepts less and trails MTP3, while at 160k it accepts
-every drafted row and leads by 20 percent.
+The ngram mix is the clear win where the drafter finds long matches: at 40k it
+nearly doubles MTP5 (92.13 vs 50.39), because a single wide ngram round still
+lands. Past 40k its matches are rare but long; the per-round cost is dominated by
+streaming, so those fewer-but-wider rounds stop paying off and the two columns
+converge towards the depth. Accepted tokens decide the rate, not width.
 
 [^1]: The streamed verify width is derived from the configured speculators, one
 plus the widest draft any of them can produce, and clamped to the context and
@@ -122,23 +120,23 @@ model's own tile workspace, so on the shared-arena path the decode phase keeps
 its KV pool.
 
 [^2]: `--spec-draft-p-min` is the draft's minimum sampling probability. The
-measured rows above use the preset's 0.7. A different value changes how often the
-draft continues, so it moves acceptance and realized width, and the tables are
-not comparable across values.
+measured rows above use the preset's 0.8 (the installation TL;DR's value). A
+different value changes how often the draft continues, so it moves acceptance and
+realized width, and the tables are not comparable across values.
 
-[^3]: The ngram column is slower at depth on memory, not on drafting: the wide
-verify reserves VRAM the decode phase would otherwise use to stream the KV cache
-from host memory. ngram-simple's default `--spec-ngram-simple-size-m 48` makes
-the streamed verify width 49 (one plus the widest draft any configured speculator
-can produce), which is wider than the span kernels cover. The decode phase
-therefore reserves the whole-layer gather shape out of the fixed GPU arena: the
-attention grant grows to the full layer K/V layout (about 318 MiB) and the verify
-graph to about 809 MiB. That is roughly 1.1 GiB less VRAM for the decode-phase KV
-pool (about 3971 to about 2874 MiB), so about 172 fewer pages stay resident and
-every forward streams more. Only forwards wider than the span width actually
-gather; a batch at or below it still runs from the stream model's own tile
-workspace. The mix wins where the drafter finds long matches (40k above) but
-trails MTP5 alone at depth.
+[^3]: A wide ngram verify used to cost memory rather than drafting:
+ngram-simple's default `--spec-ngram-simple-size-m 48` makes the streamed verify
+width 49 (one plus the widest draft any configured speculator can produce), wider
+than the span kernels cover. The decode phase then reserved the whole-layer gather
+shape out of the GPU arena - an attention grant of about 318 MiB against about
+4.6 MiB for the span-tile figure - which cost the decode-phase KV pool roughly
+1 GiB and streamed more on every forward. A verify wider than the tile now runs
+as consecutive span-width row tiles over the same KV span
+(`src/llama-kv-stream-resident.cpp`), so the decode grant stays at the tile figure
+whenever the stream can tile and the ngram column's KV pool matches MTP5's. The
+same admission change lets the vision projector carry an `ngram-*` drafter
+alongside `draft-mtp`; the vision arena previously accepted only plain
+`draft-mtp`.
 
 ---
 

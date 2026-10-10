@@ -39,6 +39,10 @@ using json = common_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+// The ngram speculators draft from token history, so they may share one target
+// with an attached MTP layer. Shared by the streamed-MTP and vision-arena admission.
+bool spec_type_is_ngram(enum common_speculative_type type);
+
 // Qualify the serial no-speculation vision arena before model/projector allocation.
 bool server_uses_vision_arena(const common_params & params);
 const char * server_vision_arena_config_error(const common_params & params);
