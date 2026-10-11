@@ -117,8 +117,8 @@ struct llama_kv_stream_model::implementation {
              ggml_backend_buffer_get_size(attention_buffer) == decode_bytes);
         session_config.cross_token_prefetch = config.cross_token_prefetch && config.resume_decode;
         session_config.span_workspace_bytes = span_bytes;
-        // Admit decode batches up to the span ceiling; wider ones gather or fall back to stock.
-        session_config.verify_width = KV_STREAM_SPAN_QUERY_WIDTH;
+        // The admitted width covers every configured speculator, including a long ngram draft.
+        session_config.verify_width = config.verify_width;
         session_config.pool_resource = pool_id;
         session_config.writer_resource = writer_id;
         session_config.attention_resource = attention_id;

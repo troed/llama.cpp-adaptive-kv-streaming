@@ -619,7 +619,8 @@ static bool mma_span_launch_make(
 
     fattn_kernel_t ordinary = ncols1 == 1 ?
         flash_attn_ext_f16<DKQ,DV,1,8,false,false,false> : ncols1 == 2 ?
-        flash_attn_ext_f16<DKQ,DV,2,8,false,false,false> :
+        flash_attn_ext_f16<DKQ,DV,2,8,false,false,false> : ncols1 == 8 ?
+        flash_attn_ext_f16<DKQ,DV,8,2,false,false,false> :
         ncols2 == 8 ? flash_attn_ext_f16<DKQ,DV,4,8,false,false,false> :
         flash_attn_ext_f16<DKQ,DV,4,2,false,false,false>;
     auto spanned = ggml_cuda_kv_stream_mma_kernel(k->type,v->type,uint32_t(ncols1),uint32_t(ncols2));

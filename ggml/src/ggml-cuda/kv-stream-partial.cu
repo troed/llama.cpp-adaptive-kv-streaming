@@ -293,7 +293,7 @@ static bool resume_plan(
     if (!backend || !ggml_backend_is_cuda(backend) || capture_active(backend) ||
             key < 0 || key >= GGML_TYPE_COUNT || value < 0 || value >= GGML_TYPE_COUNT ||
             !heads || !kv_heads || heads%kv_heads || heads > 65535 ||
-            !queries || queries > 4 || !tokens || tokens > INT32_MAX ||
+            !queries || queries > GGML_KV_STREAM_SPAN_QUERY_WIDTH || !tokens || tokens > INT32_MAX ||
             !ggml_cuda_kv_stream_kernel(ggml_type(key),ggml_type(value))) return false;
     auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(ctx.device);
@@ -546,7 +546,7 @@ static plan_status describe_streamed(ggml_backend_t backend, const ggml_tensor *
     if (family == kernel_family::none) return plan_status::stock_unavailable;
     if (!op->src[3] || op->src[4] || ggml_get_op_params_i32(op,4) != 0 ||
             metadata.head_dim_k != 256 || metadata.head_dim_v != 256 ||
-            metadata.queries > 4) return plan_status::unsupported_geometry;
+            metadata.queries > GGML_KV_STREAM_SPAN_QUERY_WIDTH) return plan_status::unsupported_geometry;
     if (op->src[3]->nb[1] < size_t(op->src[1]->ne[1])*sizeof(half) || op->src[3]->nb[1]%sizeof(half))
         return plan_status::unsupported_geometry;
     float params[3]; std::memcpy(params, op->op_params, sizeof(params));
@@ -983,7 +983,7 @@ const ggml_kv_stream_partial_ops * ggml_cuda_kv_stream_partial_ops() {
     static_assert(sizeof(float2) == sizeof(ggml_kv_stream_partial_meta), "partial metadata ABI");
     static const ggml_kv_stream_partial_ops ops{10,supports,partial,merge,fold,clear,capabilities,supports_conversion,convert,direct,resume_plan,resume,spans,spans_workspace,convert_mma_rows,mma_workspace,
         [](ggml_backend_t backend,int32_t key,int32_t value,uint32_t heads,uint32_t kv_heads,uint32_t max_queries,size_t tokens,size_t & bytes) {
-            if (!max_queries || max_queries > 4) return false;
+            if (!max_queries || max_queries > GGML_KV_STREAM_SPAN_QUERY_WIDTH) return false;
             size_t required=0;
             for (uint32_t queries=1;queries<=max_queries;++queries) {
                 ggml_kv_stream_resume_plan plan;
