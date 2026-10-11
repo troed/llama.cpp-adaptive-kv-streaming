@@ -279,7 +279,7 @@ struct llama_kv_stream_model::implementation {
     // Answer with the tile figure the arena already reserved, for an attention op this owner streams.
     size_t attention_alloc_size(const ggml_tensor * t) const {
         if (t->op != GGML_OP_FLASH_ATTN_EXT || !supports(t) ||
-                t->src[0]->ne[1] > KV_STREAM_SPAN_QUERY_WIDTH) return 0;
+                t->src[0]->ne[1] > GGML_KV_STREAM_SPAN_QUERY_WIDTH) return 0;
         return decode_bytes;
     }
     // Validate actual SET_ROWS coordinates once per input buffer per append, not once per layer.
