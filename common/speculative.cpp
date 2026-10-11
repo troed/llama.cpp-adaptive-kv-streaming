@@ -1820,6 +1820,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                if (dp.result_q) {
+                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
+
                 if (effective_cap(dp) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
