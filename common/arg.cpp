@@ -923,8 +923,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
     const bool streamed_mtp = common_params_uses_streamed_mtp(params);
     if (streamed_mtp &&
-            params.speculative.need_n_rs_seq() > 3) {
-        throw std::invalid_argument("error: attached MTP KV streaming supports at most 3 draft tokens\n");
+            params.speculative.need_n_rs_seq() > LLAMA_KV_STREAM_MTP_DRAFT_MAX) {
+        throw std::invalid_argument("error: attached MTP KV streaming supports at most 5 draft tokens\n");
     }
     if (params.no_kv_stream_rs_rollback && !streamed_mtp) {
         throw std::invalid_argument("error: --no-kv-stream-rs-rollback requires an attached MTP KV layer\n");
