@@ -1298,11 +1298,11 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
         if (!v.data) v.data=s.binding.base;
         // A verify wider than the span tile is attended as consecutive row tiles over the same KV
         // span, so a wide verify never assembles the whole layer (the gathered path).
-        const size_t tiles=ggml_kv_stream_verify_tile_count(size_t(q->ne[1]),size_t(GGML_KV_STREAM_SPAN_TILE_WIDTH));
+        const size_t tiles=ggml_kv_stream_verify_tile_count(size_t(q->ne[1]),size_t(GGML_KV_STREAM_SPAN_QUERY_WIDTH));
         if (!tiles) return false;
         for (size_t index=0;index<tiles;++index) {
             size_t first_row=0,tile_rows=0;
-            if (!ggml_kv_stream_verify_tile_make(size_t(q->ne[1]),size_t(GGML_KV_STREAM_SPAN_TILE_WIDTH),
+            if (!ggml_kv_stream_verify_tile_make(size_t(q->ne[1]),size_t(GGML_KV_STREAM_SPAN_QUERY_WIDTH),
                     index,first_row,tile_rows)) return false;
             ggml_tensor qt=*q, mt=*mask, ot=*output;
             qt.ne[1]=int64_t(tile_rows);

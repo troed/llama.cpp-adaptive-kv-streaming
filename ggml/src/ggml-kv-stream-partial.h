@@ -10,10 +10,6 @@
 // alloc-size gate treats a batch up to this width as streamed, so the two must agree.
 #define GGML_KV_STREAM_SPAN_QUERY_WIDTH 8
 
-// Widest query batch one span kernel launch serves. The instanced MMA kernels cover up to four
-// query rows, so a wider verify is attended as consecutive row tiles over the same KV span.
-#define GGML_KV_STREAM_SPAN_TILE_WIDTH 4
-
 // Natural-exponential coordinates: numerator=sum(exp(score-max_logit)*V), normalizer=sum(exp(score-max_logit)).
 // Matches the two-float CUDA metadata record without depending on CUDA headers.
 struct alignas(8) ggml_kv_stream_partial_meta {
