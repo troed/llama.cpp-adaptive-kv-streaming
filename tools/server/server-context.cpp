@@ -79,6 +79,8 @@ static std::vector<llama_token> server_accept_replay(
     result.push_back(id);
 
     return result;
+}
+
 // The ngram speculators draft from token history, so they may share one target
 // with an attached MTP layer.
 static bool spec_type_is_ngram(common_speculative_type type) {

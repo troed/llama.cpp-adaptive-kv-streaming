@@ -20,6 +20,8 @@ struct llama_kv_stream_session_config {
     // Measured before CUDA graph capture; zero retains the direct-session query.
     size_t span_workspace_bytes = 0;
     llama_memory_stage_id suspend_stage = 0;
+    // Widest admitted decode batch; the session rejects anything wider.
+    uint32_t verify_width = 1;
     // Context-owned backend resources contain no KV views and survive serial layout replacement.
     std::shared_ptr<void> prepared_copies;
 };
