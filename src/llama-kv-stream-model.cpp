@@ -765,7 +765,7 @@ bool llama_kv_stream_model::set_ring_guard(std::shared_ptr<const llama_kv_stream
 bool llama_kv_stream_model::begin(size_t active,uint32_t queries,bool decode) {
     auto & s = *impl;
     if (!s.session || s.session->device_suspended() || s.external_mutation || s.session->active() || s.session->failed() || !queries || queries > s.config.max_batch_rows ||
-            (decode && queries > KV_STREAM_SPAN_QUERY_WIDTH) || active < s.session->tokens() || active-s.session->tokens() != queries ||
+            (decode && queries > s.config.verify_width) || active < s.session->tokens() || active-s.session->tokens() != queries ||
             active > s.host->config().context_tokens) return false;
     // A new KV page can require physical repartition; retire the MTP guard
     // before admitting that page, never after an already submitted target copy.
