@@ -1,0 +1,42 @@
+# Pre-port test baseline on Raymond's untouched tip (fuss @ 1240f34c7 + docs commit)
+
+Recorded 2026-10-11, before any porting. Environment: RTX 5060 Ti (cc 12.0), CUDA 13,
+CUDA_ARCHITECTURES=120a-real, host build/.
+
+## CPU suite - llama-test (ctest -R, build-tests/)
+
+100% tests passed out of 9 (1.07 s):
+test-kv-stream-capture, test-kv-stream-context, test-kv-stream-model,
+test-kv-stream-mtp-lease, test-kv-stream-partial, test-kv-stream-resident,
+test-kv-stream-spans, test-kv-stream-vector-spans, test-arg-parser  -- all Passed.
+
+## CUDA tests - llama-test-cuda (build-tests-cuda/)
+
+test-kv-stream-model --cuda:  29 tests, 3152 assertions, 0 failures, 0 exceptions.
+
+test-kv-stream-resume --cuda: 11 tests, 328 assertions, 1 failure, 0 exceptions.
+
+    FAIL native_resume_contract_is_available
+         ASSERT EQUAL FAILED
+         expected: 4526336
+         actual  : 2396416
+         (1 of 9 assertions failed)
+
+## Baseline failure set (the reference for every later comparison)
+
+1. test-kv-stream-resume / native_resume_contract_is_available -- PRE-EXISTING.
+   A hardcoded expected byte figure (4526336) no longer matches the tree (2396416).
+   Not caused by the port; must still be present afterwards, and must not grow.
+
+Any failure appearing after a port task that is not in this list is ours.
+
+## Build notes (environment)
+
+- `build/` full CUDA Release rebuild takes > 300 s: the synchronous `llama-build` host
+  action times out. Use `llama-build-bg` + wait-build.sh.
+- build-tests-cuda: a first attempt died silently at 34% with no TESTS_CUDA_BUILD_EXIT
+  marker while the llama router was running (host RAM was 1 GB free, load 14). After
+  `llama-stop` (freed ~40 GB), the retry compiled to 100% successfully. The marker was
+  still not appended to build-tests-cuda.log even though the build completed; the
+  artifacts (bin/*, 16:31) are fresh and the tests run, so completion was judged from
+  the artifacts and the test run, not the marker.
