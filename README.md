@@ -23,9 +23,10 @@ Put this in your models-preset.ini:
 
 ```
 [Qwen3.8-27B]
-spec-type = draft-mtp
+spec-type = ngram-simple,draft-mtp
+spec-draft-sampling = probabilistic
 spec-draft-n-max = 5
-spec-draft-p-min = 0.8
+spec-draft-p-min = 0.7
 device-draft = CUDA0
 n-gpu-layers-draft = all
 # If all 16GB are available to the model, else lower this value
