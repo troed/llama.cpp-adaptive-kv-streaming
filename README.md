@@ -92,22 +92,22 @@ Decode, tokens per second:
 
 | Context | MTP3 | MTP5 | MTP5 + ngram |
 | --- | --- | --- | --- |
-| 40k | 46.66 | 50.39 | 92.13 |
-| 80k | 39.14 | 52.43 | 36.81 |
-| 120k | 32.21 | 29.88 | 31.05 |
-| 160k | 24.28 | 21.36 | 20.72 |
+| 40k | 47.29 | 65.68 | 126.15 |
+| 80k | 43.64 | 47.71 | 43.46 |
+| 120k | 43.93 | 37.47 | 33.84 |
+| 160k | 27.89 | 47.05 | 36.53 |
 
 Prefill, tokens per second - the depth does not reach this path:
 
 | Context | MTP3 | MTP5 | MTP5 + ngram |
 | --- | --- | --- | --- |
-| 40k | 764.9 | 757.4 | 754.8 |
-| 80k | 657.0 | 652.4 | 652.2 |
-| 120k | 559.8 | 555.3 | 555.3 |
-| 160k | 479.4 | 475.9 | 476.9 |
+| 40k | 790.7 | 786.1 | 789.7 |
+| 80k | 676.3 | 677.6 | 676.4 |
+| 120k | 574.8 | 572.0 | 571.1 |
+| 160k | 494.1 | 491.6 | 491.1 |
 
 The ngram mix is the clear win where the drafter finds long matches: at 40k it
-nearly doubles MTP5 (92.13 vs 50.39), because a single wide ngram round still
+nearly doubles MTP5 (126.15 vs 65.68), because a single wide ngram round still
 lands. Past 40k its matches are rare but long; the per-round cost is dominated by
 streaming, so those fewer-but-wider rounds stop paying off and the two columns
 converge towards the depth. Accepted tokens decide the rate, not width.
