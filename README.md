@@ -1,3 +1,145 @@
+# troed's fork of Raymond's adaptive KV streaming
+
+This is a fork of
+[RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming). Their README follows. Note that for good performance when streaming KV cache your GPU needs to be on PCIe 5.0.
+
+## Installation TL;DR if you have a 16GB CUDA card:
+
+Download this [ASCII condensed version of ByteShape Qwen3.8-27B-IQ4_XS](https://huggingface.co/troed/Qwen3.8-27B-ASCII-Condensed).
+Clone and compile this repo:
+
+```
+cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_CUDA=ON \
+  -DGGML_CUDA_FA_QUANTS=q8_0-q4_0,q8_0-q8_0,q4_0-q4_0
+cmake --build build --config Release -j
+```
+
+> **Do not drop the extra `GGML_CUDA_FA_QUANTS` entries.** The `q8_0-q8_0` and `q4_0-q4_0`
+> kernels are required for native KV-stream attention; a pair-only list (`q8_0-q4_0` alone)
+> builds but makes long streaming requests fail at the prefill→decode transition. See
+> [Required FlashAttention kernels](#required-flashattention-kernels).
+
+Put this in your models-preset.ini:
+
+```
+[Qwen3.8-27B]
+spec-type = draft-mtp
+spec-draft-n-max = 5
+spec-draft-p-min = 0.8
+device-draft = CUDA0
+n-gpu-layers-draft = all
+# If all 16GB are available to the model, else lower this value
+shared-device-memory-mib = 3904
+# Any suitable template
+chat-template-file = chat_template_qwen3.8.jinja
+m = Qwen3.8-27B-ASCII-Condensed-IQ4_XS-3.84bpw.gguf
+ctx-size = 200192
+n-gpu-layers = 99
+batch-size = 256
+ubatch-size = 256
+cache-type-k = q8_0
+cache-type-v = q4_0
+fit = off
+parallel = 1
+temp = 1.0
+top-p = 0.95
+top-k = 20
+min-p = 0.0
+presence-penalty = 0.0
+repeat-penalty = 1.0
+reasoning = on
+reasoning-preserve = on
+# Original GGUF-converted mmproj
+mmproj = Qwen3.8-mmproj-BF16.gguf
+load-mode = none
+flash-attn = on
+```
+
+## What's different compared to Raymond's own repo
+
+- Synced to upstream llama.cpp: merged
+  [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+  [`436f6f89e`](https://github.com/ggml-org/llama.cpp/commit/436f6f89e1e581249900b37a5b8a12a36a6d0912) (2026-10-03).
+- Synced to Raymond's adaptive-KV fork: merged
+  [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
+  [`05c0a5e45`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/05c0a5e454210ed18bf2486dfb7a6c7eba4b1cc7) (2026-10-09)
+- ngram speculators can run alongside attached MTP on a streamed context:
+  `--spec-type ngram-simple,draft-mtp` (any `ngram-*` type works) lets the ngram
+  drafter propose the wide round and the MTP head the narrow one, sharing one
+  target pool [^1]. A draft wider than the span tile runs as span-width row tiles,
+  so it no longer reserves the whole-layer gather shape, and the vision projector
+  loads with the combination too [^3].
+- Attached MTP accepts more than three draft tokens: `--spec-draft-n-max` may be
+  raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
+
+Previous fork of Raymond's v1 + ejectable MTP/DFlash2 and ngram-* is on [this branch](https://github.com/troed/llama.cpp-adaptive-kv-streaming/tree/feature/kv-stream-phase-arena-spec)
+## Attached MTP depth: MTP3, MTP5, and MTP5 with ngram
+
+All columns come from the same build, the same single GPU, and the same model,
+measured at temperature 0 on one serial request. MTP5 means
+`--spec-draft-n-max 5`; MTP3 is the depth Raymond's branch supports. The third
+column adds an ngram drafter alongside MTP5
+(`--spec-type ngram-simple,draft-mtp`), which the vision projector now loads with
+too [^3].
+
+These rows use the [installation preset](#installation-tldr-if-you-have-a-16gb-cuda-card):
+the Qwen3.8 vision projector loaded (`mmproj`), `shared-device-memory-mib 3904`,
+`--spec-draft-p-min 0.8` [^2], Q8_0 K / Q4_0 V and Flash Attention, on an
+RTX 5060 Ti with CUDA graphs enabled. Each row is a single run over the frozen
+corpus, so treat a few percent as noise; acceptance is prompt-dependent.
+
+Decode, tokens per second:
+
+| Context | MTP3 | MTP5 | MTP5 + ngram |
+| --- | --- | --- | --- |
+| 40k | 46.66 | 50.39 | 92.13 |
+| 80k | 39.14 | 52.43 | 36.81 |
+| 120k | 32.21 | 29.88 | 31.05 |
+| 160k | 24.28 | 21.36 | 20.72 |
+
+Prefill, tokens per second - the depth does not reach this path:
+
+| Context | MTP3 | MTP5 | MTP5 + ngram |
+| --- | --- | --- | --- |
+| 40k | 764.9 | 757.4 | 754.8 |
+| 80k | 657.0 | 652.4 | 652.2 |
+| 120k | 559.8 | 555.3 | 555.3 |
+| 160k | 479.4 | 475.9 | 476.9 |
+
+The ngram mix is the clear win where the drafter finds long matches: at 40k it
+nearly doubles MTP5 (92.13 vs 50.39), because a single wide ngram round still
+lands. Past 40k its matches are rare but long; the per-round cost is dominated by
+streaming, so those fewer-but-wider rounds stop paying off and the two columns
+converge towards the depth. Accepted tokens decide the rate, not width.
+
+[^1]: The streamed verify width is derived from the configured speculators, one
+plus the widest draft any of them can produce, and clamped to the context and
+ubatch, so a wide ngram draft needs an ubatch at least that large (the load is
+refused otherwise). A verify batch a span kernel covers runs from the stream
+model's own tile workspace, so on the shared-arena path the decode phase keeps
+its KV pool.
+
+[^2]: `--spec-draft-p-min` is the draft's minimum sampling probability. The
+measured rows above use the preset's 0.8 (the installation TL;DR's value). A
+different value changes how often the draft continues, so it moves acceptance and
+realized width, and the tables are not comparable across values.
+
+[^3]: A wide ngram verify used to cost memory rather than drafting:
+ngram-simple's default `--spec-ngram-simple-size-m 48` makes the streamed verify
+width 49 (one plus the widest draft any configured speculator can produce), wider
+than the span kernels cover. The decode phase then reserved the whole-layer gather
+shape out of the GPU arena - an attention grant of about 318 MiB against about
+4.6 MiB for the span-tile figure - which cost the decode-phase KV pool roughly
+1 GiB and streamed more on every forward. A verify wider than the tile now runs
+as consecutive span-width row tiles over the same KV span
+(`src/llama-kv-stream-resident.cpp`), so the decode grant stays at the tile figure
+whenever the stream can tile and the ngram column's KV pool matches MTP5's. The
+same admission change lets the vision projector carry an `ngram-*` drafter
+alongside `draft-mtp`; the vision arena previously accepted only plain
+`draft-mtp`.
+
+---
+
 # Adaptive KV Streaming for llama.cpp V2
 
 V2 runs full-context Qwen3.8-27B on a bounded GPU KV working set. The complete KV history stays in pinned system RAM; resident GPU pages and one shared ring supply attention without dropping old tokens. V1 (`feature/kv-stream-phase-arena`) already had streaming, cross-layer prefetch, and a CUDA phase arena. V2 rebuilds those ideas on explicit memory ownership, stays closer to stock attention arithmetic, and adds long-context MTP without a second full GPU KV allocation.
@@ -65,7 +207,37 @@ Streaming follows stock's attention-family selection for the device, build and t
 
 Forward-JIT runs older-target code on a newer GPU. It does not reproduce an older card's resource limits, VRAM capacity or performance. This table is not a pass for every card in a family, Windows/MSVC or every intervening compute capability. See [build and device-check commands](docs/build.md#adaptive-kv-cuda-qualification-and-startup-errors) and the [qualification ledger](DEVICE_MEMORY_CONSUMERS_ROADMAP.md#phase-c6-end-to-end-acceptance-and-handoff).
 
-For mixed Q8_0 K / Q4_0 V, **keep `-DGGML_CUDA_FA_ALL_QUANTS=ON`**. `GGML_CUDA_FA_QUANTS=...` does not replace that option in this fork. CUDA 13 cannot compile the pre-SM75 targets; use an isolated CUDA 12.9 or earlier toolkit for those builds. A startup error naming a missing native attention query width is a kernel/build/geometry admission failure, not evidence that a larger arena will fix it.
+### Required FlashAttention kernels
+
+Native KV-stream attention needs, besides the K–V pair kernel itself, a **same-type (or
+f16-paired) kernel for each side**. Compile them with `-DGGML_CUDA_FA_ALL_QUANTS=ON`, or a
+`GGML_CUDA_FA_QUANTS` list that contains the pair *and* each side. For mixed Q8_0 K / Q4_0 V:
+
+```sh
+-DGGML_CUDA_FA_QUANTS="q8_0-q4_0,q8_0-q8_0,q4_0-q4_0"
+```
+
+If a required kernel is missing, the backend reports native direct attention as unavailable and
+the policy **silently falls back to the F16 conversion path** — this is *not* a startup error. A
+fully resident **decode** then needs a full-layer gather (~143 MiB at 90 Ki tokens) that the
+decode attention grant does not hold, and the request dies at the prefill→decode transition:
+
+```
+compute: target attention failed at layer 0, rows 1
+ggml_backend_cuda_graph_compute: managed node ... failed with status -1
+srv decode: Compute error.
+```
+
+The resolved mode is logged at load: `KV attention mode native-direct (fallback=0)` is correct;
+`f16-convert` means the kernels are missing and long streaming decodes will fail. (This is a
+real trap: a pair-only list such as `-DGGML_CUDA_FA_QUANTS=q8_0-q4_0` compiles cleanly and
+starts fine, then dies only once decode begins.)
+
+`GGML_CUDA_FA_QUANTS` is the current mechanism; `GGML_CUDA_FA_ALL_QUANTS` is deprecated in
+current ggml but still maps to `FA_QUANTS=all`. CUDA 13 cannot compile the pre-SM75 targets; use
+an isolated CUDA 12.9 or earlier toolkit for those builds. A startup error naming a missing
+native attention query width is a kernel/build/geometry admission failure, not evidence that a
+larger arena will fix it.
 
 Recent compatibility checks retain stock-equivalent MMA outputs in the tested cases; regional vector reductions have a measured maximum difference of 7.45e-9 with a 1e-8 regression guard. Matched 8K/96K/128K/160K IQ4_XS, MTP=3, fixed-2,240-MiB comparisons retain all 256 output token IDs and show no material throughput regression (prefill -0.14% to -0.03%; decode +0.08% to +0.75%). These single-pair differences are not claimed as speed improvements or universal output equivalence. The opening figure is the earlier V2 MTP sweep, not this compatibility A/B test.
 
