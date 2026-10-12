@@ -1135,7 +1135,7 @@ static void test_compat(testing & t) {
 }
 
 static void test_mtp_embd_width(testing & t) {
-    t.test("mtp_uses_n_embd_out", [&](testing & t) {
+    t.test("mtp_keeps_n_embd_inp_and_takes_state_at_n_embd_out", [&](testing & t) {
         llama_hparams hparams = {};
         hparams.n_embd             = 64;
         hparams.n_deepstack_layers = 2;   // makes n_embd_inp() = 64 + 64*2 = 192
@@ -1144,16 +1144,22 @@ static void test_mtp_embd_width(testing & t) {
         t.assert_equal("default context uses n_embd_inp (deepstack-aware)",
                 (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_LLAMA, hparams));
 
-        t.assert_equal("MTP context uses n_embd_out instead (target-model hidden state width)",
-                (size_t) 96, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
+        t.assert_equal("MTP context keeps n_embd_inp for the token embeddings",
+                (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
+
+        t.assert_equal("MTP context takes the target hidden state at n_embd_out",
+                (size_t) 96, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));
+
+        t.assert_equal("default context takes no state",
+                (size_t) 0, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_DEFAULT, hparams));
     });
 
-    t.test("mtp_falls_back_to_n_embd_when_no_override", [&](testing & t) {
+    t.test("mtp_state_falls_back_to_n_embd_when_no_override", [&](testing & t) {
         llama_hparams hparams = {};
         hparams.n_embd = 64; // no deepstack, no n_embd_out_impl override
 
-        t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_LLAMA, hparams));
         t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
+        t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));
     });
 
     t.test("dflash_uses_n_embd_inp_enc", [&](testing & t) {
@@ -1168,8 +1174,8 @@ static void test_mtp_embd_width(testing & t) {
         t.assert_equal("other archs ignore n_embd_inp_enc",
                 (size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_LLAMA, hparams));
 
-        t.assert_equal("MTP takes precedence over DFlash",
-                (size_t) 96, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_DFLASH, hparams));
+        t.assert_equal("MTP context does not change the DFlash input width",
+                (size_t) 128, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_DFLASH, hparams));
     });
 }
 
@@ -1208,36 +1214,36 @@ int main(int argc, char ** argv) {
         llama_batch_allocr allocator(4);
         if (!t.assert_true(allocator.init(builder.b,vocab,false,hidden.data()))) return;
         const auto first = allocator.split_simple(3), second = allocator.split_simple(3);
-        if (!t.assert_true(first.embd_h && second.embd_h)) return;
+        if (!t.assert_true(first.embd_state && second.embd_state)) return;
         t.assert_equal(uint32_t(3),first.n_tokens);
         t.assert_equal(uint32_t(2),second.n_tokens);
-        for (size_t i = 0; i < 6; ++i) t.assert_equal(hidden[i],first.embd_h[i]);
-        for (size_t i = 0; i < 4; ++i) t.assert_equal(hidden[6+i],second.embd_h[i]);
+        for (size_t i = 0; i < 6; ++i) t.assert_equal(hidden[i],first.embd_state[i]);
+        for (size_t i = 0; i < 4; ++i) t.assert_equal(hidden[6+i],second.embd_state[i]);
         t.assert_equal(300.0f,second.embd[0]);
         t.assert_equal(llama_pos(7),second.pos[2]);
         std::fill(hidden.begin(),hidden.end(),-1);
-        t.assert_equal(10.0f,first.embd_h[0]);
-        t.assert_equal(40.0f,second.embd_h[0]);
+        t.assert_equal(10.0f,first.embd_state[0]);
+        t.assert_equal(40.0f,second.embd_state[0]);
         if (!t.assert_true(allocator.init(builder.b,vocab,false))) return;
-        t.assert_true(allocator.split_simple(1).embd_h == nullptr);
+        t.assert_true(allocator.split_simple(1).embd_state == nullptr);
     });
 
     t.test("mtp_graph_keeps_visual_and_hidden_planes_separate", [](testing & t) {
         ggml_context_ptr ctx(ggml_init({4096,nullptr,true}));
-        llm_graph_input_embd_h input(2);
+        llm_graph_input_embd_h input(2, 2);
         input.tokens = ggml_new_tensor_1d(ctx.get(),GGML_TYPE_I32,2);
         input.embd = ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,2,2);
         input.h = ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F32,2,2);
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),ggml_backend_cpu_buffer_type()));
         if (!t.assert_true(bool(buffer))) return;
         float image[]{1,2,3,4}, hidden[]{5,6,7,8}, actual[4];
-        llama_ubatch batch{}; batch.n_tokens = 2; batch.embd = image; batch.embd_h = hidden;
+        llama_ubatch batch{}; batch.n_tokens = 2; batch.embd = image; batch.embd_state = hidden;
         input.set_input(&batch);
         ggml_backend_tensor_get(input.embd,actual,0,sizeof(actual));
         for (size_t i = 0; i < 4; ++i) t.assert_equal(image[i],actual[i]);
         ggml_backend_tensor_get(input.h,actual,0,sizeof(actual));
         for (size_t i = 0; i < 4; ++i) t.assert_equal(hidden[i],actual[i]);
-        llama_token tokens[]{1,2}; batch.token = tokens; batch.embd = hidden; batch.embd_h = nullptr;
+        llama_token tokens[]{1,2}; batch.token = tokens; batch.embd = nullptr; batch.embd_state = hidden;
         input.set_input(&batch);
         ggml_backend_tensor_get(input.h,actual,0,sizeof(actual));
         for (size_t i = 0; i < 4; ++i) t.assert_equal(hidden[i],actual[i]);
