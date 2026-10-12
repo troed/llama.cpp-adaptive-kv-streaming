@@ -574,7 +574,8 @@ static bool mma_span_launch_make(
     const int gqa_ratio = int(q->ne[2]/k->ne[2]);
     // Stock Blackwell uses eight columns for ratio six and masks the two padded heads.
     const int ncols2 = gqa_ratio > 4 ? 8 : 2;
-    const int ncols1 = q->ne[1] <= 8/ncols2 ? 8/ncols2 : q->ne[1] <= 16/ncols2 ? 16/ncols2 : 32/ncols2;
+    const int ncols1 = q->ne[1] <= 8/ncols2 ? 8/ncols2 : q->ne[1] <= 16/ncols2 ? 16/ncols2 :
+        q->ne[1] <= 32/ncols2 ? 32/ncols2 : 64/ncols2;
     const int ncols = ncols1*ncols2;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!turing_mma_available(cc)) {
@@ -620,7 +621,8 @@ static bool mma_span_launch_make(
     fattn_kernel_t ordinary = ncols1 == 1 ?
         flash_attn_ext_f16<DKQ,DV,1,8,false,false,false> : ncols1 == 2 ?
         flash_attn_ext_f16<DKQ,DV,2,8,false,false,false> : ncols1 == 8 ?
-        flash_attn_ext_f16<DKQ,DV,8,2,false,false,false> :
+        ncols2 == 8 ? flash_attn_ext_f16<DKQ,DV,8,8,false,false,false> :
+                      flash_attn_ext_f16<DKQ,DV,8,2,false,false,false> :
         ncols2 == 8 ? flash_attn_ext_f16<DKQ,DV,4,8,false,false,false> :
         flash_attn_ext_f16<DKQ,DV,4,2,false,false,false>;
     auto spanned = ggml_cuda_kv_stream_mma_kernel(k->type,v->type,uint32_t(ncols1),uint32_t(ncols2));
@@ -789,7 +791,8 @@ bool ggml_cuda_flash_attn_ext_mma_f16_spans(
     if (plan.ncols1 == 4) return plan.ncols2 == 8 ?
         ggml_cuda_flash_attn_ext_mma_f16_spans_case<4,8>(ctx,dst,spans,count,workspace,plan) :
         ggml_cuda_flash_attn_ext_mma_f16_spans_case<4,2>(ctx,dst,spans,count,workspace,plan);
-    if (plan.ncols1 == 8 && plan.ncols2 == 2) return
+    if (plan.ncols1 == 8) return plan.ncols2 == 8 ?
+        ggml_cuda_flash_attn_ext_mma_f16_spans_case<8,8>(ctx,dst,spans,count,workspace,plan) :
         ggml_cuda_flash_attn_ext_mma_f16_spans_case<8,2>(ctx,dst,spans,count,workspace,plan);
     // Geometry the span kernels do not cover; the caller falls back to stock attention.
     return false;
