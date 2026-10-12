@@ -85,29 +85,31 @@ too [^3].
 These rows use the [installation preset](#installation-tldr-if-you-have-a-16gb-cuda-card):
 the Qwen3.8 vision projector loaded (`mmproj`), `shared-device-memory-mib 3904`,
 `--spec-draft-p-min 0.8` [^2], Q8_0 K / Q4_0 V and Flash Attention, on an
-RTX 5060 Ti with CUDA graphs enabled. Each row is a single run over the frozen
-corpus, so treat a few percent as noise; acceptance is prompt-dependent.
+RTX 5060 Ti with CUDA graphs enabled. Each row is the median of three runs over
+the frozen corpus, each run after a discarded warm-up request (the first point of
+a sweep is the only cold one: CUDA-graph capture and the first decode after load
+make it read low); acceptance is prompt-dependent.
 
 Decode, tokens per second:
 
 | Context | MTP3 | MTP5 | MTP5 + ngram |
 | --- | --- | --- | --- |
-| 40k | 47.29 | 65.68 | 126.15 |
-| 80k | 43.64 | 47.71 | 43.46 |
-| 120k | 43.93 | 37.47 | 33.84 |
-| 160k | 27.89 | 47.05 | 36.53 |
+| 40k | 47.75 | 61.52 | 116.57 |
+| 80k | 43.47 | 44.76 | 41.41 |
+| 120k | 43.93 | 35.17 | 33.84 |
+| 160k | 28.22 | 41.60 | 33.67 |
 
 Prefill, tokens per second - the depth does not reach this path:
 
 | Context | MTP3 | MTP5 | MTP5 + ngram |
 | --- | --- | --- | --- |
-| 40k | 790.7 | 786.1 | 789.7 |
-| 80k | 676.3 | 677.6 | 676.4 |
-| 120k | 574.8 | 572.0 | 571.1 |
-| 160k | 494.1 | 491.6 | 491.1 |
+| 40k | 790.7 | 783.0 | 785.2 |
+| 80k | 678.5 | 670.8 | 672.3 |
+| 120k | 573.9 | 565.8 | 566.8 |
+| 160k | 494.1 | 487.0 | 486.6 |
 
 The ngram mix is the clear win where the drafter finds long matches: at 40k it
-nearly doubles MTP5 (126.15 vs 65.68), because a single wide ngram round still
+nearly doubles MTP5 (116.57 vs 61.52), because a single wide ngram round still
 lands. Past 40k its matches are rare but long; the per-round cost is dominated by
 streaming, so those fewer-but-wider rounds stop paying off and the two columns
 converge towards the depth. Accepted tokens decide the rate, not width.
