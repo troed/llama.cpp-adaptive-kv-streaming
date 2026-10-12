@@ -1249,7 +1249,11 @@ int main(int argc,char ** argv) {
     t.test("suffix_truncation_preserves_allocation_and_uploads_only_tail", [&](testing & t) {
         fixture f(backend.get(),true,GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,1024,false,1);
         ggml_kv_stream_layout page; ggml_kv_stream_layout_make(f.policy.shape,256,page);
-        auto model=llama_kv_stream_model::create({backend.get(),f.host->config(),page.bytes*8,256,4});
+        llama_kv_stream_model_config config;
+        config.backend = backend.get(); config.host = f.host->config();
+        config.pool_bytes = page.bytes*8; config.max_batch_rows = 256; config.query_heads = 4;
+        config.verify_width = KV_STREAM_SPAN_QUERY_WIDTH;
+        auto model=llama_kv_stream_model::create(config);
         if (!t.assert_true(bool(model))) return;
         ggml_backend_buffer_clear(model->buffer(),91);
         t.assert_true(model->restore(252));
