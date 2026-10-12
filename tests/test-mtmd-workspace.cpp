@@ -4,6 +4,7 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-context-memory.h"
 #include "testing.h"
+#include "llama-cpp.h"
 #include "ggml-cpu.h"
 #include <cmath>
 #include <cstring>

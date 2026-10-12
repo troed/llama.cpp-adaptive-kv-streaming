@@ -1,6 +1,7 @@
 #include "../src/llama-memory-completion.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "testing.h"
+#include "ggml-cpu.h"
 #include "ggml-cpp.h"
 
 #include <cstring>

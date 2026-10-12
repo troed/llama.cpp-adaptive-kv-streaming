@@ -4,6 +4,7 @@
 #include "../tools/mtmd/mtmd-workspace.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "testing.h"
+#include "llama-cpp.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
