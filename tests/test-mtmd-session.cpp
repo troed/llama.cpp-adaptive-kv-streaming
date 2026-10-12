@@ -3,6 +3,7 @@
 #include "../tools/mtmd/mtmd-projector-storage.h"
 #include "../src/llama-context-memory.h"
 #include "testing.h"
+#include "llama-cpp.h"
 
 #include <stdexcept>
 #include <cmath>
