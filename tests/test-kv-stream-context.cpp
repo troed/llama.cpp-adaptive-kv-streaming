@@ -409,6 +409,10 @@ int main(int argc,char ** argv) {
         vision_mtp_handoff = vision_mtp_handoff || !std::strcmp(argv[i],"--vision-mtp-handoff");
         serial_workspace_growth = serial_workspace_growth || !std::strcmp(argv[i],"--serial-workspace-growth");
     }
+    // The host actions pass only --model, so the teacher-forced width case must be
+    // selectable from the environment. LLAMA_DIAG_ARTICLE gives the prefill text;
+    // its absence falls back to a repeated pattern.
+    if (std::getenv("LLAMA_DIAG_ARTICLE") || std::getenv("LLAMA_DIAG_QUERY_WIDTH")) target_drift_control = true;
     embedded_mtp_control |= vision_mtp_handoff;
     ggml_backend_load_all(); llama_backend_init();
     ggml_backend_ptr baseline_backend;
@@ -571,24 +575,32 @@ int main(int argc,char ** argv) {
     }
     if (target_drift_control) {
         t.test("teacher_forced_target_verification_and_replay", [&](testing & t) {
-            if (!t.assert_true(argc >= 5)) return;
-            std::ifstream input(argv[4]);
-            if (!t.assert_true(bool(input))) return;
-            const std::string article((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            const char * article_path = argc >= 5 ? argv[4] : std::getenv("LLAMA_DIAG_ARTICLE");
             const size_t prefill_tokens = std::getenv("LLAMA_DIAG_PREFILL_TOKENS") ? size_t(std::atoi(std::getenv("LLAMA_DIAG_PREFILL_TOKENS"))) : 7932;
             const size_t decode_tokens = std::getenv("LLAMA_DIAG_DECODE_TOKENS") ? size_t(std::atoi(std::getenv("LLAMA_DIAG_DECODE_TOKENS"))) : 16;
             if (!t.assert_true(prefill_tokens >= 256 && prefill_tokens <= 261888 &&
                     decode_tokens >= 16 && decode_tokens <= 256 && prefill_tokens+decode_tokens <= 262144)) return;
             const auto * vocab = llama_model_get_vocab(model.get());
-            const int needed = -llama_tokenize(vocab, article.data(), int(article.size()), nullptr, 0, false, false);
-            std::vector<llama_token> tokens(needed);
-            if (!t.assert_true(llama_tokenize(vocab, article.data(), int(article.size()),
-                    tokens.data(), needed, false, false) >= int32_t(prefill_tokens))) return;
+            std::vector<llama_token> tokens;
+            if (article_path && *article_path) {
+                std::ifstream input(article_path);
+                if (!t.assert_true(bool(input))) return;
+                const std::string article((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+                const int needed = -llama_tokenize(vocab, article.data(), int(article.size()), nullptr, 0, false, false);
+                tokens.assign(needed, 0);
+                if (!t.assert_true(llama_tokenize(vocab, article.data(), int(article.size()),
+                        tokens.data(), tokens.size(), false, false) >= int32_t(prefill_tokens))) return;
+            } else {
+                const std::vector<llama_token> pattern{264,4927,5253,383,2919,4802,11,4927,5253,383,4128,958,11,4927,5253,383};
+                tokens.resize(prefill_tokens);
+                for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = pattern[i%pattern.size()];
+            }
             auto p = llama_context_default_params();
             p.n_ctx = uint32_t((prefill_tokens+decode_tokens+255)/256*256); p.n_batch = p.n_ubatch = 256;
             p.n_rs_seq = target_drift_rs_control ? 3 : 0;
             p.n_threads = p.n_threads_batch = 8;
-            p.n_outputs_max = p.n_outputs_max_per_seq = 4;
+            p.n_outputs_max = p.n_outputs_max_per_seq = GGML_KV_STREAM_SPAN_QUERY_WIDTH;
+            p.kv_stream_verify_width = GGML_KV_STREAM_SPAN_QUERY_WIDTH;
             p.type_k = GGML_TYPE_Q8_0; p.type_v = GGML_TYPE_Q4_0;
             p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
             struct diagnostic_trace {
