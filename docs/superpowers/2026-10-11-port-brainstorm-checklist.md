@@ -26,3 +26,12 @@ Path: **architectural** (announced 2026-10-11)
   LLAMA_KV_STREAM_MTP_DRAFT_MAX + draft depth 5 + llama_kv_stream_residency, ngram+MTP coexistence,
   CUDA-graph cache bound, tests/test-cuda-tile-{spans,access}.cu.
 - Droppable: de0aad10a (upstream 2026-10-03 API follow), f4bd82c47 (graph_optimize sig), docs/meta commits.
+
+## Port close-out (2026-10-12)
+- [x] All 20 port commits landed on `fuss` (Tasks 1-7).
+- [x] Span-column defect fixed: the ncols1 ladder gains stock's `64/ncols2` tier and `MMA(8,8)`;
+  the width-6 streamed verify is bit-exact again (was ~0.2 logit error).
+- [x] CUDA suite: `test-kv-stream-model --cuda` 30/3209/0; `test-kv-stream-resume --cuda` 11/328/1
+  (the baseline failure). CPU `llama-test` 9/9.
+- [x] Live run healthy on `fuss` HEAD (`8f90d79b2`); pushed to origin.
+- [ ] Task 8 improvement gate: re-measure on the fixed HEAD (the earlier ad-hoc rows predate the fix).
