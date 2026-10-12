@@ -715,7 +715,7 @@ int main(int argc,char ** argv) {
             std::vector<llama_token> continuation(decode_tokens);
             for (size_t i = 0; i < decode_tokens; ++i) continuation[i] = pattern[i%pattern.size()];
             const size_t width = std::getenv("LLAMA_DIAG_QUERY_WIDTH") ? size_t(std::atoi(std::getenv("LLAMA_DIAG_QUERY_WIDTH"))) : 2;
-            if (!t.assert_true(width >= 1 && width <= 4)) return;
+            if (!t.assert_true(width >= 1 && width <= GGML_KV_STREAM_SPAN_QUERY_WIDTH)) return;
             for (size_t first = 0; first < continuation.size(); first += width) {
                 const size_t count = std::min(width, continuation.size()-first);
                 const auto save = [&](llama_context * ctx) {

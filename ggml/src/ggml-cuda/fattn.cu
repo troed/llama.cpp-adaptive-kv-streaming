@@ -610,7 +610,7 @@ static bool mma_span_launch_make(
         next.span_shared_offset = (next.shared_bytes+15)/16*16;
         next.shared_bytes = next.span_shared_offset+3*sizeof(ggml_cuda_kv_span);
     }
-    next.ntiles_x = 1;
+    next.ntiles_x = (int(q->ne[1])+ncols1-1)/ncols1;
     next.gqa_ratio = int(q->ne[2]/k->ne[2]);
     next.ntiles_z_gqa = (next.gqa_ratio+ncols2-1)/ncols2;
     next.ntiles_dst = next.ntiles_x*next.ntiles_z_gqa*int(k->ne[2])*int(q->ne[3]);
