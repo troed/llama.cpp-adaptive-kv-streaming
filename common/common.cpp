@@ -1572,7 +1572,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
-            tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
+            // warm up with a full ubatch: a smaller warmup graph does not match the graph the
+            // scheduler reserved for prompt processing, so reserving for it discards that plan
+            const llama_token pad = tmp.back();
+            const size_t n_warmup = std::max<size_t>(1, std::min<size_t>((size_t) params.n_ubatch, (size_t) params.n_ctx));
+            tmp.resize(n_warmup, pad);
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);

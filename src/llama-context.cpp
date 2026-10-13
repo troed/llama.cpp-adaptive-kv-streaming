@@ -2428,7 +2428,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (draft_graph_rebuild) {
         auto reserve_context = memory->init_full();
         const uint32_t reserve_tokens = text_phase == llama_memory_text_phase::decode ?
-            std::min(4u, std::min(cparams.n_ctx, cparams.n_ubatch)) :
+            std::min((uint32_t) LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1, std::min(cparams.n_ctx, cparams.n_ubatch)) :
             std::min(cparams.n_ctx, cparams.n_ubatch);
         const uint32_t reserve_outputs = std::min(reserve_tokens, cparams.n_outputs_max);
         ggml_cgraph * reserved;
@@ -4838,7 +4838,7 @@ bool llama_kv_stream_mtp_prepare(llama_context * ctx, uint32_t future_tokens) {
     LLAMA_LOG_DEBUG("%s: target=%zu mtp=%zu future=%u active=%d reserved=%zu\n",
         __func__, stream->tokens(), cache->tokens(), future_tokens,
         int(stream->has_mtp_layer()), stream->mtp_reserved_tokens());
-    if (cache->tokens() < 4) return true; // ordinary short-prefix MTP path
+    if (cache->tokens() < KV_STREAM_SPAN_QUERY_WIDTH) return true; // a span plan needs this many active tokens; use the ordinary short-prefix path
     const size_t frontier = stream->tokens();
     if (frontier > ctx->n_ctx()) return false;
     const size_t reserve = std::min<size_t>(future_tokens, ctx->n_ctx() - frontier);
