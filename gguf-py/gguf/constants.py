@@ -268,6 +268,7 @@ class Keys:
         SCALING_ATTN_FACTOR       = "{arch}.rope.scaling.attn_factor"
         SCALING_ORIG_CTX_LEN      = "{arch}.rope.scaling.original_context_length"
         SCALING_FINETUNED         = "{arch}.rope.scaling.finetuned"
+        SCALING_YARN_TRUNCATE     = "{arch}.rope.scaling.yarn_truncate"
         SCALING_YARN_LOG_MUL      = "{arch}.rope.scaling.yarn_log_multiplier"
         SCALING_YARN_EXT_FACTOR   = "{arch}.rope.scaling.yarn_ext_factor"
         SCALING_YARN_ATTN_FACTOR  = "{arch}.rope.scaling.yarn_attn_factor"
@@ -307,6 +308,16 @@ class Keys:
 
     class WKV:
         HEAD_SIZE = "{arch}.wkv.head_size"
+
+    class LiliCorr:
+        HIDDEN_SIZE     = "lilicorr.hidden_size"
+        CANDIDATE_TOPK  = "lilicorr.candidate_topk"
+        NUM_HEADS       = "lilicorr.num_heads"
+        NUM_LAYERS      = "lilicorr.num_layers"
+        FACTOR_DIM      = "lilicorr.factor_dim"
+        MLP_HIDDEN_SIZE = "lilicorr.mlp_hidden_size"
+        VECTOR_EPS      = "lilicorr.vector_eps"
+        LOGIT_SCALE     = "lilicorr.logit_scale"
 
     class PosNet:
         EMBEDDING_LENGTH = "{arch}.posnet.embedding_length"
@@ -363,6 +374,7 @@ class Keys:
         CHAT_TEMPLATE_N      = "tokenizer.chat_template.{name}"
         CHAT_TEMPLATES       = "tokenizer.chat_templates"
         # Normalizer constants
+        NORMALIZER_NFC           = "tokenizer.ggml.normalizer.nfc"
         NORMALIZER_LOWERCASE     = "tokenizer.ggml.normalizer.lowercase"
         NORMALIZER_STRIP_ACCENTS = "tokenizer.ggml.normalizer.strip_accents"
         # FIM/Infill special tokens constants
@@ -672,6 +684,7 @@ class MODEL_ARCH(IntEnum):
     SPARK2_5           = auto()
     LLAMA_EMBED      = auto()
     MAINCODER        = auto()
+    MAION_CODER      = auto()
     KIMI_LINEAR      = auto()
     KIMI_K3          = auto()
     TALKIE           = auto()
@@ -1277,6 +1290,19 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    LILICORR_TOKEN_PROJ           = auto()
+    LILICORR_PASS_HIDDEN_PROJ     = auto()
+    LILICORR_SLOT_EMBD            = auto()
+    LILICORR_RANK_EMBD            = auto()
+    LILICORR_ATTN_BIAS            = auto()
+    LILICORR_CONTEXT_PROJ         = auto()
+    LILICORR_ATTN_IN_PROJ         = auto()
+    LILICORR_OUTPUT_NORM          = auto()
+    LILICORR_ANCHOR_NORM          = auto()
+    LILICORR_FACTOR_INPUT_PROJ    = auto()
+    LILICORR_OUT_HEAD             = auto()
+    LILICORR_IN_HEAD              = auto()
+    LILICORR_ANCHOR_OUT_HEAD      = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1463,6 +1489,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.SPARK2_5:         "spark2_5",
     MODEL_ARCH.LLAMA_EMBED:      "llama-embed",
     MODEL_ARCH.MAINCODER:        "maincoder",
+    MODEL_ARCH.MAION_CODER:      "maion-coder",
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
     MODEL_ARCH.KIMI_K3:          "kimi-k3",
     MODEL_ARCH.TALKIE:           "talkie",
@@ -2091,6 +2118,19 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
+    MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
+    MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
+    MODEL_TENSOR.LILICORR_RANK_EMBD:                    "lilicorr.rank_embedding",
+    MODEL_TENSOR.LILICORR_ATTN_BIAS:                    "lilicorr.attention_bias",
+    MODEL_TENSOR.LILICORR_CONTEXT_PROJ:                 "lilicorr.context_proj",
+    MODEL_TENSOR.LILICORR_ATTN_IN_PROJ:                 "lilicorr.layers.{bid}.attn.in_proj",
+    MODEL_TENSOR.LILICORR_OUTPUT_NORM:                  "lilicorr.output_norm",
+    MODEL_TENSOR.LILICORR_ANCHOR_NORM:                  "lilicorr.anchor_norm",
+    MODEL_TENSOR.LILICORR_FACTOR_INPUT_PROJ:            "lilicorr.factor_input_proj",
+    MODEL_TENSOR.LILICORR_OUT_HEAD:                     "lilicorr.out_head",
+    MODEL_TENSOR.LILICORR_IN_HEAD:                      "lilicorr.in_head",
+    MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD:              "lilicorr.anchor_out_head",
     MODEL_TENSOR.D2T:                       "d2t",
     MODEL_TENSOR.ATTN_V_GATE:               "blk.{bid}.attn_v_gate",
     MODEL_TENSOR.ATTN_V_EXP:                "blk.{bid}.attn_v_exps",
@@ -5546,6 +5586,19 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.LILICORR_TOKEN_PROJ,
+        MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
+        MODEL_TENSOR.LILICORR_SLOT_EMBD,
+        MODEL_TENSOR.LILICORR_RANK_EMBD,
+        MODEL_TENSOR.LILICORR_ATTN_BIAS,
+        MODEL_TENSOR.LILICORR_CONTEXT_PROJ,
+        MODEL_TENSOR.LILICORR_ATTN_IN_PROJ,
+        MODEL_TENSOR.LILICORR_OUTPUT_NORM,
+        MODEL_TENSOR.LILICORR_ANCHOR_NORM,
+        MODEL_TENSOR.LILICORR_FACTOR_INPUT_PROJ,
+        MODEL_TENSOR.LILICORR_OUT_HEAD,
+        MODEL_TENSOR.LILICORR_IN_HEAD,
+        MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5690,6 +5743,31 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+    ],
+    MODEL_ARCH.MAION_CODER: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.MOE_LATENT_DOWN,
+        MODEL_TENSOR.MOE_LATENT_UP,
     ],
     MODEL_ARCH.KIMI_LINEAR: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -6137,6 +6215,7 @@ class DecisionType:
     CLEF    = "clef"     # joint head over all questions, one score per option
     PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
     VLLM_DECISION2 = "vllm-decision2"  # head over the end token of each option and the last token, one score per option
+    VLLM_D3 = "vllm-d3"  # same as pplx-decider, non-causal attention
     LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
     LFM2_D1_OMNI = "lfm2-d1-omni"  # same head as laya on a bidirectional LFM2 trunk, other prompt layout
 
@@ -6186,6 +6265,7 @@ class VisionProjectorType:
     GLM5V = "glm5v"
     YOUTUVL = "youtuvl"
     NEMOTRON_V2_VL = "nemotron_v2_vl"
+    NEMOTRON_OMNI = "nemotron_omni"
     QWEN3TTS_SPKENC = "qwen3tts_spkenc" # audio: ECAPA-TDNN speaker encoder
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder

@@ -62,6 +62,7 @@ struct server_decision_context {
             case COMMON_DECISION_TYPE_OPENJEV:
             case COMMON_DECISION_TYPE_CLEF:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
+            case COMMON_DECISION_TYPE_VLLM_D3:
             case COMMON_DECISION_TYPE_LFM2_D1:
             case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
                 return true;
@@ -117,8 +118,9 @@ private:
     bool   noul_criteria_order = false; // noul options are in the order of the criteria keys, if given
     bool   choice_sorted   = false; // choice options are in the order of their keys
     bool   strict_payload  = false; // state, instructions and descriptions must be text, an object or an array
+    bool   canonical_legend = false; // non-string score descriptions are returned as canonical JSON text
 
-    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER
+    // OPENJEV, LEV, NIMBLE, PPLX_DECIDER, VLLM_D3
     std::vector<llama_token> labels;
     std::vector<std::string> label_texts; // only if the label of an option is given to the template
 
@@ -159,3 +161,6 @@ private:
 // each group is one parent and its children, it takes at most n_slots slots
 // note: the order of the tasks is preserved
 std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots);
+
+// write "<|name|>" with U+00A6 in place of "|", so text from the request is not parsed as special tokens
+std::string server_decision_escape_special_tokens(const std::string & text);

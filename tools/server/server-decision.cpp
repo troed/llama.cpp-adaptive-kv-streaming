@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <regex>
 #include <stdexcept>
 
 static const char * decision_question_type_name(server_decision_question_type type) {
@@ -100,7 +99,7 @@ void server_decision_context::init(const llama_model * model) {
         }
         n_options_max   = labels.size();
         noul_true_first = true;
-    } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
+    } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER || model_type == COMMON_DECISION_TYPE_VLLM_D3) {
         // label codes are A..Z then AA..ZZ, only the ones that are a single token are used
         std::vector<std::string> codes;
         for (char a = 'A'; a <= 'Z'; a++) {
@@ -119,6 +118,9 @@ void server_decision_context::init(const llama_model * model) {
             }
         }
         n_options_max = labels.size();
+        if (model_type == COMMON_DECISION_TYPE_VLLM_D3) {
+            canonical_legend = true;
+        }
     } else if (model_type == COMMON_DECISION_TYPE_KEV) {
         // the hidden state of an option is read at the token that ends it
         const auto toks = common_tokenize(vocab, "<|box_end|>", false, true);
@@ -149,6 +151,7 @@ void server_decision_context::init(const llama_model * model) {
         n_options_max       = 255;
         noul_criteria_order = true;
         strict_payload      = true;
+        canonical_legend    = true;
     } else if (model_type == COMMON_DECISION_TYPE_LFM2_D1) {
         n_options_max   = 255;
         noul_true_first = true;
@@ -175,8 +178,8 @@ static bool decision_is_payload(const json & val) {
 }
 
 std::vector<server_decision_question> server_decision_context::parse_questions(const json & body) const {
-    // lfm2-d1 and lfm2-d1-omni accept a null state, for example to ask about images only
-    if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1 && type != COMMON_DECISION_TYPE_LFM2_D1_OMNI)) {
+    // lfm2-d1, lfm2-d1-omni and vllm-d3 accept a null state, for example to ask about images only
+    if (!body.contains("state") || (body.at("state").is_null() && type != COMMON_DECISION_TYPE_LFM2_D1 && type != COMMON_DECISION_TYPE_LFM2_D1_OMNI && type != COMMON_DECISION_TYPE_VLLM_D3)) {
         throw std::invalid_argument("\"state\" must be provided");
     }
     if (strict_payload && !decision_is_payload(body.at("state"))) {
@@ -194,16 +197,18 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         if (!q.is_object()) {
             throw err("must be an object");
         }
-        if (!q.contains("instructions") || q.at("instructions").is_null()) {
+        // the vllm-d3 prompt has a default question
+        const json instructions = q.contains("instructions") ? q.at("instructions") : json();
+        if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3) {
             throw err("\"instructions\" must be provided");
         }
-        if (strict_payload && (!decision_is_payload(q.at("instructions")) || q.at("instructions") == "")) {
+        if (strict_payload && (!decision_is_payload(instructions) || instructions == "")) {
             throw err("\"instructions\" must be non-empty text, an object or an array");
         }
 
         server_decision_question question;
         question.id           = id;
-        question.instructions = q.at("instructions");
+        question.instructions = instructions;
 
         const std::string type_name = json_value(q, "type", std::string());
         const json        criteria  = q.contains("criteria") ? q.at("criteria") : json();
@@ -443,17 +448,43 @@ static std::string decision_kev_render(const json & val, int indent = 0) {
     return val.dump();
 }
 
+// same result as std::regex_replace with <\|([A-Za-z0-9_]+)\|>
+// std::regex is not used: libstdc++ recurses for each char, a long input overflows the stack
+std::string server_decision_escape_special_tokens(const std::string & text) {
+    const auto is_name = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    };
+    std::string out;
+    size_t n_done = 0; // the chars of text that are in out
+    for (size_t i = text.find("<|"); i != std::string::npos; i = text.find("<|", std::max(i + 1, n_done))) {
+        size_t j = i + 2;
+        while (j < text.size() && is_name(text[j])) {
+            j++;
+        }
+        if (j > i + 2 && text.compare(j, 2, "|>") == 0) {
+            out.append(text, n_done, i - n_done);
+            out += "<\xC2\xA6";
+            out.append(text, i + 2, j - i - 2);
+            out += "\xC2\xA6>";
+            n_done = j + 2;
+        }
+    }
+    if (n_done == 0) {
+        return text;
+    }
+    out.append(text, n_done, std::string::npos);
+    return out;
+}
+
 // kev text input: special tokens written in the text must not be parsed as such
 static std::string decision_kev_text(const json & val) {
-    static const std::regex re_special("<\\|([A-Za-z0-9_]+)\\|>");
-    return std::regex_replace(decision_kev_render(val), re_special, "<\xC2\xA6$1\xC2\xA6>");
+    return server_decision_escape_special_tokens(decision_kev_render(val));
 }
 
 // lfm2-d1-omni: special tokens written in the input must not be parsed as such, in keys too (d1-omni prompt.py: escape)
 static json decision_d1omni_escape(const json & val) {
-    static const std::regex re_special("<\\|([A-Za-z0-9_]+)\\|>");
     if (val.is_string()) {
-        return std::regex_replace(val.get<std::string>(), re_special, "<\xC2\xA6$1\xC2\xA6>");
+        return server_decision_escape_special_tokens(val.get<std::string>());
     }
     if (val.is_array()) {
         json out = json::array();
@@ -465,7 +496,7 @@ static json decision_d1omni_escape(const json & val) {
     if (val.is_object()) {
         json out = json::object();
         for (const auto & [key, item] : val.items()) {
-            out[std::regex_replace(key, re_special, "<\xC2\xA6$1\xC2\xA6>")] = decision_d1omni_escape(item);
+            out[server_decision_escape_special_tokens(key)] = decision_d1omni_escape(item);
         }
         return out;
     }
@@ -722,7 +753,7 @@ void server_decision_context::fill_task(
 
     const std::string prompt = render(state, questions, question, variant, files.size());
 
-    if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER) {
+    if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3) {
         // lev reads the ratings of a noul question at its first labels, not at the digits
         task.decision.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
     }
@@ -735,7 +766,7 @@ void server_decision_context::fill_task(
             task.decision.label_groups.push_back(group.size());
         }
     }
-    if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_LFM2_D1) {
+    if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM2_D1) {
         if (!files.empty()) {
             task.tokens = process_mtmd_prompt(mctx, prompt, files, init_opt);
             return;
@@ -1113,7 +1144,7 @@ static double decision_confidence_score(const std::vector<double> & probs) {
     return std::max(0.0, 1.0 - dist / dist_uniform);
 }
 
-// VLLM_DECISION2: normalized entropy, as in the reference implementation
+// VLLM_DECISION2, VLLM_D3: normalized entropy, as in the reference implementation
 static double decision_confidence_entropy(const std::vector<double> & probs) {
     if (probs.size() < 2) {
         return 1.0;
@@ -1128,7 +1159,7 @@ static double decision_confidence_entropy(const std::vector<double> & probs) {
 }
 
 double server_decision_context::get_decision_confidence(server_decision_question_type question_type, const std::vector<double> & probs) const {
-    if (type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
+    if (type == COMMON_DECISION_TYPE_VLLM_DECISION2 || type == COMMON_DECISION_TYPE_VLLM_D3) {
         return decision_confidence_entropy(probs);
     }
     switch (question_type) {
@@ -1212,8 +1243,7 @@ json server_decision_context::format_answer(const server_decision_question & que
         for (size_t i = 0; i < n; i++) {
             expected += i * probs[i];
             const json & description = question.options[i].description;
-            // vllm-decision2 returns structured descriptions as canonical JSON text
-            legend[question.options[i].key] = strict_payload && !description.is_string() ? json(decision_sort_keys(description).dump()) : description;
+            legend[question.options[i].key] = canonical_legend && !description.is_string() ? json(decision_sort_keys(description).dump()) : description;
         }
         answer["score"]         = expected;
         answer["legend"]        = legend;

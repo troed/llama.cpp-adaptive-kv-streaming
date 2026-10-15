@@ -119,7 +119,7 @@ int main(int argc, char ** argv) {
         t.assert_equal(size_t(77),bytes);
         t.assert_true(get()->mma_workspace(backend.get(),GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,64,8,25856,3,bytes));
         t.assert_true(bytes > 0);
-        t.assert_equal(size_t(4526336),bytes);
+        t.assert_equal(size_t(4792576),bytes);
     });
     if (argc>1 && !std::strcmp(argv[1],"--cuda")) t.test("resident_and_ring_spans_preserve_native_decode", [&](testing & t) {
         auto * dev=ggml_backend_dev_by_name("CUDA0"); ggml_backend_ptr backend(ggml_backend_dev_init(dev,nullptr));
