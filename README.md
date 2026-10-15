@@ -60,7 +60,7 @@ flash-attn = on
 
 - Synced to upstream llama.cpp: merged
   [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-  [`097cf33d9`](https://github.com/ggml-org/llama.cpp/commit/097cf33d9499b1eade67d51e16d7c75427e7b267) (2026-10-12).
+  [`620d2225c`](https://github.com/ggml-org/llama.cpp/commit/620d2225cc436ab0b001e3200e590e3b286ef9ab) (2026-10-15).
 - Synced to Raymond's adaptive-KV fork: merged
   [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
   [`1240f34c7`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/1240f34c77441d8afc1afecf34f60c702d436c61) (2026-10-11)
