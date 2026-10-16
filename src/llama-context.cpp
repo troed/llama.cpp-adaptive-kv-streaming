@@ -849,6 +849,11 @@ bool llama_context::prepare_compute_arenas(
         stream = static_cast<llama_memory_hybrid *>(memory.get())->get_mem_attn()->get_kv_stream();
         if (!stream) return false;
     }
+    // Only KV streaming and attached MTP borrow a graph workspace. Other contexts keep the
+    // scheduler's growable compute buffers, so graphs larger than the reserve-time size still fit.
+    if (stream == nullptr && !cparams.mtp_publish_host) {
+        return true;
+    }
     if (!cparams.pipeline_parallel && cparams.n_seq_max == 1 &&
             llama_context_memory::supported(backend_ptrs)) {
         auto * serial_parent = cparams.mtp_publish_host && mtp_target_ctx ?

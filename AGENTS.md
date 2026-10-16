@@ -246,3 +246,5 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+Prerequisite: You MUST read BRIEF.md (recent-activity notes, maintained nightly by reflect; skip if absent)

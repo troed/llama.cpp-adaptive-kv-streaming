@@ -72,6 +72,10 @@ flash-attn = on
   loads with the combination too [^3].
 - Attached MTP accepts more than three draft tokens: `--spec-draft-n-max` may be
   raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
+- DFlash2 models run without streaming: A fix to `prepare_compute_arenas`
+  (`src/llama-context.cpp`) short-circuits the graph-workspace reservation for
+  non-streaming, non-MTP contexts, keeping the scheduler's growable compute buffers so
+  large graphs — e.g. Nvidia Nemotron 3.5 Bolt's DFlash2 graph — still fit.
 
 Previous fork of Raymond's v1 + ejectable MTP/DFlash2 and ngram-* is on [this branch](https://github.com/troed/llama.cpp-adaptive-kv-streaming/tree/feature/kv-stream-phase-arena-spec)
 ## Attached MTP depth: MTP3, MTP5, and MTP5 with ngram
