@@ -670,7 +670,7 @@ llama_context::llama_context(
             params_mem.kv_stream_rs_rollback = streamed_rs_rollback;
             params_mem.kv_stream_max_rows = cparams.n_ubatch;
             params_mem.kv_stream_verify_width = cparams.kv_stream_verify_width;
-            params_mem.kv_stream_max_decode_rows = std::max(rollback_plan.workspace_rows, cparams.kv_stream_verify_width);
+            params_mem.kv_stream_max_decode_rows = rollback_plan.workspace_rows;
             for (auto & backend : backends) if (ggml_backend_get_device(backend.get()) == model.devices.front().dev) {
                 params_mem.kv_stream_backend = backend.get(); break;
             }
@@ -2554,7 +2554,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         (cparams.kv_stream_decode ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
         (cparams.serial_block_rows ?
             (n_tokens_all <= cparams.serial_block_rows ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) : cparams.mtp_publish_host ?
-            (n_tokens_all <= std::max(4u, cparams.kv_stream_verify_width) ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
+            (n_tokens_all <= (uint32_t) LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1 ? llama_memory_text_phase::decode : llama_memory_text_phase::prefill) :
             llama_memory_text_phase::unspecified);
 
     if (output_all) {

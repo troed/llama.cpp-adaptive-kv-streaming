@@ -36,7 +36,10 @@ struct llama_cparams {
         const uint32_t maximum = n_ctx < n_ubatch ? n_ctx : n_ubatch;
         if (serial_block_rows) return serial_block_rows;
         if (decode) {
-            const uint32_t rows = kv_stream_verify_width > 4 ? kv_stream_verify_width : 4;
+            // Native target decode wave: cap the verify width at the attached-MTP ceiling.
+            const uint32_t cap = LLAMA_KV_STREAM_MTP_DRAFT_MAX + 1;
+            const uint32_t width = kv_stream_verify_width < cap ? kv_stream_verify_width : cap;
+            const uint32_t rows = width > 4 ? width : 4;
             return rows < maximum ? rows : maximum;
         }
         return maximum;

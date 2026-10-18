@@ -1,4 +1,5 @@
 #include "llama-memory-recurrent-spill.h"
+#include "llama.h"
 #include "../ggml/src/ggml-backend-execution.h"
 
 #include <algorithm>
@@ -9,7 +10,7 @@
 
 bool llama_recurrent_rollback_plan_make(uint32_t depth, bool embedded_mtp, uint32_t microbatch_rows,
         llama_recurrent_rollback_plan & output) noexcept {
-    if (depth > 7 || (embedded_mtp && depth > 3) || microbatch_rows < depth+1) return false;
+    if (depth > 7 || (embedded_mtp && depth > LLAMA_KV_STREAM_MTP_DRAFT_MAX) || microbatch_rows < depth+1) return false;
     output={depth,depth+1,std::max(4u,depth+1),depth != 0,depth ? 2u : 0u};
     return true;
 }

@@ -648,7 +648,6 @@ bool llama_kv_stream_session::begin(size_t active, uint32_t queries, bool decode
     if (s.busy || s.transition_closed || s.running || s.poisoned || !s.publications || s.publications->failed() || s.publication.pending() || !s.leases[2] ||
             !queries || queries > s.config.max_batch_rows ||
             (decode && queries > s.config.verify_width) ||
-            (decode && queries > s.config.max_decode_rows) ||
             active < s.committed || active-s.committed != queries || active > s.content->host()->config().context_tokens) return false;
     session_operation guard(s.busy);
     if (s.content->generation() != s.expected_generation) { s.drain(); s.poisoned = true; return false; }
