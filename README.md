@@ -74,46 +74,57 @@ flash-attn = on
   raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
 
 Previous fork of Raymond's v1 + ejectable MTP/DFlash2 and ngram-* is on [this branch](https://github.com/troed/llama.cpp-adaptive-kv-streaming/tree/feature/kv-stream-phase-arena-spec)
-## Attached MTP depth: MTP3, MTP5, and MTP5 with ngram
+## Drafter configurations: MTP3, MTP5, MTP5 + ngram, and DFlash2
 
 All columns come from the same build, the same single GPU, and the same model,
 measured at temperature 0 on one serial request. MTP5 means
 `--spec-draft-n-max 5`; MTP3 is the depth Raymond's branch supports. The third
 column adds an ngram drafter alongside MTP5
 (`--spec-type ngram-simple,draft-mtp`), which the vision projector now loads with
-too [^3].
+too [^3]. The fourth column swaps the attached MTP head for the DFlash2 sidecar
+(`--spec-type draft-dflash`, `--spec-draft-n-max 4`, `--spec-draft-p-min 0.8`),
+which drafts from a bounded window rather than a full-history head [^4].
 
-These rows use the [installation preset](#installation-tldr-if-you-have-a-16gb-cuda-card):
+The MTP columns use the [installation preset](#installation-tldr-if-you-have-a-16gb-cuda-card):
 the Qwen3.8 vision projector loaded (`mmproj`), `shared-device-memory-mib 3904`,
 `--spec-draft-p-min 0.8` [^2], Q8_0 K / Q4_0 V and Flash Attention, on an
-RTX 5060 Ti with CUDA graphs enabled. Each row is the median of three runs over
-the frozen corpus, each run after a discarded warm-up request (the first point of
-a sweep is the only cold one: CUDA-graph capture and the first decode after load
-make it read low); acceptance is prompt-dependent.
+RTX 5060 Ti with CUDA graphs enabled. The DFlash2 column is the live preset after
+the drafter swap: the same target, KV formats and sampling, but the DFlash2
+sidecar instead of MTP, `shared-device-memory-mib 3728` and no vision projector
+[^4]. Each row is the median of three runs over the frozen corpus (the DFlash2
+column, the mean of three), each run after a discarded warm-up request (the first
+point of a sweep is the only cold one: CUDA-graph capture and the first decode
+after load make it read low); acceptance is prompt-dependent.
 
 Decode, tokens per second:
 
-| Context | MTP3 | MTP5 | MTP5 + ngram |
-| --- | --- | --- | --- |
-| 40k | 47.75 | 61.52 | 116.57 |
-| 80k | 43.47 | 44.76 | 41.41 |
-| 120k | 43.93 | 35.17 | 33.84 |
-| 160k | 28.22 | 41.60 | 33.67 |
+| Context | MTP3 | MTP5 | MTP5 + ngram | DFlash2 |
+| --- | --- | --- | --- | --- |
+| 40k | 47.75 | 61.52 | 116.57 | 46.83 |
+| 80k | 43.47 | 44.76 | 41.41 | 40.91 |
+| 120k | 43.93 | 35.17 | 33.84 | 30.61 |
+| 160k | 28.22 | 41.60 | 33.67 | 34.30 |
 
 Prefill, tokens per second - the depth does not reach this path:
 
-| Context | MTP3 | MTP5 | MTP5 + ngram |
-| --- | --- | --- | --- |
-| 40k | 790.7 | 783.0 | 785.2 |
-| 80k | 678.5 | 670.8 | 672.3 |
-| 120k | 573.9 | 565.8 | 566.8 |
-| 160k | 494.1 | 487.0 | 486.6 |
+| Context | MTP3 | MTP5 | MTP5 + ngram | DFlash2 |
+| --- | --- | --- | --- | --- |
+| 40k | 790.7 | 783.0 | 785.2 | 787.6 |
+| 80k | 678.5 | 670.8 | 672.3 | 653.6 |
+| 120k | 573.9 | 565.8 | 566.8 | 539.4 |
+| 160k | 494.1 | 487.0 | 486.6 | 463.6 |
 
 The ngram mix is the clear win where the drafter finds long matches: at 40k it
 nearly doubles MTP5 (116.57 vs 61.52), because a single wide ngram round still
 lands. Past 40k its matches are rare but long; the per-round cost is dominated by
 streaming, so those fewer-but-wider rounds stop paying off and the two columns
 converge towards the depth. Accepted tokens decide the rate, not width.
+
+DFlash2 accepts often but drafts shallower: acceptance is 0.71-0.80, yet the
+mean accepted length is only 2.5-3.1, and decode lands below MTP5 at every depth
+(46.83 vs 61.52 at 40k, 30.61 vs 35.17 at 120k). Prefill is close at 40k and
+lower with depth, though that column also runs the smaller 3728 MiB arena
+without `mmproj`, so the prefill gap is not attributable to the drafter alone.
 
 [^1]: The streamed verify width is derived from the configured speculators, one
 plus the widest draft any of them can produce, and clamped to the context and
@@ -140,6 +151,15 @@ whenever the stream can tile and the ngram column's KV pool matches MTP5's. The
 same admission change lets the vision projector carry an `ngram-*` drafter
 alongside `draft-mtp`; the vision arena previously accepted only plain
 `draft-mtp`.
+
+[^4]: DFlash2 is a separate five-layer sidecar with a 2,048-token sliding window
+that consumes target features and drafts a candidate block; it is not another
+attached MTP head (see [DFlash2](DFLASH2_ADAPTIVE_KV_ROADMAP.md)). The measured
+column is the live preset after the swap: `--spec-type draft-dflash
+--spec-draft-n-max 4 --spec-draft-p-min 0.8`, the ASCII-Condensed `Q2_K_S-MIX`
+sidecar, `shared-device-memory-mib 3728`, `ctx-size 200192` and no vision
+projector. The MTP columns instead loaded `mmproj` into a 3904 MiB arena, so the
+columns are not configuration-identical.
 
 ---
 
