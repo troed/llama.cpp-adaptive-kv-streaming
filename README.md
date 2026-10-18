@@ -63,7 +63,7 @@ flash-attn = on
   [`620d2225c`](https://github.com/ggml-org/llama.cpp/commit/620d2225cc436ab0b001e3200e590e3b286ef9ab) (2026-10-15).
 - Synced to Raymond's adaptive-KV fork: merged
   [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
-  [`1240f34c7`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/1240f34c77441d8afc1afecf34f60c702d436c61) (2026-10-11)
+  [`db8fd5d89`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/db8fd5d898b0d19be74a4269c126c23d2f62c38d) (2026-10-18)
 - ngram speculators can run alongside attached MTP on a streamed context:
   `--spec-type ngram-simple,draft-mtp` (any `ngram-*` type works) lets the ngram
   drafter propose the wide round and the MTP head the narrow one, sharing one
@@ -72,10 +72,6 @@ flash-attn = on
   loads with the combination too [^3].
 - Attached MTP accepts more than three draft tokens: `--spec-draft-n-max` may be
   raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
-- DFlash2 models run without streaming: A fix to `prepare_compute_arenas`
-  (`src/llama-context.cpp`) short-circuits the graph-workspace reservation for
-  non-streaming, non-MTP contexts, keeping the scheduler's growable compute buffers so
-  large graphs — e.g. Nvidia Nemotron 3.5 Bolt's DFlash2 graph — still fit.
 
 Previous fork of Raymond's v1 + ejectable MTP/DFlash2 and ngram-* is on [this branch](https://github.com/troed/llama.cpp-adaptive-kv-streaming/tree/feature/kv-stream-phase-arena-spec)
 ## Attached MTP depth: MTP3, MTP5, and MTP5 with ngram
