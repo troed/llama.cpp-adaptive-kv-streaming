@@ -1156,13 +1156,23 @@ private:
             return false;
         }
         const bool streamed_mtp = common_params_uses_streamed_mtp(params);
+        if (const auto * error=common_streamed_kv_config_error(params)) {
+            SRV_ERR("%s\n",error); return false;
+        }
+        const bool streamed_dflash = common_params_uses_streamed_dflash(params);
+        if (const auto * error=common_streamed_dflash_config_error(params)) {
+            SRV_ERR("%s\n",error); return false;
+        }
+        if (streamed_dflash && !has_draft) {
+            SRV_ERR("%s", "adaptive DFlash2 requires a matching separate draft model\n"); return false;
+        }
         if (params.kv_stream_auxiliary_layers && !streamed_mtp) {
             SRV_ERR("%s", "auxiliary KV layers require embedded draft-mtp and a KV stream pool or arena\n");
             return false;
         }
         if (streaming && (params.fit_params ||
-                (has_spec && !streamed_mtp))) {
-            SRV_ERR("%s", "KV streaming requires --fit off and embedded draft-mtp for text speculation\n");
+                (has_spec && !streamed_mtp && !streamed_dflash))) {
+            SRV_ERR("%s", "KV streaming requires --fit off and an admitted embedded MTP or DFlash2 pairing\n");
             return false;
         }
         // Embedded draft-mtp may run alongside ngram self-speculation; any other draft type would
@@ -1179,9 +1189,8 @@ private:
         if (streamed_mtp && (!streaming || !spec_mtp || has_draft ||
                 std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
                     unsupported_type) || params.n_parallel != 1 ||
-                params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > LLAMA_KV_STREAM_MTP_DRAFT_MAX ||
-                params.cache_type_k != GGML_TYPE_Q8_0 || params.cache_type_v != GGML_TYPE_Q4_0)) {
-            SRV_ERR("%s", "adaptive MTP currently requires serial embedded Qwen MTP with optional ngram self-speculation, 1-5 draft tokens, Q8_0 K/Q4_0 V, and an explicit KV stream pool or arena\n");
+                params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > LLAMA_KV_STREAM_MTP_DRAFT_MAX)) {
+            SRV_ERR("%s", "adaptive MTP currently requires serial embedded Qwen MTP with optional ngram self-speculation, 1-5 draft tokens, and an explicit KV stream pool or arena; cache support is checked during context initialization\n");
             return false;
         }
         if (streaming) {

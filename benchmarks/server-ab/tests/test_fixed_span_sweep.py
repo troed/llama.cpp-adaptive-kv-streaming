@@ -15,6 +15,49 @@ SPEC.loader.exec_module(SWEEP)
 
 
 class MtpSweepTests(unittest.TestCase):
+    def test_physical_auto_fitting_rejects_uvm_before_loading_inputs(self):
+        with patch("sys.argv", [str(SCRIPT), "--model", "missing.gguf", "--auto-max-arena", "--uvm"]):
+            with self.assertRaisesRegex(SystemExit, "UVM"):
+                SWEEP.main()
+
+    def test_cache_types_are_configurable_and_draft_types_are_not_overridden(self):
+        args = SimpleNamespace(server=Path("server"), model=Path("model"), batch_size=256, ubatch_size=256,
+            arena_mib=2240, port=1246, cache_type_k="q5_1", cache_type_v="q8_0")
+        for depth in (0, 3):
+            command = SWEEP.server_command(args, 8192, depth)
+            self.assertEqual(command[command.index("--cache-type-k")+1], "q5_1")
+            self.assertEqual(command[command.index("--cache-type-v")+1], "q8_0")
+            self.assertNotIn("--spec-draft-type-k", command)
+            self.assertNotIn("--spec-draft-type-v", command)
+
+    def test_explicit_points_and_shared_headroom_match_dflash_controls(self):
+        args=SimpleNamespace(contexts="16384,65536,131072,196608,262144",min_context=8192,max_context=262144,context_step=8192)
+        self.assertEqual(SWEEP.context_points(args),[16384,65536,131072,196608,262144])
+        for lengths in ((0,),(3,),(0,3)):
+            self.assertEqual(SWEEP.prompt_tokens_for_context(262144,256,lengths,15),261873)
+        self.assertEqual(SWEEP.prompt_tokens_for_context(8192,256,(0,)),7936)
+        self.assertEqual(SWEEP.prompt_tokens_for_context(8192,256,(3,)),7932)
+        for headroom in (-1,0,3,True):
+            with self.subTest(headroom=headroom),self.assertRaises(ValueError):
+                SWEEP.prompt_tokens_for_context(8192,256,(3,),headroom)
+
+    def test_explicit_points_reject_duplicates_invalid_and_empty(self):
+        for contexts in ("", "8192,8192", "8192,0", "-1,8192", "8192,nope",str(2**31)):
+            with self.subTest(contexts=contexts),self.assertRaises(ValueError):
+                SWEEP.context_points(SimpleNamespace(contexts=contexts))
+        self.assertEqual(SWEEP.context_points(SimpleNamespace(contexts=None,min_context=8192,max_context=24576,context_step=8192)),
+                         [8192,16384,24576])
+        with self.assertRaises(ValueError):
+            SWEEP.context_points(SimpleNamespace(contexts=None,min_context=1,max_context=5000,context_step=1))
+
+    def test_completed_response_does_not_hide_recovered_backend_failure(self):
+        for text in ("0.02.517.481 E graph_reserve: failed to allocate compute buffers",
+                     "decode: failed to rebuild MTP graph after shared scratch handoff",
+                     "common_context: llama_process() failed: -2", "CUDA error: out of memory"):
+            with self.assertRaises(RuntimeError):
+                SWEEP.validate_execution_log(text)
+        SWEEP.validate_execution_log("0.02.517.481 W model has unused tensor\n0.02.518.000 I decode completed")
+
     def test_mtp_command_uses_model_derived_layer_count(self):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=2240, port=1246,
