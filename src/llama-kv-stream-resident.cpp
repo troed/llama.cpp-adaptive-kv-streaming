@@ -1104,7 +1104,7 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
             uint32_t(q->ne[2]),uint32_t(s.binding.config.shape.heads),uint32_t(q->ne[1]),padded,resume_plan);
     if (bounded_prefill && !resumed) return false;
     const bool segmented = s.native_graph_attention && cross && !prefill && !s.fallback &&
-        q->ne[1] <= 8 && blocks <= slots && ops->version >= 8 && ops->spans && ops->spans_workspace &&
+        blocks <= slots && ops->version >= 8 && ops->spans && ops->spans_workspace &&
         (((prefix == padded || !resumed) && (!resumed || !resume_plan.resume_resident)) ||
          (resumed && resume_plan.kernel_config[0] == 2));
     const bool span_resume=resumed && cross && !segmented && ops->version >= 11 &&
@@ -1120,12 +1120,19 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
         lease(ggml_backend_memory_lease_retain(workspace),ggml_backend_memory_lease_free);
     auto * wb = ggml_backend_memory_lease_buffer(lease.get());
     ggml_backend_memory_region region;
-    const size_t required_workspace = bounded_prefill ? s.prefill_scratch_bytes :
+    // The segmented span path checks its scratch per tile below, so it does not charge the resume
+    // plan figure here; a resumed verify would otherwise reject before the real requirement is known.
+    const size_t required_workspace = bounded_prefill ? s.prefill_scratch_bytes : segmented ? 0 :
         (native || (resumed && !resume_plan.resume_resident)) && !s.fallback && prefix == padded ?
         0 : resumed ? resume_plan.bytes : native && !segmented ? gathered.bytes : work.bytes;
     if (!wb || !ggml_backend_memory_lease_get_region(lease.get(),&region) ||
             region.size != ggml_backend_buffer_get_size(wb) || region.size < required_workspace ||
-            ggml_backend_buffer_get_type(wb) != ggml_backend_buffer_get_type(s.binding.buffer)) return false;
+            ggml_backend_buffer_get_type(wb) != ggml_backend_buffer_get_type(s.binding.buffer)) {
+        LLAMA_LOG_WARN("%s: layer %u KV workspace rejected rows=%u required=%zu available=%zu resumed=%d segmented=%d kcfg=%d\n",
+            __func__, layer, uint32_t(q->ne[1]), required_workspace, wb ? region.size : size_t(0),
+            int(resumed), int(segmented), int(resume_plan.kernel_config[0]));
+        return false;
+    }
     const auto scratch = uintptr_t(ggml_backend_buffer_get_base(wb));
     const auto pool = uintptr_t(s.binding.base);
     if (!scratch || scratch%128 || scratch > UINTPTR_MAX-region.size || pool > UINTPTR_MAX-s.binding.capacity) return false;
@@ -1279,7 +1286,11 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
     };
     if (prefetch && !cross) for (size_t block = 0; block < std::min(slots,blocks); block += width(block)) if (!enqueue(block)) return false;
     if (!bounded_prefill && (native || (resumed && !resume_plan.resume_resident)) && !s.fallback && prefix == padded && !segmented) {
-        if (!describe(0,prefix,0,true) || !ops->direct(s.backend,&op)) return false;
+        if (!describe(0,prefix,0,true) || !ops->direct(s.backend,&op)) {
+            LLAMA_LOG_WARN("%s: layer %u resident attention rejected rows=%u prefix=%zu padded=%zu\n",
+                __func__, layer, uint32_t(q->ne[1]), prefix, padded);
+            return false;
+        }
         ++s.attention_calls; direct_result = true; return finish();
     }
     if (segmented) {
@@ -1425,14 +1436,22 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
         std::memcpy(op.op_params,&scale,sizeof(scale)); ggml_flash_attn_ext_set_prec(&op,GGML_PREC_F32);
         ggml_backend_execution_set_external_workspace(&op, ggml_backend_execution_has_external_workspace(output));
         op.src[0] = q; op.src[1] = &k; op.src[2] = &v; op.src[3] = &slice;
-        if (!ops->direct(s.backend,&op)) return false;
+        if (!ops->direct(s.backend,&op)) {
+            LLAMA_LOG_WARN("%s: layer %u gathered attention rejected rows=%u padded=%zu\n",
+                __func__, layer, uint32_t(q->ne[1]), padded);
+            return false;
+        }
         ++s.attention_calls; direct_result = true; return finish();
     };
     const auto convert_inputs = [&] {
         return !s.fallback || (ops->convert(s.backend,&k,&ck) && ops->convert(s.backend,&v,&cv));
     };
     if (resumed) {
-        if (prefix && !prefix_pending && (!describe(0,prefix,0,true) || !ops->resume(s.backend,&op,wb,resume_plan,padded,0,prefix == padded))) return false;
+        if (prefix && !prefix_pending && (!describe(0,prefix,0,true) || !ops->resume(s.backend,&op,wb,resume_plan,padded,0,prefix == padded))) {
+            LLAMA_LOG_WARN("%s: layer %u resumed prefix rejected rows=%u prefix=%zu padded=%zu\n",
+                __func__, layer, uint32_t(q->ne[1]), prefix, padded);
+            return false;
+        }
         s.attention_calls += prefix != 0 && !prefix_pending;
         if (prefix == padded) {direct_result=true; return finish();}
     } else if (native) {
@@ -1500,7 +1519,11 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
             for (const auto & request : requests)
                 if (!s.copy_ops->acquire_span(s.copies.get(),request.slot,request.pages)) return false;
             const ggml_kv_stream_span_plan_view view{s.binding.config.shape,sources.data(),sources.size(),padded,size_t(q->ne[1])};
-            if (!ops->resume_spans(s.backend,&op,wb,resume_plan,view,wave_first,end)) return false;
+            if (!ops->resume_spans(s.backend,&op,wb,resume_plan,view,wave_first,end)) {
+                LLAMA_LOG_WARN("%s: layer %u resumed spans rejected rows=%u first=%zu end=%zu padded=%zu\n",
+                    __func__, layer, uint32_t(q->ne[1]), wave_first, end, padded);
+                return false;
+            }
             ++s.attention_calls; prefix_pending=false;
             for (const auto & request : requests)
                 if (!s.copy_ops->release_span(s.copies.get(),request.slot,request.pages)) return false;
@@ -1596,7 +1619,11 @@ bool llama_kv_stream_resident::compute_streamed(uint32_t layer, ggml_tensor * q,
             };
             if (resumed) {
                 const bool last = token+tokens == padded;
-                if (!ops->resume(s.backend,&op,wb,resume_plan,padded,token,last)) return false;
+                if (!ops->resume(s.backend,&op,wb,resume_plan,padded,token,last)) {
+                    LLAMA_LOG_WARN("%s: layer %u resumed attention rejected rows=%u token=%zu padded=%zu last=%d\n",
+                        __func__, layer, uint32_t(q->ne[1]), token, padded, int(last));
+                    return false;
+                }
                 ++s.attention_calls;
                 if (prefetch && !recycle()) return false;
                 if (last) { direct_result = true; return finish(); }
