@@ -1275,8 +1275,19 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
         return "adaptive DFlash2 requires a declared --kv-stream-arena-mib budget and --fit off";
     if (params.n_parallel != 1 || params.kv_stream_auxiliary_layers ||
             std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[](auto type) {
-                return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
-            })) return "adaptive DFlash2 requires one serial slot, no auxiliary MTP layers and no other speculative mode";
+                switch (type) {
+                    case COMMON_SPECULATIVE_TYPE_NONE:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                        return false;
+                    default:
+                        return true;
+                }
+            })) return "adaptive DFlash2 requires one serial slot, no auxiliary MTP layers and no other speculative mode than ngram-*";
     if (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 7)
         return "adaptive DFlash2 supports 1-7 draft tokens";
     if (!params.mmproj.path.empty()) return "adaptive DFlash2 currently supports text only, without mmproj";

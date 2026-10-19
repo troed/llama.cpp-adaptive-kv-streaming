@@ -110,6 +110,28 @@ static void test(void) {
             }
             assert(common_streamed_dflash_config_error(invalid));
         }
+        // the ngram self-speculators draft from token history, so like attached MTP they may
+        // share the target with the DFlash2 sidecar
+        for (auto ngram : {COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
+                COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+                COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}) {
+            auto combined=dflash;
+            combined.speculative.types.push_back(ngram);
+            assert(!common_streamed_dflash_config_error(combined));
+        }
+        // the attached ngram drafter is capped to the span width so the DFlash2 serial arena
+        // never reserves a wider verify graph
+        auto capped=dflash;
+        capped.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
+        capped.speculative.ngram_simple.size_m=48;
+        assert(common_speculative_n_max(&capped.speculative)==7);
+        auto dflash_only=dflash;
+        assert(common_speculative_n_max(&dflash_only.speculative)==7);
+        auto mtp_ngram=dflash;
+        mtp_ngram.speculative.types={COMMON_SPECULATIVE_TYPE_DRAFT_MTP,COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
+        mtp_ngram.speculative.draft.n_max=5;
+        mtp_ngram.speculative.ngram_simple.size_m=48;
+        assert(common_speculative_n_max(&mtp_ngram.speculative)==48);
     }
 
     {

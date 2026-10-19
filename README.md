@@ -72,6 +72,11 @@ flash-attn = on
   loads with the combination too [^3].
 - Attached MTP accepts more than three draft tokens: `--spec-draft-n-max` may be
   raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
+- DFlash2 also accepts an `ngram-*` drafter alongside it
+  (`--spec-type ngram-simple,draft-dflash`). The attached ngram depth is capped to
+  the 8-row streamed span path (7 tokens), so the pair stays on the span path
+  instead of reserving the wider verify graph the DFlash2 serial arena cannot host.
+  DFlash2-only and MTP+ngram are unchanged.
 
 Previous fork of Raymond's v1 + ejectable MTP/DFlash2 and ngram-* is on [this branch](https://github.com/troed/llama.cpp-adaptive-kv-streaming/tree/feature/kv-stream-phase-arena-spec)
 ## Drafter configurations: MTP3, MTP5, MTP5 + ngram, and DFlash2

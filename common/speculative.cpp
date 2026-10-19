@@ -2553,6 +2553,15 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
     return result;
 }
 
+// A DFlash2 sidecar borrows the target arena for its serial block draft. The streamed span path
+// serves at most 8 query rows, so keep an attached ngram drafter on that path instead of
+// reserving a wider verify graph that the DFlash2 serial arena cannot host.
+static constexpr int32_t COMMON_SPECULATIVE_DFLASH_NGRAM_MAX = 7;
+
+static bool common_speculative_is_dflash(common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+}
+
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
     int32_t n_max = 0;
 
@@ -2586,6 +2595,10 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
         }
     }
 
+    if (std::any_of(spec->types.begin(), spec->types.end(), common_speculative_is_dflash)) {
+        n_max = std::min(n_max, COMMON_SPECULATIVE_DFLASH_NGRAM_MAX);
+    }
+
     return n_max;
 }
 
@@ -2598,6 +2611,11 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
 
     for (const auto & impl : spec->impls) {
         n_max = std::max(n_max, std::max(0, impl->n_max));
+    }
+
+    if (std::any_of(spec->impls.begin(), spec->impls.end(),
+            [](const auto & impl) { return common_speculative_is_dflash(impl->type); })) {
+        n_max = std::min(n_max, COMMON_SPECULATIVE_DFLASH_NGRAM_MAX);
     }
 
     return n_max;
@@ -3086,6 +3104,9 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    const bool has_dflash = std::any_of(spec->impls.begin(), spec->impls.end(),
+            [](const auto & impl) { return common_speculative_is_dflash(impl->type); });
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3108,15 +3129,16 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                const int32_t draft_limit = has_dflash ?
+                    std::min(dp.n_max > 0 ? dp.n_max : COMMON_SPECULATIVE_DFLASH_NGRAM_MAX,
+                             COMMON_SPECULATIVE_DFLASH_NGRAM_MAX) : dp.n_max;
+                if (draft_limit > 0 && (int) result.size() > draft_limit) {
+                    SPC_DBG("truncating draft to %d tokens\n", draft_limit);
+                    result.resize(draft_limit);
 
-                        // trim the candidates only if the drafter produced them (n-gram drafters do not)
-                        if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
-                        }
+                    // trim the candidates only if the drafter produced them (n-gram drafters do not)
+                    if (dp.result_q && !dp.result_q->empty()) {
+                        dp.result_q->resize(draft_limit);
                     }
                 }
 
