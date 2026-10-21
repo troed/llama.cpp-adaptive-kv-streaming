@@ -3717,6 +3717,8 @@ private:
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
 
+                    const bool is_new_prompt = slot.state == SLOT_STATE_STARTED;
+
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
@@ -4056,7 +4058,23 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // the MTP layer lease of the previous generation is bound to the old frontier,
+                    // and a streamed cache refuses to truncate while the lease is held
+                    if (is_new_prompt && !llama_kv_stream_mtp_release(ctx_tgt)) {
+                        SLT_WRN(slot, "%s", "failed to release the MTP layer before reusing the prompt\n");
+                    }
+
+                    if (!slot.mem.seq_rm_try(slot.id, p0, -1)) {
+                        SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+
+                        // a bounded or streamed memory can refuse an arbitrary suffix removal
+                        // (e.g. a pending publication or a long recurrent rollback)
+                        slot.mem.seq_rm(slot.id, -1, -1);
+
+                        slot.prompt.clear();
+                        slot.stats.n_prompt_cached    = 0;
+                        slot.stats.n_prompt_processed = 0;
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;

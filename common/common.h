@@ -1076,6 +1076,9 @@ struct common_memory {
 
     void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
 
+    // attempts to remove [p0, p1) from the target and the draft contexts, returns false if either refuses
+    bool seq_rm_try(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
