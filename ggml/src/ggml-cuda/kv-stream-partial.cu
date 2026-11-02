@@ -266,7 +266,7 @@ static bool partial(ggml_backend_t backend, const ggml_tensor * op, ggml_backend
         const ggml_cuda_kernel_launch_params launch({unsigned(tile.queries),2,unsigned(q->ne[2])}, {32,4,1}, 0, ctx.stream());
         ggml_cuda_kernel_launch(ggml_cuda_kv_stream_kernel(k->type,v->type), launch,
             (const char *)q->data+first*q->nb[1], (const char *)k->data, (const char *)v->data, (const char *)m->data+first*m->nb[1],
-            (const char *)nullptr, (const int *)nullptr, (float *)scratch+tile.first_row*2*256,
+            (const char *)nullptr, (const int *)nullptr, (const int *)nullptr, (float *)scratch+tile.first_row*2*256,
             (float2 *)(scratch+layout.partial.meta_offset)+tile.first_row*2,
             scale, 0.0f, 1.0f, 1.0f, uint32_t(1), 0.0f,
             int32_t(q->ne[0]), init_fastdiv_values(tile.queries), int32_t(q->ne[2]), int32_t(1),
@@ -449,7 +449,7 @@ static bool resume_launch(
     const ggml_cuda_kernel_launch_params launch({1,plan.splits,plan.heads},{32,4,1},0,ctx.stream());
     ggml_cuda_kernel_launch(kernel,launch,
         static_cast<const char *>(q->data),static_cast<const char *>(k.data),static_cast<const char *>(v.data),static_cast<const char *>(m->data),
-        (const char *) nullptr,(const int *) nullptr,partials,meta,scale,0.0f,1.0f,1.0f,uint32_t(1),0.0f,
+        (const char *) nullptr,(const int *) nullptr,(const int *) nullptr,partials,meta,scale,0.0f,1.0f,1.0f,uint32_t(1),0.0f,
         int32_t(256),init_fastdiv_values(plan.queries),int32_t(q->ne[2]),int32_t(1),
         int32_t(q->nb[1]),int32_t(q->nb[2]),int32_t(q->nb[3]),
         int32_t(256),int32_t(mask_tokens),int32_t(k.ne[2]),int32_t(1),
