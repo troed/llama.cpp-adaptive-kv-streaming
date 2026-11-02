@@ -129,7 +129,7 @@ bool ggml_cuda_kv_stream_tile_launch(ggml_backend_cuda_context & ctx, const ggml
         {(g.queries+g.ncols1-1)/g.ncols1,g.splits,g.query_heads/g.ncols2},{32,g.nthreads/32,1},0,ctx.stream());
     ggml_cuda_kernel_launch(kernel,launch,
         static_cast<const char *>(q->data),raw,static_cast<const char *>(nullptr),static_cast<const char *>(m->data),
-        static_cast<const char *>(nullptr),static_cast<const int *>(nullptr),reinterpret_cast<float *>(raw+layout.partial_offset),
+        static_cast<const char *>(nullptr),static_cast<const int *>(nullptr),static_cast<const int *>(nullptr),reinterpret_cast<float *>(raw+layout.partial_offset),
         reinterpret_cast<float2 *>(raw+layout.meta_offset),scale,0.0f,1.0f,1.0f,uint32_t(1),0.0f,
         int32_t(256),init_fastdiv_values(g.queries),int32_t(g.query_heads),int32_t(1),
         int32_t(q->nb[1]),int32_t(q->nb[2]),int32_t(q->nb[3]),

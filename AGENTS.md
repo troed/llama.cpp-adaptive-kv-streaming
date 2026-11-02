@@ -248,3 +248,6 @@ Chat template and parser:
 - [Jinja engine](common/jinja/README.md)
 
 Prerequisite: You MUST read BRIEF.md (recent-activity notes, maintained nightly by reflect; skip if absent)
+
+Testing:
+- [Slice model](skills/slice-model/SKILL.md) - build a small slice (few layers/experts) of a big HF model without downloading the full weights, to test conversion and inference

@@ -25,6 +25,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -53,6 +54,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+    GGML_UNUSED(KV_rows_ptr);
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
@@ -360,7 +362,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
 
-        ggml_cuda_syncwarp();
+        ggml_cuda_syncwarp(); // Needed for KQ synchronization.
 
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
@@ -445,8 +447,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
-        // Retire all warp-local weight readers before the next tile overwrites KQ.
-        ggml_cuda_syncwarp();
+        ggml_cuda_syncwarp(); // Needed for KQ synchronization.
     }
 
     if constexpr (resumable) {
@@ -600,7 +601,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*output_count + output_y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -625,6 +626,7 @@ static __global__ void flash_attn_ext_vec(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -641,7 +643,7 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
     flash_attn_ext_vec_impl<D,ncols,type_K,type_V,use_logit_softcap,false>(
-        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31,nb32,nb33,nullptr,0,0,true,true,int(blockIdx.y),int(gridDim.y),int(blockIdx.y),int(gridDim.y));
+        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31,nb32,nb33,nullptr,0,0,true,true,int(blockIdx.y),int(gridDim.y),int(blockIdx.y),int(gridDim.y));
 }
 
 // Save per-thread accumulators before native reductions; resume the same logical tile ownership.
@@ -654,6 +656,7 @@ static __global__ void flash_attn_ext_vec_resume(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -671,7 +674,7 @@ static __global__ void flash_attn_ext_vec_resume(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         float * state, int first, int end, bool reset, bool finish, const int32_t * mask_bounds = nullptr) {
     flash_attn_ext_vec_impl<D,ncols,type_K,type_V,false,true,tail_safe,compact_mask>(
-        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31,nb32,nb33,state,first,end,reset,finish,int(blockIdx.y),int(gridDim.y),int(blockIdx.y),int(gridDim.y),mask_bounds);
+        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31,nb32,nb33,state,first,end,reset,finish,int(blockIdx.y),int(gridDim.y),int(blockIdx.y),int(gridDim.y),mask_bounds);
 
 }
 
