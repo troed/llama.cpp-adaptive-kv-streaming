@@ -10,6 +10,7 @@
 #include "llama-kv-stream-mtp-proxy.h"
 #include "llama-memory-bounded-kv.h"
 #include "ggml-alloc.h"
+#include "../ggml/src/ggml-backend-execution.h"
 #include "../ggml/src/ggml-kv-stream-device.h"
 
 #include <algorithm>
@@ -578,7 +579,10 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
                 continue;
             }
 
-            const auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            const auto buft = [&](ggml_backend_buffer_type_t cache_buft) {
+                // a streamed cache sits on an execution-only host buft that cannot hand out standalone buffers
+                return ggml_backend_buft_is_execution(cache_buft) ? ggml_backend_cpu_buffer_type() : cache_buft;
+            }(ggml_backend_buffer_get_type(cache->buffer));
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };

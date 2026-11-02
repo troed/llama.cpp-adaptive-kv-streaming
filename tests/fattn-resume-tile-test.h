@@ -68,7 +68,7 @@ static void check_tile(ggml_backend_t backend, int active, int queries, int spli
             auto * out = reinterpret_cast<float *>(outputs[implementation].data+guard);
             auto * meta = reinterpret_cast<float2 *>(metadata[implementation].data+guard);
             const char * k_data = dense_k.data, * v_data = dense_v.data;
-#define TILE_ARGS q.data,k_data,v_data,mask.data,sinks.data,nullptr,out,meta, \
+#define TILE_ARGS q.data,k_data,v_data,mask.data,sinks.data,nullptr,nullptr,out,meta, \
     1.0f/16,0.0f,1.0f,1.0f,0u,0.0f,width,init_fastdiv_values(queries),heads,1, \
     width*4,queries*width*4,heads*queries*width*4,width,extent,kv_heads,1, \
     width*2,capacity*width*2,int64_t(capacity)*width*kv_heads*2, \

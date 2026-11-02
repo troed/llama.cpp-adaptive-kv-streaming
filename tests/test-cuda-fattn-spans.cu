@@ -261,7 +261,7 @@ static void check_attention(int queries, int active, int count, bool interleaved
         const int m1 = capacity*2, m2 = queries*m1;
         const char * k_data = implementation == 0 ? (encoded ? encoded->dense_key.data : key.dense.data) : prototype.data;
         const char * v_data = implementation == 0 ? (encoded ? encoded->dense_value.data : value.dense.data) : prototype.data;
-#define ATTENTION_ARGS q.data,k_data,v_data,mask.data,nullptr,nullptr,out,fixup, \
+#define ATTENTION_ARGS q.data,k_data,v_data,mask.data,nullptr,nullptr,nullptr,out,fixup, \
     1.0f/16.0f,0.0f,1.0f,1.0f,0u,0.0f,dim,init_fastdiv_values(queries),heads,1,q1,q2,q3, \
     dim,capacity,span_fixture::heads,1,k1,k2_stride,int64_t(k3),k1,k2_stride,int64_t(k3), \
     queries,1,1,m1,m2,int64_t(m2)
