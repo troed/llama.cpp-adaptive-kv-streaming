@@ -115,7 +115,7 @@ static void check_vector(int active, int queries, int splits, int wave, bool sin
             const char * mask_data = implementation == 0 || !compact_mask ? mask.data : nullptr;
             const auto * mask_bounds = compact_mask ? reinterpret_cast<const int32_t *>(bounds.data) : nullptr;
             int k_head = capacity*k_row, v_head = capacity*v_row;
-#define VECTOR_ARGS q.data,k_data,v_data,mask_data,sink ? sinks.data : nullptr,nullptr,out,meta, \
+#define VECTOR_ARGS q.data,k_data,v_data,mask_data,sink ? sinks.data : nullptr,nullptr,nullptr,out,meta, \
     1.0f/16,0.0f,1.0f,1.0f,0u,0.0f,width,init_fastdiv_values(queries),heads,1, \
     width*4,queries*width*4,heads*queries*width*4,width,capacity,kv_heads,1, \
     k_row,k_head,int64_t(k_head)*kv_heads,v_row,v_head,int64_t(v_head)*kv_heads, \
