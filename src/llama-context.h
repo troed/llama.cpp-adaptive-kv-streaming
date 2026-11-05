@@ -49,6 +49,14 @@ struct llama_context {
     llama_context(
             const llama_model & model,
                   llama_context_params params);
+    llama_context(
+            const llama_model & model,
+                  llama_context_params params,
+                  uint32_t serial_prediction_rows);
+    llama_context(
+            const llama_model & model,
+                  llama_context_params params,
+                  uint32_t serial_prediction_rows, bool serial_image_inputs);
 
     ~llama_context();
 
@@ -89,6 +97,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    llama_memory_kv_resources get_kv_resources() const noexcept { return kv_resources; }
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -309,6 +318,10 @@ private:
     // Create and attach arena workspaces from phase-major scheduler measurements.
     bool prepare_compute_arenas(const std::vector<size_t> & measurements, size_t n_phases);
     bool publish_mtp_kv(const llama_ubatch & ubatch, const llm_graph_result & graph);
+    // Snapshot committed target sources after their writes and before submitting any native or streamed reader.
+    bool prepare_shared_kv_read();
+    // Complete native readers before releasing physical pins. A failed drain retains the closed frame.
+    bool finish_shared_kv_read() noexcept;
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -394,6 +407,7 @@ private:
     std::unique_ptr<llama_context_memory_loan> publication_stage;
     // Memory consumers may drain backend work during teardown, including constructor-failure unwinding.
     llama_memory_ptr memory;
+    llama_memory_kv_resources kv_resources;
 
     // The scheduler is declared after the arenas and backends so it is destroyed first.
     std::vector<llama_compute_arena_binding> compute_arenas;
@@ -405,9 +419,20 @@ private:
     // Validated source context outlives this MTP context; no cross-context ownership cycle.
     llama_context * mtp_target_ctx = nullptr;
     llama_context * serial_target_ctx = nullptr;
+    bool kv_read_frame_active = false;
     bool serial_feature_producer = false;
+    bool serial_feature_images = false;
     std::vector<int32_t> serial_feature_layers;
     std::vector<std::pair<llama_token,llama_pos>> serial_feature_rows;
+    struct serial_feature_image_row {
+        bool has_embd;
+        size_t offset;
+        std::array<llama_pos,GGML_MROPE_SECTIONS> position;
+    };
+    std::vector<serial_feature_image_row> serial_feature_image_rows;
+    std::vector<float> serial_feature_image_values;
+    size_t serial_feature_image_width = 0;
+    void clear_serial_features();
 
     llama_compute_reserve_state sched_reserve_state;
 

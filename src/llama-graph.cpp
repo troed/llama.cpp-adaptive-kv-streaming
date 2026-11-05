@@ -32,12 +32,12 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams, bool allow_compact_mask = true) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    if (cparams.kv_stream_mask && !cparams.kv_stream_decode) {
+    if (allow_compact_mask && cparams.kv_stream_mask && !cparams.kv_stream_decode) {
         ggml_tensor * res=ggml_new_tensor_2d(ctx,GGML_TYPE_I32,4,n_tokens);
         ggml_set_input(res);
         ggml_set_name(res,"attn_inp_kq_bounds");
@@ -58,12 +58,12 @@ static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams, bool allow_compact_mask = true) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    const bool compact=cparams.kv_stream_mask && !cparams.kv_stream_decode;
+    const bool compact=allow_compact_mask && cparams.kv_stream_mask && !cparams.kv_stream_decode;
     if (compact || kq_mask->type == GGML_TYPE_I32) return compact && kq_mask->type == GGML_TYPE_I32 &&
         kq_mask->ne[0] == 4 && kq_mask->ne[1] == n_tokens && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
 
@@ -3025,7 +3025,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
         if (compact_mask) GGML_ASSERT(ggml_backend_execution_set_mask_bounds(cur,kq_mask));
         ggml_backend_execution_set_external_workspace(cur,
-            cparams.mtp_publish_host ? cparams.mtp_span_attention : cparams.kv_stream_decode || cparams.kv_stream_prefill);
+            (cparams.mtp_publish_host ? cparams.mtp_span_attention : cparams.kv_stream_decode || cparams.kv_stream_prefill) ||
+            (cparams.kv_shared_read && managed_k && managed_k == managed_v));
         if (cparams.kv_stream_prefill && !cparams.mtp_publish_host) ggml_backend_execution_set_verified_workspace(cur);
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
@@ -3598,16 +3599,24 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
 
     // optionally store to KV cache
+    ggml_tensor * copy_k = nullptr;
     if (store_kv && k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        copy_k = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_build_forward_expand(gf, copy_k);
     }
 
     if (store_kv && v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        auto * copy_v = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        ggml_backend_buffer_t managed = nullptr;
+        if (copy_k && ggml_backend_execution_owner(copy_v, managed) && managed) {
+            // Keep the paired K producer live until managed V publication.
+            copy_v->src[3] = copy_k->src[0];
+        }
+        ggml_build_forward_expand(gf, copy_v);
     }
 
     const auto & kq_mask = is_swa ? inp->self_attn_mask_swa.cnv : inp->self_attn_mask.cnv;

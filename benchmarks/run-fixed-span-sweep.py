@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -34,11 +35,13 @@ def parse_mtp_lengths(value: str) -> tuple[int, ...]:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--model-draft",type=Path,help="optional external MTP assistant; never loaded for length 0")
     parser.add_argument(
         "--prefill-text", type=Path, default=ROOT / "benchmarks/data/online-articles-262144-words.txt",
         help="UTF-8 article text to tokenize once and use as the prefill prefix (default: benchmarks/data/online-articles-262144-words.txt)",
     )
-    parser.add_argument("--server", type=Path, default=ROOT / "build-device-memory-infra-cuda-release/bin/llama-server")
+    executable = "llama-server.exe" if os.name == "nt" else "llama-server"
+    parser.add_argument("--server", type=Path, default=ROOT / "build-device-memory-infra-cuda-release/bin" / executable)
     parser.add_argument("--output", type=Path, default=ROOT / "benchmarks/results/fixed-span-8k-256k")
     parser.add_argument("--min-context", type=int, default=8192)
     parser.add_argument("--max-context", type=int, default=262144,
@@ -48,6 +51,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--prompt-headroom", type=int,
                         help="reserve this many positions beyond decode tokens; use 15 to match DFlash2 D=7 controls")
     parser.add_argument("--decode-tokens", type=int, default=256)
+    parser.add_argument("--request-timeout",type=float,default=1800,help="full-workload request timeout in seconds (1..43200)")
     parser.add_argument("--arena-mib", type=int, default=2368,
                         help="fixed arena size in MiB, or starting probe when --auto-max-arena is set")
     parser.add_argument("--auto-max-arena", action="store_true",
@@ -56,9 +60,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--ubatch-size", type=int, default=256)
     parser.add_argument("--cache-type-k", choices=KV_TYPES, default="q8_0")
     parser.add_argument("--cache-type-v", choices=KV_TYPES, default="q4_0")
+    parser.add_argument("--h2d-reference-gbps", type=float,
+                        help="measured pinned host-to-device bandwidth in decimal GB/s; enables estimated KV-payload percentage, not a PCIe bus-utilization measurement")
     parser.add_argument("--port", type=int, default=1246)
     parser.add_argument("--production-container", default="llm-llmster")
-    parser.add_argument("--no-manage-production", action="store_true")
+    parser.add_argument("--manage-production", action=argparse.BooleanOptionalAction, default=os.name != "nt",
+                        help="stop/restart the configured Podman container (default: off on Windows, on elsewhere)")
     parser.add_argument("--uvm", action="store_true")
     parser.add_argument("--no-kv-stream-rs-rollback", action="store_true",
                         help="use the old full-checkpoint path instead of default MTP recurrent rollback")
@@ -66,7 +73,13 @@ def arguments() -> argparse.Namespace:
         "--mtp-lengths", type=parse_mtp_lengths, default=(0,), metavar="N[,N...]",
         help="maximum MTP draft lengths to sweep (0=target-only baseline; supported: 1-4; default: 0)",
     )
-    return parser.parse_args()
+    args=parser.parse_args()
+    if not math.isfinite(args.request_timeout) or not 1<=args.request_timeout<=43200:
+        parser.error("--request-timeout must be finite and within 1..43200 seconds")
+    if args.h2d_reference_gbps is not None and (not math.isfinite(args.h2d_reference_gbps) or args.h2d_reference_gbps <= 0):
+        parser.error("--h2d-reference-gbps must be finite and positive")
+    args.no_manage_production = not args.manage_production
+    return args
 
 
 def server_command(args: argparse.Namespace, context: int, mtp_length: int, arena_mib: int | None = None) -> list[str]:
@@ -85,6 +98,8 @@ def server_command(args: argparse.Namespace, context: int, mtp_length: int, aren
         "--cache-type-v", getattr(args, "cache_type_v", "q4_0"),
         "--kv-stream-arena-mib", str(args.arena_mib if arena_mib is None else arena_mib),
         "--fit", "off",
+        "--offline",
+        "--no-context-shift",
         "--no-mmproj",
         "--host", "127.0.0.1",
         "--port", str(args.port),
@@ -97,13 +112,16 @@ def server_command(args: argparse.Namespace, context: int, mtp_length: int, aren
             "--spec-type", "draft-mtp",
             "--spec-draft-n-max", str(mtp_length),
         ]
+        if getattr(args,"model_draft",None) is not None:
+            command += ["--model-draft",str(args.model_draft),"--spec-draft-ngl","999",
+                "--spec-draft-n-min","0","--spec-draft-p-min","0"]
         if getattr(args, "no_kv_stream_rs_rollback", False):
             command.append("--no-kv-stream-rs-rollback")
     return command
 
 
 def server_environment(uvm: bool) -> dict[str, str]:
-    env = os.environ.copy()
+    env = {key:value for key,value in os.environ.items() if not key.startswith("LLAMA_ARG_")}
     if uvm:
         env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
     else:
@@ -143,12 +161,16 @@ class ArenaTooSmallError(RuntimeError):
         super().__init__(f"arena too small; reported minimum={minimum_mib} MiB")
 
 
-def arena_minimum_mib(log_text: str) -> int | None:
-    lines = re.findall(r"shared arena quota insufficient[^\r\n]*", log_text, re.IGNORECASE)
+def arena_minimum_mib(log_text: str, *, include_mtp_fallback_hint: bool = True) -> int | None:
+    diagnostics = (r"shared arena quota insufficient|persistent local cache does not fit the declared shared arena:\s*insufficient arena quota"
+                   r"|shared MTP arena quota requires")
+    if include_mtp_fallback_hint:
+        diagnostics += r"|MTP graph exceeds shared arena quota:"
+    lines = re.findall(r"(?:"+diagnostics+r")[^\r\n]*", log_text, re.IGNORECASE)
     if not lines:
         return None
     required = [int(value) for line in lines for value in
-                re.findall(r"(?:required|compute minimum)=(\d+) bytes", line, re.IGNORECASE)]
+                re.findall(r"(?:required|compute minimum)=(\d+)(?=[,\s;]|$)", line, re.IGNORECASE)]
     # Older binaries may reject the quota without reporting its exact minimum.
     return (max(required) + 1048575) // 1048576 if required else 0
 
@@ -300,8 +322,9 @@ def probe_arena(args: argparse.Namespace, context: int, mtp_length: int, arena_m
     command = server_command(args, context, mtp_length, arena_mib)
     failure = None
     started = time.monotonic()
-    with log_path.open("w") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=server_environment(args.uvm))
+    with log_path.open("w", encoding="utf-8") as log:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=server_environment(args.uvm), creationflags=flags)
         try:
             wait_ready(url, process, log_path)
             if article_text is None:
@@ -342,7 +365,7 @@ def probe_arena(args: argparse.Namespace, context: int, mtp_length: int, arena_m
                         "cache_prompt": False,
                         "stream": True,
                         "return_tokens": True,
-                    }, timeout=1800)
+                    }, timeout=getattr(args,"request_timeout",1800))
                     timing = result["timings"]
                     if timing.get("prompt_n") != prompt_count or timing.get("predicted_n") != args.decode_tokens or len(result["tokens"]) != args.decode_tokens:
                         raise RuntimeError(f"arena full workload did not complete: timings={timing}, token_ids={len(result['tokens'])}")
@@ -358,12 +381,12 @@ def probe_arena(args: argparse.Namespace, context: int, mtp_length: int, arena_m
     label = "full" if full_workload else "fast"
     if failure is None:
         try:
-            validate_execution_log(log_path.read_text(errors="replace"))
+            validate_execution_log(log_path.read_text(encoding="utf-8", errors="replace"))
         except RuntimeError as error:
             failure = error
     if failure is not None:
-        log_text = log_path.read_text(errors="replace")
-        minimum = arena_minimum_mib(log_text)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        minimum = arena_minimum_mib(log_text, include_mtp_fallback_hint=is_arena_capacity_failure(log_text))
         if minimum is not None:
             print(f"arena probe ({label}): context={context} mtp={mtp_length} arena={arena_mib} MiB -> too small (reported minimum={minimum} MiB)", flush=True)
             raise ArenaTooSmallError(minimum) from failure
@@ -403,8 +426,8 @@ def arena_for_point(args: argparse.Namespace, context: int, mtp_length: int, log
     return find_max_arena_mib(fast_max, full_fits, upper_limit=fast_max)
 
 
-def decode_layout(log_path: Path) -> tuple[float, int, int, int, float, int]:
-    text = log_path.read_text(errors="replace")
+def decode_layout(log_path: Path) -> tuple[float, int, int, int, float | None, int | None]:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
     phase = re.findall(
         r"memory_phase: phase=decode .*?kv_pool=(\d+).*?resident_pages=(\d+).*?"
         r"ring_slots=(\d+).*?active_pages=(\d+)",
@@ -414,7 +437,7 @@ def decode_layout(log_path: Path) -> tuple[float, int, int, int, float, int]:
     if not phase:
         raise RuntimeError(f"missing decode layout telemetry in {log_path}")
     pool, resident, ring, active = map(int, phase[-1])
-    h2d_mib, h2d_calls = (float(transfers[-1][0]), int(transfers[-1][1])) if transfers else (0.0, 0)
+    h2d_mib, h2d_calls = (float(transfers[-1][0]), int(transfers[-1][1])) if transfers else (None, None)
     return pool / 1048576.0, resident, ring, active, h2d_mib, h2d_calls
 
 
@@ -431,13 +454,20 @@ def parse_draft_acceptance(log_text: str) -> tuple[int | None, int | None]:
 
 def write_outputs(rows: list[dict], output: Path) -> None:
     fields = list(rows[0])
-    with (output / "results.csv").open("w", newline="") as handle:
+    with (output / "results.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    with (output / "results.jsonl").open("w") as handle:
+    with (output / "results.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def h2d_metrics(mtp_length: int, h2d_mib: float | None, decode_tps: float, reference_gbps: float | None = None) -> dict:
+    # The logged sequence corresponds to one output interval only without speculation.
+    estimated_gbps = h2d_mib * 1048576 * decode_tps / 1e9 if mtp_length == 0 and h2d_mib is not None else None
+    return {"estimated_h2d_gbps": estimated_gbps, "h2d_reference_gbps": reference_gbps,
+            "h2d_util_pct": 100 * estimated_gbps / reference_gbps if estimated_gbps is not None and reference_gbps is not None else None}
 
 
 def plot(rows: list[dict], output: Path, args: argparse.Namespace) -> None:
@@ -445,19 +475,21 @@ def plot(rows: list[dict], output: Path, args: argparse.Namespace) -> None:
 
     contexts = sorted({row["context_capacity"] / 1024 for row in rows})
     lengths = sorted({row.get("mtp_length", 0) for row in rows})
+    reference = getattr(args, "h2d_reference_gbps", None)
     fig, axes = plt.subplots(2, 2, figsize=(15.5, 10.2), sharex=True)
     panels = [
         ("decode_tps", "Decode throughput", "tokens/s", "-"),
         ("prefill_tps", "Prefill throughput", "tokens/s", "--"),
         ("decode_kv_pool_mib", "Effective decode KV pool", "MiB", "-."),
-        ("h2d_util_pct", "Estimated decode H2D utilization", "% of measured 50 GB/s", ":"),
+        ("h2d_util_pct", "Estimated KV H2D payload / reference", f"% of {reference:g} GB/s reference" if reference is not None else "% of supplied H2D reference", ":"),
     ]
     colors = {0: "#7A3E9D", 1: "#E69F00", 2: "#0072B2", 3: "#009E73", 4: "#D55E00"}
     for axis, (field, title, ylabel, style) in zip(axes.flat, panels):
         for length in lengths:
             points = series(rows, length)
             x = [row["context_capacity"] / 1024 for row in points]
-            y = [row[field] for row in points]
+            y = [h2d_metrics(length, row.get("h2d_mib_per_token"), row["decode_tps"], reference)[field]
+                 if field == "h2d_util_pct" else row[field] for row in points]
             if all(value is None for value in y):
                 continue
             label = "No MTP" if length == 0 else f"MTP max {length}"
@@ -470,17 +502,24 @@ def plot(rows: list[dict], output: Path, args: argparse.Namespace) -> None:
     for axis in axes.flat:
         axis.set_xticks(contexts[::2])
     axes[0, 0].legend(title="Max draft length", fontsize=8)
-    axes[1, 1].axhline(100, color="black", linewidth=1, alpha=0.35)
+    notes = []
+    if reference is not None:
+        axes[1, 1].axhline(100, color="black", linewidth=1, alpha=0.35)
+    else:
+        notes.append("Supply --h2d-reference-gbps from a pinned-copy measurement")
+        axes[1, 1].set_yticks([])
     if any(length > 0 for length in lengths):
+        notes.append("MTP H2D rate unavailable without per-evaluation accounting")
+    if notes:
         axes[1, 1].text(
-            0.98, 0.97, "MTP H2D rate unavailable without per-evaluation accounting",
+            0.98, 0.97, "\n".join(notes),
             ha="right", va="top", transform=axes[1, 1].transAxes, fontsize=8,
         )
     fig.suptitle(f"{args.model.stem} - adaptive KV / MTP draft length sweep", fontsize=15)
     fig.text(
         0.5,
         0.015,
-        f"Context-matched capacity | Q8_0 K / Q4_0 V | batch/ubatch {args.batch_size}/{args.ubatch_size} | "
+        f"Context-matched capacity | {getattr(args,'cache_type_k','q8_0')} K / {getattr(args,'cache_type_v','q4_0')} V | batch/ubatch {args.batch_size}/{args.ubatch_size} | "
         f"{args.decode_tokens} decoded tokens | UVM {'on' if args.uvm else 'off'}",
         ha="center",
         fontsize=9,
@@ -498,6 +537,10 @@ def main() -> int:
     if args.no_kv_stream_rs_rollback and not any(args.mtp_lengths):
         raise SystemExit("--no-kv-stream-rs-rollback requires an MTP length")
     args.model = args.model.resolve()
+    if args.model_draft is not None:
+        args.model_draft=args.model_draft.resolve()
+        if not args.model_draft.is_file():
+            raise SystemExit(f"draft model does not exist: {args.model_draft}")
     args.prefill_text = args.prefill_text.resolve()
     args.server = args.server.resolve()
     args.output = args.output.resolve()
@@ -507,6 +550,8 @@ def main() -> int:
         raise SystemExit("model or server executable does not exist")
     if not args.prefill_text.is_file():
         raise SystemExit(f"prefill text does not exist: {args.prefill_text}")
+    if os.name == "nt":
+        print("Windows: disabling UVM does not disable driver system-memory fallback. Configure this server's NVIDIA profile to Prefer No Sysmem Fallback for dedicated-VRAM fitting; the script does not verify that policy.", flush=True)
     try:
         contexts=context_points(args)
         args.min_context, args.max_context=min(contexts),max(contexts)
@@ -557,8 +602,9 @@ def main() -> int:
                 env = server_environment(args.uvm)
                 command = server_command(args, context, mtp_length, arena_mib)
                 started = time.monotonic()
-                with log_path.open("w") as log:
-                    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
+                with log_path.open("w", encoding="utf-8") as log:
+                    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
                     try:
                         wait_ready(url, process, log_path)
                         if tokens is None:
@@ -605,7 +651,7 @@ def main() -> int:
                                 "stream": True,
                                 "return_tokens": True,
                             },
-                            timeout=1800,
+                            timeout=args.request_timeout,
                         )
                         timing = result["timings"]
                         if timing.get("prompt_n") != prompt_tokens or timing.get("predicted_n") != args.decode_tokens:
@@ -625,18 +671,20 @@ def main() -> int:
                 wall_seconds = time.monotonic() - started
 
             pool, resident, ring, active, h2d_mib, h2d_calls = decode_layout(log_path)
-            log_text = log_path.read_text(errors="replace")
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
             validate_execution_log(log_text)
             draft_accepted, draft_generated = parse_draft_acceptance(log_text)
             if mtp_length and not draft_generated:
                 raise RuntimeError(f"no MTP drafts recorded for context {context}, length {mtp_length}; see {log_path}")
             decode_tps = float(timing["predicted_per_second"])
-            h2d_gbs = h2d_mib * 1048576 * decode_tps / 1e9 if mtp_length == 0 else None
             row = {
                 "status": "ok",
                 "uvm": args.uvm,
                 "budget_policy": "maximum-fit" if args.auto_max_arena else "fixed",
+                "windows_sysmem_fallback_verified": False if os.name == "nt" else None,
                 "command": server_command(args,context,mtp_length,arena_mib),
+                "model": str(args.model),
+                "model_draft": str(args.model_draft) if mtp_length and args.model_draft is not None else None,
                 "context_capacity": context,
                 "cache_type_k": args.cache_type_k,
                 "cache_type_v": args.cache_type_v,
@@ -649,6 +697,7 @@ def main() -> int:
                 "decode_tokens": args.decode_tokens,
                 "decoded_first_10_text": decoded_first_10_text,
                 "decoded_last_10_text": decoded_last_10_text,
+                "decoded_token_ids": decoded_tokens,
                 "arena_mib": arena_mib,
                 "prefill_tps": float(timing["prompt_per_second"]),
                 "decode_tps": decode_tps,
@@ -661,7 +710,8 @@ def main() -> int:
                 "active_pages": active,
                 "h2d_mib_per_token": h2d_mib if mtp_length == 0 else None,
                 "h2d_calls_per_token": h2d_calls if mtp_length == 0 else None,
-                "h2d_util_pct": h2d_gbs / 50.0 * 100.0 if h2d_gbs is not None else None,
+                **h2d_metrics(mtp_length, h2d_mib, decode_tps, getattr(args, "h2d_reference_gbps", None)),
+                "h2d_measurement_scope": "KV-payload estimate, not total PCIe traffic or a bus-utilization counter; MTP requires per-evaluation accounting.",
                 "log": str(log_path),
             }
             rows.append(row)

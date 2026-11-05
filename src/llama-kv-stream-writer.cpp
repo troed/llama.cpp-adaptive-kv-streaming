@@ -19,13 +19,15 @@ struct write_graph {
 
 struct llama_kv_stream_writer::implementation {
     ggml_backend_t backend;
-    ggml_backend_buffer_t buffer;
+    ggml_backend_buffer_ptr buffer;
     ggml_kv_stream_shape shape;
     bool cpu;
     size_t maximum = 0, capacity = 0, scratch_bytes = 0;
     ggml_context_ptr context;
     ggml_tensor * roots[2] = {};
     ggml_tensor * indices = nullptr;
+    // Cached executions drain before this upload storage is released.
+    std::vector<int64_t> index_data;
     std::array<std::vector<std::unique_ptr<write_graph>>,2> plans;
     llama_kv_stream_write_stats last;
 
@@ -116,7 +118,7 @@ std::unique_ptr<llama_kv_stream_writer> llama_kv_stream_writer::create(ggml_back
         std::unique_ptr<llama_kv_stream_writer> writer(new llama_kv_stream_writer);
         writer->impl = std::make_unique<implementation>();
         auto & s = *writer->impl;
-        s.backend = backend; s.buffer = buffer; s.shape = shape; s.maximum = max_rows;
+        s.backend = backend; s.buffer.reset(ggml_backend_buffer_retain(buffer)); s.shape = shape; s.maximum = max_rows;
         auto * device = ggml_backend_get_device(backend);
         s.cpu = device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
         if (!s.cpu) { llama_memory_cuda_executor probe(backend); if (!probe.supported()) return {}; }
@@ -154,9 +156,8 @@ std::unique_ptr<llama_kv_stream_writer> llama_kv_stream_writer::create(ggml_back
         }
         s.indices = ggml_new_tensor_1d(s.context.get(), GGML_TYPE_I64, int64_t(s.capacity));
         if (ggml_backend_tensor_alloc(buffer, s.indices, base + index_offset) != GGML_STATUS_SUCCESS) return {};
-        std::vector<int64_t> indices(s.capacity);
-        for (size_t i = 0; i < s.capacity; ++i) indices[i] = int64_t(i);
-        ggml_backend_tensor_set(s.indices, indices.data(), 0, indices.size()*sizeof(int64_t));
+        s.index_data.resize(s.capacity);
+        for (size_t i = 0; i < s.capacity; ++i) s.index_data[i] = int64_t(i);
         return writer;
     } catch (const std::bad_alloc &) { return {}; }
 }
@@ -183,7 +184,7 @@ bool llama_kv_stream_writer::accepts(const ggml_tensor * source, bool value) con
     const auto data = reinterpret_cast<uintptr_t>(source->data);
     const size_t size = ggml_backend_buffer_get_size(buffer);
     const size_t bytes = size_t(source->ne[1])*source->nb[1];
-    const auto scratch = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(s.buffer));
+    const auto scratch = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(s.buffer.get()));
     const bool overlaps = data >= scratch ? data-scratch < s.scratch_bytes : bytes > scratch-data;
     return !overlaps && data >= base && data - base <= size && bytes <= size - size_t(data - base);
 }
@@ -202,6 +203,8 @@ bool llama_kv_stream_writer::generate_async(const ggml_tensor * source, bool val
         return false;
     };
     try {
+        // Another execution phase may have overwritten the shared scratch.
+        ggml_backend_tensor_set_async(s.backend,s.indices,s.index_data.data(),0,std::min(rows,s.capacity)*sizeof(int64_t));
         size_t tile=0;
         for (size_t first=0; first < rows; first += std::min(s.capacity,rows-first)) {
             const size_t count=std::min(s.capacity,rows-first);

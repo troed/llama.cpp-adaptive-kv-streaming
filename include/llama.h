@@ -435,6 +435,9 @@ extern "C" {
         uint32_t kv_stream_auxiliary_layers;
         // Widest decode/verify batch admitted while streaming. 1 disables wide verify.
         uint32_t kv_stream_verify_width;
+        // Explicit target verification query bound, independent of recurrent snapshots; zero keeps the inferred profile.
+        // Initially supported for serial streamed Gemma4 targets with 1-4 queries that fit n_ubatch.
+        uint32_t kv_stream_verify_max;
     };
 
 // Widest attached-MTP draft chain the streamed KV lease supports.

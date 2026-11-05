@@ -1298,6 +1298,39 @@ const char * common_streamed_kv_config_error(const common_params & params) {
     return nullptr;
 }
 
+const char * common_streamed_dflash_verification_error(const common_params & params, uint32_t & depth) {
+    if (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 7) {
+        return "adaptive DFlash2 supports 1-7 draft tokens";
+    }
+    bool ngram = false;
+    for (auto type : params.speculative.types) {
+        if (type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V) ngram = true;
+        else if (type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD || type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE) {
+            // token-history proposals share the target and are capped to the span width
+        }
+        else if (type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+            return "adaptive DFlash2 verification supports only DFlash2 and ngram proposal sources";
+        }
+    }
+    const auto & map = params.speculative.ngram_map_k4v;
+    if (ngram && (!map.size_m || map.size_m > 7)) {
+        return "adaptive DFlash2+K4V requires --spec-ngram-map-k4v-size-m 1-7; longer continuations are not admitted";
+    }
+    if (ngram && (!map.size_n || map.size_n > 1024 || !map.min_hits)) {
+        return "adaptive DFlash2+K4V requires lookup length 1-1024 and positive minimum hits";
+    }
+    if (params.n_batch <= 0 || params.n_ubatch < 0) {
+        return "adaptive DFlash2 requires a positive batch and nonnegative microbatch limit";
+    }
+    depth = uint32_t(common_speculative_n_max(&params.speculative));
+    const int32_t microbatch = params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch, params.n_ubatch);
+    if (uint32_t(microbatch) < depth + 1) {
+        return "adaptive DFlash2 verification block must fit the effective target microbatch";
+    }
+    return nullptr;
+}
+
 const char * common_streamed_dflash_config_error(const common_params & params) {
     if (!common_params_uses_streamed_dflash(params)) return nullptr;
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
@@ -1320,12 +1353,13 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
             })) return "adaptive DFlash2 requires one serial slot, no auxiliary MTP layers and no other speculative mode than ngram-*";
     if (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 7)
         return "adaptive DFlash2 supports 1-7 draft tokens";
-    if (!params.mmproj.path.empty()) return "adaptive DFlash2 currently supports text only, without mmproj";
     if (params.n_batch <= 0 || params.n_ubatch < 0 || params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
         return "adaptive DFlash2 requires a positive batch, nonnegative microbatch limit and -fa on";
     const int32_t microbatch=params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch,params.n_ubatch);
     if (microbatch < params.speculative.draft.n_max+1)
         return "adaptive DFlash2 verification block must fit the effective target microbatch";
+    uint32_t depth = 0;
+    if (const auto * error = common_streamed_dflash_verification_error(params, depth)) return error;
     const auto & draft=params.speculative.draft;
     const auto cache_type=[](ggml_type type) {
         switch (type) {
@@ -1341,10 +1375,20 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
     return nullptr;
 }
 
-uint32_t common_kv_stream_auxiliary_layers(const common_params & params, int32_t model_nextn_layers) {
+uint32_t common_kv_stream_auxiliary_layers(const common_params & params, int32_t model_nextn_layers,
+        bool shares_target_kv) {
     if (!common_params_uses_streamed_mtp(params)) {
         if (params.kv_stream_auxiliary_layers) {
             throw std::invalid_argument("the auxiliary KV layer setting requires streamed embedded MTP");
+        }
+        return 0;
+    }
+    if (shares_target_kv) {
+        if (!params.speculative.has_dft() || params.kv_stream_auxiliary_layers ||
+                std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto type) {
+                    return type != COMMON_SPECULATIVE_TYPE_NONE && type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                })) {
+            throw std::invalid_argument("shared-target MTP requires a separate assistant and no auxiliary KV layers or other speculative mode");
         }
         return 0;
     }
@@ -1417,6 +1461,20 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 
+uint32_t common_kv_stream_verify_max(const common_params & params,bool shares_target_kv) {
+    if (!shares_target_kv || !common_params_uses_streamed_mtp(params)) return 0;
+    (void)common_kv_stream_auxiliary_layers(params,0,true);
+    if (const auto * error=common_streamed_kv_config_error(params)) throw std::invalid_argument(error);
+    const int32_t depth=params.speculative.draft.n_max;
+    if (depth < 1 || depth > 3) throw std::invalid_argument("shared-target MTP supports 1-3 draft tokens");
+    const int32_t rows=depth+1;
+    if (params.n_parallel != 1 || params.n_batch <= 0 || params.n_ubatch < 0 ||
+            (params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch,params.n_ubatch)) < rows) {
+        throw std::invalid_argument("shared-target MTP requires one serial slot and verification within the target microbatch");
+    }
+    return uint32_t(rows);
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1436,7 +1494,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     try {
-        cparams.kv_stream_auxiliary_layers = common_kv_stream_auxiliary_layers(params, llama_model_n_layer_nextn(model));
+        char architecture[32] = {};
+        const bool shared_target_kv = params.speculative.has_dft() &&
+            llama_model_meta_val_str(model,"general.architecture",architecture,sizeof(architecture)) == 6 &&
+            std::strcmp(architecture,"gemma4") == 0;
+        cparams.kv_stream_auxiliary_layers = common_kv_stream_auxiliary_layers(
+            params, llama_model_n_layer_nextn(model), shared_target_kv);
+        cparams.kv_stream_verify_max=common_kv_stream_verify_max(params,shared_target_kv);
     } catch (const std::invalid_argument & error) {
         COM_ERR("%s\n", error.what());
         return;
@@ -1672,7 +1736,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         if (llama_model_has_encoder(model)) {
             common_batch batch = common_batch_get_one(lctx, tmp);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
+            const int32_t status = llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
+            if (status != 0) {
+                COM_ERR("model warmup encode failed, status = %d\n", status);
+                res->pimpl->context.reset();
+                return res;
+            }
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
             if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
                 decoder_start_token_id = bos;
@@ -1689,7 +1758,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            const int32_t status = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (status != 0) {
+                COM_ERR("model warmup decode failed, status = %d\n", status);
+                res->pimpl->context.reset();
+                return res;
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
@@ -1737,6 +1811,11 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
+    // Shared-KV MTP owns no appendable cache; a two-token probe is invalid for its hidden-conditioned TG1 input.
+    if (llama_get_ctx_other(ctx) && llama_model_n_layer_nextn(llama_get_model(ctx)) > 0) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
     }
 
     if (llama_n_rs_seq(ctx) > 0) {
@@ -1889,6 +1968,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     const bool streamed_mtp = common_params_uses_streamed_mtp(params);
     cparams.n_rs_seq          = (params.kv_stream_auxiliary_layers && !streamed_mtp) || params.no_kv_stream_rs_rollback ?
                                 0 : params.speculative.need_n_rs_seq();
+    if (common_params_uses_streamed_dflash(params)) {
+        uint32_t depth = 0;
+        if (const auto * error = common_streamed_dflash_verification_error(params, depth)) {
+            throw std::invalid_argument(error);
+        }
+        cparams.n_rs_seq = depth;
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

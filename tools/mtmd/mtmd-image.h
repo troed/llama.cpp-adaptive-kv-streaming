@@ -156,6 +156,13 @@ struct mtmd_image_preprocessor_lfm3vl : mtmd_image_preprocessor_dyn_size {
                                         int n_frames = 1, int temporal_factor = 1);
 };
 
+// Gemma4, similar to dyn_size but fitted to the reference floor-aligned patch budget
+struct mtmd_image_preprocessor_gemma4 : mtmd_image_preprocessor_dyn_size {
+    mtmd_image_preprocessor_gemma4(const clip_ctx * ctx) : mtmd_image_preprocessor_dyn_size(ctx) {}
+    static clip_image_size get_target_size(const clip_hparams & hparams, const clip_image_size & original_size);
+    clip_image_size target_size(const clip_image_size & original_size) const override { return get_target_size(hparams, original_size); }
+};
+
 // GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
 struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_glm5v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}

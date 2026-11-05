@@ -1,11 +1,13 @@
 import argparse
+import csv
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "run-fixed-span-sweep.py"
@@ -15,6 +17,69 @@ SPEC.loader.exec_module(SWEEP)
 
 
 class MtpSweepTests(unittest.TestCase):
+    def test_external_assistant_cli_and_commands_do_not_load_it_for_target_only(self):
+        with patch("sys.argv",[str(SCRIPT),"--model","target.gguf","--model-draft","assistant.gguf","--mtp-lengths","0,1,2,3"]):
+            args=SWEEP.arguments()
+        self.assertEqual(args.model_draft,Path("assistant.gguf"))
+        for depth in (0,1,2,3):
+            command=SWEEP.server_command(args,8192,depth)
+            self.assertIn("--offline",command)
+            self.assertIn("--no-context-shift",command)
+            if depth:
+                self.assertEqual(command[command.index("--model-draft")+1],"assistant.gguf")
+                self.assertEqual(command[command.index("--spec-draft-ngl")+1],"999")
+            else:
+                self.assertNotIn("--model-draft",command)
+                self.assertNotIn("--spec-draft-ngl",command)
+            self.assertNotIn("--spec-draft-type-k",command)
+            self.assertNotIn("--spec-draft-type-v",command)
+
+    def test_missing_external_assistant_is_rejected_before_managing_production(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory=Path(temp)
+            for name in ("target","server","corpus"):
+                (directory/name).write_text("fixture")
+            argv=[str(SCRIPT),"--model",str(directory/"target"),"--server",str(directory/"server"),
+                "--prefill-text",str(directory/"corpus"),"--model-draft",str(directory/"missing"),"--mtp-lengths","3"]
+            with patch("sys.argv",argv),patch.object(SWEEP.subprocess,"run") as manage, \
+                    self.assertRaisesRegex(SystemExit,"draft"):
+                SWEEP.main()
+            manage.assert_not_called()
+
+    def test_benchmark_environment_cannot_inherit_draft_quant_or_model_overrides(self):
+        with patch.dict(SWEEP.os.environ,{"LLAMA_ARG_MODEL":"wrong","LLAMA_ARG_SPEC_DRAFT_TYPE_K":"f16", "KEEP_ME":"yes"},clear=True):
+            env=SWEEP.server_environment(False)
+        self.assertEqual(env["KEEP_ME"],"yes")
+        self.assertFalse(any(name.startswith("LLAMA_ARG_") for name in env))
+
+    def test_persistent_local_quota_is_a_lower_bound_not_an_oom(self):
+        diagnostic="persistent local cache does not fit the declared shared arena: insufficient arena quota; required=788880128, available=536870912, additional=252009216 bytes; phase=1, resource=6"
+        self.assertEqual(SWEEP.arena_minimum_mib(diagnostic),753)
+        self.assertFalse(SWEEP.is_arena_capacity_failure(diagnostic))
+        self.assertIsNone(SWEEP.arena_minimum_mib(diagnostic.replace("insufficient arena quota","invalid request")))
+        self.assertIsNone(SWEEP.arena_minimum_mib("unsupported geometry: required=788880128 bytes"))
+
+    def test_full_context_request_deadline_is_configurable_and_bounded(self):
+        with patch("sys.argv",[str(SCRIPT),"--model","target.gguf","--request-timeout","3600"]):
+            self.assertEqual(SWEEP.arguments().request_timeout,3600)
+        for value in ("0","-1","nan","inf","43201"):
+            with patch("sys.argv",[str(SCRIPT),"--model","target.gguf","--request-timeout",value]),self.assertRaises(SystemExit):
+                SWEEP.arguments()
+
+    def test_full_workload_probe_uses_the_configured_deadline(self):
+        args=SimpleNamespace(server=Path("server"),model=Path("model"),batch_size=256,ubatch_size=256,
+            arena_mib=1024,port=1246,uvm=False,decode_tokens=8,mtp_lengths=(3,),request_timeout=3600)
+        def completion(_url,payload,**kwargs):
+            return {"timings":{"prompt_n":len(payload["prompt"]),"predicted_n":payload["n_predict"]},
+                "tokens":list(range(payload["n_predict"]))}
+        with tempfile.TemporaryDirectory() as temp,patch.object(SWEEP.subprocess,"Popen") as launch, \
+                patch.object(SWEEP,"wait_ready"),patch.object(SWEEP,"stop_process"), \
+                patch.object(SWEEP,"stream_completion",side_effect=completion) as complete:
+            self.assertTrue(SWEEP.probe_arena(args,8192,3,1024,Path(temp),"http://localhost","article",
+                {"tokens":list(range(8192))},full_workload=True))
+        self.assertEqual(complete.call_args_list[-1].kwargs["timeout"],3600)
+        self.assertEqual(launch.call_args.kwargs["creationflags"], SWEEP.subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+
     def test_physical_auto_fitting_rejects_uvm_before_loading_inputs(self):
         with patch("sys.argv", [str(SCRIPT), "--model", "missing.gguf", "--auto-max-arena", "--uvm"]):
             with self.assertRaisesRegex(SystemExit, "UVM"):
@@ -214,6 +279,18 @@ class MtpSweepTests(unittest.TestCase):
                 self.assertEqual(error.exception.minimum_mib, 979)
                 stop.assert_called_once()
 
+    def test_mtp_fallback_warning_does_not_hide_an_unrelated_failure(self):
+        args = SimpleNamespace(server=Path("server"),model=Path("model"),batch_size=128,ubatch_size=128,
+                               arena_mib=512,port=1246,uvm=False)
+        with tempfile.TemporaryDirectory() as temporary:
+            def launch(*command, **kwargs):
+                kwargs["stdout"].write("MTP graph exceeds shared arena quota: available=536870912 required=1254383744 bytes; trying a separate workspace\n")
+                return object()
+            with patch.object(SWEEP.subprocess, "Popen", side_effect=launch), \
+                    patch.object(SWEEP, "wait_ready", side_effect=RuntimeError("kernel unsupported")), \
+                    patch.object(SWEEP, "stop_process"), self.assertRaisesRegex(RuntimeError, "kernel unsupported"):
+                SWEEP.probe_arena(args,8192,3,512,Path(temporary),"http://localhost")
+
     def test_successful_probe_does_not_misclassify_a_handled_oom(self):
         args = SimpleNamespace(server=Path("/build/llama-server"), model=Path("/models/model.gguf"),
                                batch_size=256, ubatch_size=256, arena_mib=100, port=1246,
@@ -392,7 +469,75 @@ class MtpSweepTests(unittest.TestCase):
     def test_default_server_is_the_release_build(self):
         with patch("sys.argv", [str(SCRIPT), "--model", "model.gguf"]):
             args = SWEEP.arguments()
-        self.assertEqual(args.server, SWEEP.ROOT / "build-device-memory-infra-cuda-release/bin/llama-server")
+        executable = "llama-server.exe" if os.name == "nt" else "llama-server"
+        self.assertEqual(args.server, SWEEP.ROOT / "build-device-memory-infra-cuda-release/bin" / executable)
+
+    def test_production_management_defaults_and_explicit_flags(self):
+        for option, disabled in ((None, os.name == "nt"), ("--no-manage-production", True), ("--manage-production", False)):
+            with self.subTest(option=option), patch("sys.argv", [str(SCRIPT), "--model", "model.gguf"] + ([option] if option else [])):
+                self.assertEqual(SWEEP.arguments().no_manage_production, disabled)
+
+    def test_h2d_reference_is_optional_and_must_be_finite_positive(self):
+        with patch("sys.argv", [str(SCRIPT), "--model", "model.gguf"]):
+            self.assertIsNone(SWEEP.arguments().h2d_reference_gbps)
+        with patch("sys.argv", [str(SCRIPT), "--model", "model.gguf", "--h2d-reference-gbps", "23.52"]):
+            self.assertEqual(SWEEP.arguments().h2d_reference_gbps, 23.52)
+        for value in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(value=value), patch("sys.argv", [str(SCRIPT), "--model", "model.gguf", "--h2d-reference-gbps="+value]), self.assertRaises(SystemExit):
+                SWEEP.arguments()
+
+    def test_h2d_payload_rate_requires_a_reference_for_percentages(self):
+        uncalibrated = SWEEP.h2d_metrics(0, 1000, 10)
+        self.assertAlmostEqual(uncalibrated["estimated_h2d_gbps"], 10.48576)
+        self.assertIsNone(uncalibrated["h2d_reference_gbps"])
+        self.assertIsNone(uncalibrated["h2d_util_pct"])
+        calibrated = SWEEP.h2d_metrics(0, 1000, 10, 20)
+        self.assertAlmostEqual(calibrated["h2d_util_pct"], 52.4288)
+        self.assertEqual(calibrated["h2d_reference_gbps"], 20)
+        for length, mib in ((3, 1000), (0, None)):
+            with self.subTest(length=length, mib=mib):
+                unknown = SWEEP.h2d_metrics(length, mib, 10, 20)
+                self.assertIsNone(unknown["estimated_h2d_gbps"])
+                self.assertIsNone(unknown["h2d_util_pct"])
+        self.assertEqual(SWEEP.h2d_metrics(0, 0, 10, 20)["h2d_util_pct"], 0)
+
+    def test_missing_transfer_telemetry_is_unknown_not_zero(self):
+        layout = "memory_phase: phase=decode kv_pool=1048576 resident_pages=1 ring_slots=2 active_pages=3\n"
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp)/"server.log"
+            log.write_text(layout, encoding="utf-8")
+            self.assertEqual(SWEEP.decode_layout(log)[-2:], (None, None))
+            log.write_text(layout+"attention: accepted KV layout copied 0.00 MiB in 0 H2D calls\n", encoding="utf-8")
+            self.assertEqual(SWEEP.decode_layout(log)[-2:], (0, 0))
+
+    def test_result_files_preserve_unicode(self):
+        row = {"decoded_first_10_text":"\u6a21\u578b \U0001f999", "h2d_util_pct":None}
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            SWEEP.write_outputs([row], output)
+            with (output/"results.csv").open(encoding="utf-8", newline="") as handle:
+                self.assertEqual(next(csv.DictReader(handle))["decoded_first_10_text"], row["decoded_first_10_text"])
+            self.assertEqual(json.loads((output/"results.jsonl").read_text(encoding="utf-8")), row)
+
+    def test_plot_recalibrates_legacy_percentages_and_never_assumes_a_reference(self):
+        row = {"context_capacity":8192, "mtp_length":0, "decode_tps":10, "prefill_tps":100,
+               "decode_kv_pool_mib":100, "h2d_mib_per_token":1000, "h2d_util_pct":20.97152}
+        for reference in (None, 20):
+            with self.subTest(reference=reference), tempfile.TemporaryDirectory() as temp:
+                grid = [[MagicMock(),MagicMock()],[MagicMock(),MagicMock()]]
+                axes = MagicMock()
+                axes.flat = [axis for pair in grid for axis in pair]
+                axes.__getitem__.side_effect = lambda index: grid[index[0]][index[1]] if isinstance(index,tuple) else grid[index]
+                pyplot = MagicMock()
+                pyplot.subplots.return_value = (MagicMock(),axes)
+                matplotlib = MagicMock(pyplot=pyplot)
+                args = SimpleNamespace(model=Path("model.gguf"), batch_size=128, ubatch_size=128, decode_tokens=256, uvm=False, h2d_reference_gbps=reference)
+                with patch.dict("sys.modules", {"matplotlib":matplotlib,"matplotlib.pyplot":pyplot}):
+                    SWEEP.plot([row],Path(temp),args)
+                if reference is None:
+                    grid[1][1].plot.assert_not_called()
+                else:
+                    self.assertAlmostEqual(grid[1][1].plot.call_args.args[1][0],52.4288)
 
     def test_uvm_flag_controls_the_server_environment(self):
         inherited = {"GGML_CUDA_ENABLE_UNIFIED_MEMORY": "1", "GGML_CUDA_PREFER_MODEL_WEIGHTS": "1", "OTHER_OPTION": "kept"}
