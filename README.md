@@ -63,7 +63,7 @@ flash-attn = on
   [`29c720eaf`](https://github.com/ggml-org/llama.cpp/commit/29c720eaf72fcf8e4e61a56a88b994d92668261d) (2026-11-02).
 - Synced to Raymond's adaptive-KV fork: merged
   [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
-  [`db8fd5d89`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/db8fd5d898b0d19be74a4269c126c23d2f62c38d) (2026-10-18)
+  [`a0672f5ea`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/a0672f5ea7d706331d35c4b4a466c3a83ecc03d2) (2026-11-04)
 - ngram speculators can run alongside attached MTP on a streamed context:
   `--spec-type ngram-simple,draft-mtp` (any `ngram-*` type works) lets the ngram
   drafter propose the wide round and the MTP head the narrow one, sharing one
