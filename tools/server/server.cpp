@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdio>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -113,6 +114,10 @@ static server_role_type server_role_detect(const common_params & params, server_
 
 // adjust the params for the role; returns false on a configuration error
 static bool server_prepare_params(common_params & params, server_role_type role_type) {
+    if (params.vision_memory_report && role_type == SERVER_ROLE_ROUTER) {
+        SRV_ERR("%s", "vision memory reporting requires a specific model\n");
+        return false;
+    }
     if (role_type != SERVER_ROLE_ROUTER) {
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
@@ -674,6 +679,15 @@ static int server_run_instance(common_params & params, server_role & role, commo
         ctx_http.join();
         SRV_ERR("%s", "exiting due to model loading error\n");
         return 1;
+    }
+
+    if (params.vision_memory_report) {
+        int status = 0;
+        try { std::printf("%s\n", ctx_server.get_vision_memory_report().dump().c_str()); }
+        catch (const std::exception & error) { SRV_ERR("vision memory report: %s\n", error.what()); status = 1; }
+        clean_up();
+        ctx_http.join();
+        return status;
     }
 
     routes.update_meta(ctx_server);

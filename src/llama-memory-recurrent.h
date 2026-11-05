@@ -28,7 +28,7 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter, bool stream_host_spill = false);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent() override;
 
     //
     // llama_memory_i
@@ -142,6 +142,7 @@ private:
     bool spill_pending = false;
     //const llama_model & model;
     bool spill_restore_pending = false;
+    bool spill_rollback_pending = false;
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;

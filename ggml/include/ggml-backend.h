@@ -346,6 +346,8 @@ extern "C" {
     // `graph_size_changed` is true if the graph size changed since the last allocation
     typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // Called after split inputs are submitted, before execution. Do not modify the graph; false rejects the split.
+    typedef bool (*ggml_backend_sched_pre_compute_callback)(ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -400,6 +402,7 @@ extern "C" {
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
+    GGML_API void                 ggml_backend_sched_set_pre_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_compute_callback callback, void * user_data);
     //
     // Meta backend
     //

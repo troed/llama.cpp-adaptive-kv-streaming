@@ -49,7 +49,8 @@ bool spec_type_is_ngram(enum common_speculative_type type);
 bool server_uses_vision_arena(const common_params & params);
 const char * server_vision_arena_config_error(const common_params & params);
 struct server_task;
-const char * server_vision_arena_request_error(const server_task & task, bool embedded_mtp = false);
+const char * server_vision_arena_request_error(const server_task & task, bool streamed_mtp = false,
+    const common_params_speculative * configured = nullptr);
 
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
@@ -167,6 +168,12 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
  * server_tokens is a helper to manage the input tokens and image for the server.
  * it is made this way to simplify the logic of KV cache management.
  */
+struct server_speculative_text {
+    llama_tokens tokens;
+    size_t ngram_begin = 0;
+    bool has_media = false;
+};
+
 struct server_tokens {
     bool has_mtmd = false;
 
@@ -243,6 +250,8 @@ public:
     const llama_tokens & get_tokens() const;
 
     llama_tokens get_text_tokens() const;
+
+    server_speculative_text get_speculative_text() const;
 
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
