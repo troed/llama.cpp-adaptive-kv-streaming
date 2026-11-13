@@ -60,7 +60,7 @@ flash-attn = on
 
 - Synced to upstream llama.cpp: merged
   [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-  [`29c720eaf`](https://github.com/ggml-org/llama.cpp/commit/29c720eaf72fcf8e4e61a56a88b994d92668261d) (2026-11-02).
+  [`31953bcf7`](https://github.com/ggml-org/llama.cpp/commit/31953bcf74ba489a8bbb0c936c5fcf24fcf9485c) (2026-11-13).
 - Synced to Raymond's adaptive-KV fork: merged
   [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
   [`a0672f5ea`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/a0672f5ea7d706331d35c4b4a466c3a83ecc03d2) (2026-11-04)
@@ -1020,14 +1020,14 @@ See [memory infrastructure](DEVICE_MEMORY_INFRASTRUCTURE.md), [consumer roadmap 
 
 # llama.cpp
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
 
 <b>LLM inference in C/C++</b>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
+[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
 [![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
 [![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
 [![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
