@@ -3315,6 +3315,8 @@ int main(int argc,char ** argv) {
         hp.n_swa = 128;
         hp.swa_type = LLAMA_SWA_TYPE_STANDARD;
         hp.is_swa_impl[0] = true;
+        // the cache binds the per-layer FP8 KV scales, which a loaded model would have created
+        model->layers.resize(hp.n_layer_all);
         llama_kv_cache_iswa local(*model, false, GGML_TYPE_F32, GGML_TYPE_F32, false, false, false,
                 true, 256, 1, 64, nullptr, nullptr, nullptr, nullptr);
         const auto view = llama_memory_kv_resources_get(&local);

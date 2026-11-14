@@ -124,8 +124,3 @@ MTMD_API bool mtmd_reload_projector_weights(mtmd_context * ctx,
 MTMD_API mtmd_context * mtmd_init_from_file_deferred(const char * path,const llama_model * model,mtmd_context_params params);
 MTMD_API bool mtmd_reload_projector_weights_in(mtmd_context * ctx,ggml_backend_memory_lease_t lease,
     mtmd_progress_callback progress = nullptr,void * user_data = nullptr) noexcept;
-struct clip_ctx;
-std::shared_ptr<const mtmd_projector_weights> clip_acquire_projector_weights(const clip_ctx * ctx) noexcept;
-bool clip_unload_projector_weights(clip_ctx * ctx) noexcept;
-bool clip_reload_projector_weights(clip_ctx * ctx,mtmd_progress_callback progress,void * user_data) noexcept;
-bool clip_reload_projector_weights_in(clip_ctx * ctx,ggml_backend_memory_lease_t lease,mtmd_progress_callback progress,void * user_data) noexcept;

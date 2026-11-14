@@ -66,7 +66,7 @@ int main(int argc, char ** argv) {
                 auto * v = ggml_view_3d(ctx.get(),vs,dim,tokens,2,ggml_row_size(pair.second,dim*2),ggml_row_size(pair.second,dim),0);
                 auto * mask = masked ? ggml_new_tensor_2d(ctx.get(),GGML_TYPE_F16,(tokens+31)/32*32,queries) : nullptr;
                 auto * output = ggml_flash_attn_ext(ctx.get(),q,k,v,mask,1.0f/std::sqrt(float(dim)),0,0);
-                ggml_flash_attn_ext_set_prec(output,GGML_PREC_F32);
+                ggml_prec_set_acc(output,GGML_PREC_F32);
                 auto * graph = ggml_new_graph_custom(ctx.get(),32,false);
                 ggml_build_forward_expand(graph,output);
                 ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),backend.get()));
