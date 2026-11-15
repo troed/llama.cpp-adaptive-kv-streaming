@@ -156,6 +156,8 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact          LABEL behavior
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
 if (NOT WIN32)
+    set(LLAMA_TEST_VOCABS_REVISION "2c9db6cf7f8f6f80ec1c13e0cd5016c5a96de1c6" CACHE STRING
+        "Vocabulary fixtures matching this fork's upstream tokenizer baseline")
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
         NAME test-tokenizers-ggml-vocabs
@@ -163,6 +165,8 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
         ARGS https://huggingface.co/ggml-org-dev/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
+    set_property(TEST test-tokenizers-ggml-vocabs PROPERTY ENVIRONMENT
+        "LLAMA_TEST_VOCABS_REVISION=${LLAMA_TEST_VOCABS_REVISION}")
 endif()
 
 if (LLAMA_LLGUIDANCE)
@@ -456,6 +460,10 @@ llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-architecture-config
     ARGS -DPROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-cuda-architecture-config.cmake)
 llama_test_cmd(${CMAKE_COMMAND} NAME test-cuda-kv-runtime-config
     ARGS -DPROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test-cuda-kv-runtime-config.cmake)
+
+add_executable(test-cuda-mmq-workspace test-cuda-mmq-workspace.cpp)
+target_link_libraries(test-cuda-mmq-workspace PRIVATE ggml)
+llama_test(test-cuda-mmq-workspace)
 
 if (GGML_CUDA AND GGML_CUDA_FA)
     enable_language(CUDA)

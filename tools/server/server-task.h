@@ -690,7 +690,7 @@ struct server_prompt {
 
     // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
-    std::vector<uint8_t> speculative_state;
+    std::vector<uint8_t> speculative_state = {};
 
     void clear() {
         tokens.clear();

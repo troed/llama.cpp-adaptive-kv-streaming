@@ -218,7 +218,7 @@ int main(int argc, char ** argv) {
         ggml_context_ptr ctx(ggml_init({16384,nullptr,true}));
         ggml_cuda_operator_workspace_caps caps;caps.ready=true;caps.nsm=70;
         for (auto & row : caps.tile) for (auto & config : row) { config.occupancy=2;config.nbatch=64; }
-        for (const auto pair : {std::pair<int64_t,size_t>{256,2424832},{576,19095552},{16,0}}) {
+        for (const auto & pair : {std::pair<int64_t,size_t>{256,2424832},{576,19095552},{16,0}}) {
             auto * q=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F32,72,pair.first,16);
             auto * k=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,pair.first,16);
             auto * v=ggml_new_tensor_3d(ctx.get(),GGML_TYPE_F16,72,pair.first,16);
@@ -824,7 +824,7 @@ int main(int argc, char ** argv) {
         ggml_backend_tensor_set(weights,matrix,0,sizeof(matrix));
         ggml_backend_tensor_set(input,data,0,sizeof(data));
         ggml_backend_tensor_set(output,sentinel,0,sizeof(sentinel));
-        struct state {
+        struct callback_state {
             testing * test;
             ggml_backend_t backend;
             ggml_tensor * input;
@@ -834,7 +834,7 @@ int main(int argc, char ** argv) {
             bool gpu=false;
         } state{&t,compute,input,output,0,false,gpu};
         const auto callback=[](ggml_backend_t backend,ggml_cgraph * split,void * opaque) {
-            auto & s=*static_cast<struct state *>(opaque);
+            auto & s=*static_cast<callback_state *>(opaque);
             ++s.calls;
             s.test->assert_true(backend==s.backend && ggml_graph_n_nodes(split)==1);
             auto * copied=ggml_graph_node(split,0)->src[1];

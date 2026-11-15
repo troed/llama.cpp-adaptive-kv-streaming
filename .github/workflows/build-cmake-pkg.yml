@@ -1,0 +1,66 @@
+name: Build relocatable cmake package
+on:
+  workflow_call:
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - run: python -m pip install cmake==3.31.10 ninja==1.13.0
+
+      - name: Build
+        run: |
+          PREFIX="$(pwd)"/inst
+          cmake -S . -B build \
+                -DCMAKE_PREFIX_PATH="$PREFIX" \
+                -DLLAMA_OPENSSL=OFF \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_TOOLS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DLLAMA_BUILD_APP=OFF \
+                -DLLAMA_BUILD_SERVER=OFF \
+                -DLLAMA_BUILD_COMMON=OFF \
+                -DLLAMA_BUILD_IS_DEV=OFF \
+                -DGGML_NATIVE=OFF \
+                -DLLAMA_FATAL_WARNINGS=ON \
+                -DGGML_FATAL_WARNINGS=ON \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+          cmake --install build --prefix "$PREFIX" --config Release
+          mv "$PREFIX" "${PREFIX}-relocated"
+          PREFIX="${PREFIX}-relocated"
+
+          export LLAMA_CONFIG="$PREFIX"/lib/cmake/llama/llama-config.cmake
+          build_commit=$(git rev-parse --short HEAD | xargs)
+          build_number=$(git rev-list --count HEAD | xargs)
+
+          major=$(grep -oE "set\(LLAMA_VERSION_MAJOR[[:space:]]+[0-9]+" CMakeLists.txt | grep -oE "[0-9]+$")
+          minor=$(grep -oE "set\(LLAMA_VERSION_MINOR[[:space:]]+[0-9]+" CMakeLists.txt | grep -oE "[0-9]+$")
+          patch=$(grep -oE "set\(LLAMA_VERSION_PATCH[[:space:]]+[0-9]+" CMakeLists.txt | grep -oE "[0-9]+$")
+          build_version="$major.$minor.$patch"
+
+          checks=("set\(LLAMA_VERSION[[:space:]]+$build_version\)"
+                  "set\(LLAMA_BUILD_COMMIT[[:space:]]+$build_commit\)"
+                  "set\(LLAMA_BUILD_NUMBER[[:space:]]+$build_number\)")
+
+          for check in "${checks[@]}"; do
+              if ! grep -qE "$check" "$LLAMA_CONFIG"; then
+                  echo "Checking llama-config.cmake version... \"$check\" failed!"
+                  exit 1
+              fi
+          done
+
+          echo "Checking llama-config.cmake version... success."
+
+          cd examples/simple-cmake-pkg
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$PREFIX"/lib/cmake
+          cmake --build build -j 2

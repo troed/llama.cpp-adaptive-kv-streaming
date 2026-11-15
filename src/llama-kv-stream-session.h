@@ -24,7 +24,7 @@ struct llama_kv_stream_session_config {
     // Widest admitted decode batch; the session rejects anything wider.
     uint32_t verify_width = 1;
     // Context-owned backend resources contain no KV views and survive serial layout replacement.
-    std::shared_ptr<void> prepared_copies;
+    std::shared_ptr<void> prepared_copies = {};
     // Admitted target verification width, independent of prefill microbatch and embedded-MTP plans.
     uint32_t max_decode_rows = 4;
     size_t prefill_span_bytes = 0;

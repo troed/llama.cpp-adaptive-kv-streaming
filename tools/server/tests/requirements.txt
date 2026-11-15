@@ -1,5 +1,6 @@
 pytest~=8.3.3
 pytest-xdist~=3.6
+PyYAML~=6.0
 filelock~=3.16
 numpy~=2.2.6; python_version < "3.14"
 numpy~=2.4.6; python_version >= "3.14"
