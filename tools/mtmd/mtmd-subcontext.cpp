@@ -1442,7 +1442,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                                 std::fill(
                                     mask.begin() + row_offset + (dst_0 * merge_ratio * merge_ratio),
                                     mask.begin() + row_offset + (dst   * merge_ratio * merge_ratio),
-                                    0.0);
+                                    0.0f);
                                 mask_row++;
                             }
                         }

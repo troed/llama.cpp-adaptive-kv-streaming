@@ -1136,7 +1136,6 @@ int main(int argc, char ** argv) {
 #else
     if (consumer) return 77;
 #endif
-    const bool tg2 = argc > 1 && (!std::strcmp(argv[1],"--cuda-pascal-tg2") || !std::strcmp(argv[1],"--cuda-tg2"));
     const bool pascal = argc > 1 && (!std::strcmp(argv[1],"--cuda-pascal-tg1") || !std::strcmp(argv[1],"--cuda-pascal-tg2"));
     if (pascal) {
 #ifdef KV_STREAM_PASCAL_CUDA_TEST
@@ -1531,6 +1530,7 @@ int main(int argc, char ** argv) {
     });
 
 #ifdef KV_STREAM_PASCAL_CUDA_TEST
+    const bool tg2 = argc > 1 && (!std::strcmp(argv[1],"--cuda-pascal-tg2") || !std::strcmp(argv[1],"--cuda-tg2"));
     if (pascal || tg2 || (argc > 1 && !std::strcmp(argv[1],"--cuda"))) t.test("quantized_vector_stock_equivalence_across_spans_and_ring_waves", [&](testing & t) {
         ggml_backend_load_all();
         auto * dev = ggml_backend_dev_by_name("CUDA0");
