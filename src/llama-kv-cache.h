@@ -14,6 +14,8 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 class llama_kv_stream_model;
+class llama_kv_stream_group_model;
+struct llama_kv_stream_slot_projection;
 class llama_kv_stream_logical_cache;
 class llama_kv_stream_mtp_proxy;
 class llama_kv_stream_read_proxy;
@@ -131,6 +133,10 @@ public:
 
     ~llama_kv_cache();
     llama_kv_stream_model * get_kv_stream() const noexcept { return kv_stream.get(); }
+    llama_kv_stream_group_model * get_group_model() const noexcept { return group_stream.get(); }
+    // Retire old reservation graphs first. Candidate ownership transfers only on complete native binding.
+    bool bind_group_model(std::unique_ptr<llama_kv_stream_group_model> & candidate,
+        const llama_kv_stream_slot_projection & projection);
     // Replace shared full-cache roots with owned read-only metadata. The target and parent outlive all reader graphs.
     bool attach_shared_stream_reader(llama_context_memory & parent, uint32_t max_queries);
     // Arm only after preparing the parent's serial phase; release before any target mutation.
@@ -157,7 +163,8 @@ public:
     }
     bool kv_stream_can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1, size_t * retained = nullptr) const;
     // A retained prefix needs every local row visible to its next query, not only full-cache backing.
-    bool bounded_prefix_available(const llama_kv_cells & full, size_t retained) const noexcept;
+    bool bounded_prefix_available(const llama_kv_cells & full, size_t retained, llama_seq_id sequence = 0) const noexcept;
+    bool kv_stream_bounded_suffix_available(const llama_kv_cache & bounded,llama_seq_id sequence,llama_pos begin,llama_pos end) const;
 
     //
     // llama_memory_i
@@ -206,6 +213,8 @@ public:
     ggml_type type_v() const { return layers[0].v->type; }
 
     std::vector<uint32_t> get_layer_ids() const;
+    // Protect native aliases after their source binds its final physical views.
+    bool protect_shared_views();
     // First streamed source follows this cache's actual graph-layer order, not the target's layer count.
     bool shared_stream_consumer(uint32_t query_tokens, llama_kv_stream_next_consumer & output) const noexcept;
     // Describe one serial homogeneous SWA allocation without changing stock cells, tensors or masks.
@@ -215,8 +224,15 @@ public:
     std::unique_ptr<llama_memory_bounded_kv> retain_bounded_storage(uint64_t identity,uint64_t generation,
             uint32_t history_rows,uint32_t headroom_rows,llama_memory_resource resource = {}) const;
     bool bounded_storage_pending() const noexcept;
+    bool full_storage_pending() const noexcept { return full_pending; }
     // Bind an empty deferred cache after retiring reservation graphs; old placeholder metadata stays alive.
     bool bind_bounded_storage(ggml_backend_memory_lease_t lease);
+    // Capture native state and retire all graphs/readers first. Release roots and reset only their projection cells.
+    // Rebinding uses the existing deferred path; the caller restores the saved state before activation.
+    bool release_bounded_storage();
+    // Retire graphs/readers first. Preserve physical row order as well as native cell metadata.
+    bool park_bounded_storage();
+    bool restore_bounded_storage(ggml_backend_memory_lease_t lease);
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const;
 
@@ -302,6 +318,7 @@ public:
     bool mask_is_causal(bool causal_attn) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -339,6 +356,7 @@ private:
     std::unique_ptr<llama_kv_stream_mtp_proxy> mtp_proxy;
     std::shared_ptr<llama_kv_stream_logical_cache> attached_mtp_cache;
     std::unique_ptr<llama_kv_stream_model> kv_stream;
+    std::unique_ptr<llama_kv_stream_group_model> group_stream;
     std::vector<std::unique_ptr<llama_kv_stream_read_proxy>> shared_readers;
     ggml_context_ptr shared_read_metadata;
     std::unique_ptr<llama_memory_bounded_kv_read> shared_bounded_read;
@@ -380,8 +398,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> retired_bounded_metadata;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> retired_storage_metadata;
     bool bounded_pending = false;
+    bool full_pending = false;
     std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> bounded_lease{nullptr,ggml_backend_memory_lease_free};
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
@@ -437,6 +456,11 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+    struct bounded_parking_state;
+    std::unique_ptr<bounded_parking_state> parked_bounded;
+    std::vector<llama_seq_id> storage_selected_sequences;
+    bool selected_sequence_valid(llama_seq_id sequence) const noexcept;
+    bool selected_batch_valid(const llama_ubatch & batch) const noexcept;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -483,6 +507,7 @@ public:
 
     uint32_t get_n_kv() const;
     bool kv_stream_begin(const llama_ubatch & ubatch, bool decode) const;
+    bool selected_indices(std::vector<uint32_t> & output) const;
     bool prepare_mask_bounds(const llama_ubatch & ubatch, bool causal) const;
     bool mtp_span_append(const llama_ubatch & ubatch) const;
     uint32_t get_n_kv_rows() const;
@@ -521,6 +546,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

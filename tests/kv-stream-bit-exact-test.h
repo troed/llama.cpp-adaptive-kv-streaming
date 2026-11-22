@@ -294,19 +294,24 @@ struct kv_stream_exact_trace {
     std::string role, phase;
     size_t outputs = 0;
     std::exception_ptr failure;
+    std::function<void()> prediction_attention_before;
     std::function<void()> prediction_attention;
     kv_stream_exact_trace(kv_stream_bit_oracle & oracle, std::string role) : oracle(oracle), role(std::move(role)) {}
     static bool callback(ggml_tensor * tensor, bool ask, void * opaque) {
         auto & trace = *static_cast<kv_stream_exact_trace *>(opaque);
-        const bool attention = trace.prediction_attention && tensor && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
+        const bool attention = (trace.prediction_attention_before || trace.prediction_attention) && tensor && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
             trace.phase.find("/predict") != std::string::npos;
         if (!tensor || trace.phase.empty() || trace.failure ||
                 (!attention && std::strcmp(tensor->name, "result_output") && std::strcmp(tensor->name, "h_nextn") &&
                  (trace.role != "target" || std::strcmp(tensor->name, "result_norm")))) return false;
-        if (ask) return true;
+        if (ask && !attention) return true;
         try {
+            if (ask) {
+                if (trace.prediction_attention_before) trace.prediction_attention_before();
+                return true;
+            }
             if (attention) {
-                trace.prediction_attention();
+                if (trace.prediction_attention) trace.prediction_attention();
                 return true;
             }
             trace.oracle.tensor(trace.phase + "/" + trace.role + "/" + tensor->name, tensor, true);
@@ -322,10 +327,10 @@ struct kv_stream_exact_trace {
 
 // Read valid KV rows in logical order, not allocation order or padded capacity.
 static void kv_stream_exact_kv(kv_stream_bit_oracle & oracle, const std::string & label,
-        llama_kv_cache * kv, size_t first, size_t count) {
+        llama_kv_cache * kv, size_t first, size_t count,llama_seq_id sequence=0) {
     const auto & cells = kv->get_cells(0);
     std::vector<uint32_t> slots(count, UINT32_MAX);
-    for (const auto & item : cells.seq_pos_get(0)) {
+    for (const auto & item : cells.seq_pos_get(sequence)) {
         if (item.first >= 0 && size_t(item.first) >= first && size_t(item.first)-first < count)
             slots[size_t(item.first)-first] = item.second;
     }

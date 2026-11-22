@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include <chrono>
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -29,8 +30,8 @@ struct writer_fixture {
     llama_kv_stream_resident * resident = nullptr;
 
     // Fixed Qwen-like geometry and budget, independent of the writer implementation being compared.
-    writer_fixture(ggml_backend_t backend, bool cuda, ggml_type k = GGML_TYPE_Q8_0, ggml_type v = GGML_TYPE_Q4_0, bool tiny = false) : backend(backend), cuda(cuda) {
-        llama_kv_stream_host_config c{91, {k, v, 256, 256, 4, 256, 128},
+    writer_fixture(ggml_backend_t backend, bool cuda, ggml_type k = GGML_TYPE_Q8_0, ggml_type v = GGML_TYPE_Q4_0, bool tiny = false, uint32_t width = 256) : backend(backend), cuda(cuda) {
+        llama_kv_stream_host_config c{91, {k, v, width, width, 4, 256, 128},
             {{k, true, true, true, true}, {v, true, true, true, true}, true, true}, 1024, 1};
         auto * device = ggml_backend_get_device(backend);
         if (cuda) {
@@ -74,17 +75,18 @@ struct encoder {
     std::unique_ptr<llama_memory_cuda_executor> execution;
 
     // Ordinary SET_ROWS is the independent GPU quantization control; its source buffer is already on the device.
-    encoder(writer_fixture & f, size_t rows, ggml_type type) : backend(f.backend), cuda(f.cuda), rows(rows), row_bytes(ggml_row_size(type, 1024)) {
+    encoder(writer_fixture & f, size_t rows, ggml_type type) : backend(f.backend), cuda(f.cuda), rows(rows), row_bytes(ggml_row_size(type, int64_t(f.host->config().shape.head_dim_k)*f.host->config().shape.heads)) {
+        const size_t width=size_t(f.host->config().shape.head_dim_k)*f.host->config().shape.heads;
         context.reset(ggml_init({65536, nullptr, true}));
-        source = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 1024, int64_t(rows));
+        source = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, int64_t(width), int64_t(rows));
         auto * indices = ggml_new_tensor_1d(context.get(), GGML_TYPE_I64, int64_t(rows));
-        auto * dst = ggml_new_tensor_2d(context.get(), type, 1024, int64_t(rows));
+        auto * dst = ggml_new_tensor_2d(context.get(), type, int64_t(width), int64_t(rows));
         output = ggml_set_rows(context.get(), dst, source, indices);
         GGML_ASSERT(ggml_backend_supports_op(backend, output));
         graph = ggml_new_graph_custom(context.get(), 32, false);
         ggml_build_forward_expand(graph, output);
         buffer.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend)); GGML_ASSERT(buffer);
-        std::vector<float> input(rows*1024);
+        std::vector<float> input(rows*width);
         for (size_t i = 0; i < input.size(); ++i) input[i] = std::sin(float(i%1021)*.07f);
         std::vector<int64_t> idx(rows); for (size_t i = 0; i < rows; ++i) idx[i] = int64_t(i);
         ggml_backend_tensor_set(source, input.data(), 0, input.size()*sizeof(float));
@@ -162,13 +164,188 @@ struct release_probe {
     ~release_probe() { if (!frees) buffer->iface.free_buffer = original; active = nullptr; }
 };
 
+#ifdef KV_STREAM_WRITER_EVENT_TRACE
+void kv_stream_writer_capture_events(bool enabled);
+bool kv_stream_writer_observed_host_backend(ggml_backend_t producer);
+bool kv_stream_writer_observed_reuse_wait(ggml_backend_t producer);
+#endif
+
+#ifdef KV_STREAM_WRITER_CACHE_TRACE
+void kv_stream_writer_capture_cache(bool enabled);
+size_t kv_stream_writer_cache_syncs();
+#endif
+
+static void check_routed_publication(testing & t,ggml_backend_t backend,bool cache_sources=false,size_t patterns=3) {
+    auto * device=ggml_backend_get_device(backend);
+    auto * reg=ggml_backend_dev_backend_reg(device);
+    const auto get=reinterpret_cast<ggml_kv_stream_copy_ops_get>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_kv_stream_copy_ops"));
+    const auto * copies=get ? get() : nullptr;
+    if (!t.assert_true(copies && copies->gather)) return;
+    for (uint32_t dimension : {256u,512u}) for (auto formats : {
+            std::pair{GGML_TYPE_Q8_0,GGML_TYPE_Q4_0},std::pair{GGML_TYPE_Q8_0,GGML_TYPE_Q8_0},
+            std::pair{GGML_TYPE_Q5_1,GGML_TYPE_Q5_1}}) for (size_t rows : {1u,8u,16u}) {
+        if (cache_sources && (formats.first!=GGML_TYPE_Q8_0 || formats.second!=GGML_TYPE_Q4_0 ||
+                rows!=(patterns>3 ? 1u : 8u) || (patterns>3 && dimension!=256))) continue;
+        const size_t repeats=cache_sources ? (patterns>3 ? patterns+2 : 9) : 3;
+        writer_fixture f(backend,true,formats.first,formats.second,false,dimension);
+        encoder key(f,rows,formats.first),value(f,rows,formats.second);
+        encoder * controls[2]={&key,&value};
+        const size_t strides[2]={key.row_bytes,value.row_bytes};
+        size_t scratch_bytes=0;
+        auto * type=llama_kv_stream_device_buffer_type(device);
+        if (!t.assert_true(llama_kv_stream_writer::requirements(type,f.host->config().shape,256,scratch_bytes))) return;
+        const size_t alignment=ggml_backend_buft_get_alignment(type);
+        const size_t first=(scratch_bytes+alignment-1)/alignment*alignment;
+        const size_t second=(first+repeats*rows*strides[0]+alignment-1)/alignment*alignment;
+        const size_t source_offset=(second+repeats*rows*strides[1]+alignment-1)/alignment*alignment;
+        const size_t source_bytes=2*patterns*rows*dimension*4*sizeof(float);
+        arena_ptr arena(ggml_backend_memory_arena_new(type,cache_sources ? source_offset+source_bytes : second+repeats*rows*strides[1]),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),1,0,scratch_bytes,alignment,0,nullptr) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),2,first,repeats*rows*strides[0],alignment,0,nullptr) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),3,second,repeats*rows*strides[1],alignment,0,nullptr) &&
+                (!cache_sources || ggml_backend_memory_arena_reserve_at(arena.get(),4,source_offset,source_bytes,alignment,0,nullptr)) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        auto * scratch=ggml_backend_memory_arena_get_buffer(arena.get(),1);
+        auto writer=llama_kv_stream_writer::create(backend,scratch,scratch_bytes,f.host->config().shape,256);
+        if (!t.assert_true(writer!=nullptr)) return;
+        ggml_context_ptr source_metadata;
+        std::vector<ggml_tensor *> inputs(2*patterns);
+        if (cache_sources) {
+            source_metadata.reset(ggml_init({4096+(2*patterns+8)*ggml_tensor_overhead(),nullptr,true}));
+            if (!t.assert_true(bool(source_metadata))) return;
+            auto * storage=ggml_backend_memory_arena_get_buffer(arena.get(),4);
+            for (size_t i=0;i<2*patterns;++i) {
+                inputs[i]=ggml_new_tensor_2d(source_metadata.get(),GGML_TYPE_F32,dimension*4,int64_t(rows));
+                if (!t.assert_true(ggml_backend_tensor_alloc(storage,inputs[i],static_cast<char *>(ggml_backend_buffer_get_base(storage))+
+                        i*rows*dimension*4*sizeof(float))==GGML_STATUS_SUCCESS)) return;
+            }
+        }
+        std::unique_ptr<llama_kv_stream_host_reservation> hosts[2];
+        for (uint32_t slot=0;slot<2;++slot) {
+            auto config=f.host->config();config.cache_id=810+slot;
+            hosts[slot]=llama_kv_stream_host_reservation::create(config,device,65536);
+            if (!t.assert_true(hosts[slot] && hosts[slot]->prepare(cache_sources ? 600 : 300))) return;
+        }
+        std::vector<std::array<std::vector<uint8_t>,2>> expected(repeats);
+        std::vector<std::array<std::vector<std::pair<const uint8_t *,size_t>>,2>> addresses(repeats);
+        std::vector<std::array<llama_kv_stream_writer_completion,2>> completions(repeats);
+        std::vector<std::array<uintptr_t,2>> encoded(repeats);
+#ifdef KV_STREAM_WRITER_EVENT_TRACE
+        kv_stream_writer_capture_events(true);
+#endif
+        for (size_t repeat=0;repeat<repeats;++repeat) for (size_t side=0;side<2;++side) {
+            auto & control=*controls[side];
+            std::vector<float> input(size_t(ggml_nelements(control.source)));
+            for (size_t i=0;i<input.size();++i) input[i]=std::sin(float((i+repeat*17)%1021)*.07f);
+            auto * active_source=cache_sources ? inputs[2*(repeat%patterns)+side] : control.source;
+            ggml_backend_buffer_ptr transient_view;
+            ggml_tensor transient_source{};
+            if (cache_sources) {
+                auto * storage=ggml_backend_memory_arena_get_buffer(arena.get(),4);
+                transient_view.reset(ggml_backend_buffer_view(storage,0,source_bytes));
+                if (!t.assert_true(bool(transient_view))) return;
+                transient_source=*active_source;transient_source.buffer=nullptr;transient_source.data=nullptr;
+                if (!t.assert_true(ggml_backend_tensor_alloc(transient_view.get(),&transient_source,active_source->data)==GGML_STATUS_SUCCESS)) return;
+                active_source=&transient_source;
+            }
+            if (cache_sources) ggml_backend_tensor_set_async(backend,active_source,input.data(),0,input.size()*sizeof(float));
+            ggml_backend_tensor_set(control.source,input.data(),0,input.size()*sizeof(float));
+            control.run();expected[repeat][side].resize(rows*strides[side]);
+            ggml_backend_tensor_get(control.output,expected[repeat][side].data(),0,expected[repeat][side].size());
+            std::vector<llama_kv_stream_host_range> routes;
+            size_t cursors[2]={7+repeat*(patterns>3 ? 4 : 64),13+repeat*(patterns>3 ? 4 : 64)};
+            for (size_t row=0;row<rows;++row) {
+                const size_t slot=row%2;
+                std::vector<llama_kv_stream_host_range> ranges;
+                if (!t.assert_true(hosts[slot]->ranges(0,side ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,
+                        cursors[slot]++*strides[side],strides[side],ranges))) return;
+                for (auto & range : ranges) {
+                    addresses[repeat][side].push_back({static_cast<const uint8_t *>(ggml_backend_buffer_get_base(range.buffer.get()))+range.offset,range.bytes});
+                    routes.push_back(std::move(range));
+                }
+            }
+            auto * mirror=ggml_backend_memory_arena_get_buffer(arena.get(),side+2);
+            const auto publish=[&](const ggml_tensor * source,size_t first_row,size_t count) {
+                encoded[repeat][side]=uintptr_t(source->data);
+                const ggml_kv_stream_copy_rectangle rectangle{source->buffer,
+                    size_t(static_cast<const char *>(source->data)-static_cast<const char *>(ggml_backend_buffer_get_base(source->buffer))),
+                    strides[side],(repeat*rows+first_row)*strides[side],strides[side],strides[side],count};
+                return copies->gather(backend,mirror,&rectangle,1,false);
+            };
+#ifdef KV_STREAM_WRITER_CACHE_TRACE
+            if (cache_sources && repeat>=patterns) kv_stream_writer_capture_cache(true);
+#endif
+            const bool generated=writer->generate_async_routed(active_source,side,routes,publish,completions[repeat][side]);
+#ifdef KV_STREAM_WRITER_CACHE_TRACE
+            if (cache_sources && repeat>=patterns) {
+                kv_stream_writer_capture_cache(false);
+                if (patterns>3) t.assert_true("an evicted source is safely rebound after the bounded cache fills",kv_stream_writer_cache_syncs()>0);
+                else t.assert_true("switching among warmed same-parent sources does not rebuild or drain encoding graphs",kv_stream_writer_cache_syncs()==0);
+            }
+#else
+            if (cache_sources) {t.assert_true("native graph-cache tracing is required",false);return;}
+#endif
+            if (!t.assert_true(generated)) return;
+        }
+#ifdef KV_STREAM_WRITER_EVENT_TRACE
+        const bool reuse_wait=kv_stream_writer_observed_reuse_wait(backend);
+        bool host_backend=true;
+        for (auto & pair : completions) for (auto & completion : pair) {
+            if (!t.assert_true(completion.host && completion.host->wait(backend))) return;
+            host_backend &= kv_stream_writer_observed_host_backend(backend);
+        }
+        kv_stream_writer_capture_events(false);
+        ggml_backend_synchronize(backend);
+#endif
+        hosts[0].reset();hosts[1].reset();
+        for (size_t repeat=0;repeat<repeats;++repeat) for (size_t side=0;side<2;++side) {
+            auto & completion=completions[repeat][side];
+            if (!t.assert_true(completion.device && completion.host && completion.device->synchronize() && completion.host->synchronize())) return;
+#ifdef KV_STREAM_WRITER_EVENT_TRACE
+            if (!t.assert_true(completion.host->release_waiter(backend))) return;
+#endif
+            size_t offset=0;
+            for (const auto & range : addresses[repeat][side]) {
+                if (!t.assert_true("deferred canonical writes retain every native byte and registration owner",
+                        !std::memcmp(expected[repeat][side].data()+offset,range.first,range.second))) return;
+                offset+=range.second;
+            }
+            ggml_context_ptr metadata(ggml_init({4096,nullptr,true}));
+            auto * output=ggml_new_tensor_1d(metadata.get(),GGML_TYPE_I8,int64_t(rows*strides[side]));
+            auto * mirror=ggml_backend_memory_arena_get_buffer(arena.get(),side+2);
+            if (!t.assert_true(ggml_backend_tensor_alloc(mirror,output,static_cast<char *>(ggml_backend_buffer_get_base(mirror))+repeat*rows*strides[side])==GGML_STATUS_SUCCESS)) return;
+            std::vector<uint8_t> actual(rows*strides[side]);ggml_backend_tensor_get(output,actual.data(),0,actual.size());
+            if (!t.assert_true("device publication preserves native encoding before scratch reuse",actual==expected[repeat][side])) return;
+        }
+        bool disjoint=true;
+        for (const auto & roots : encoded) disjoint &= roots[0]+rows*strides[0]<=roots[1] || roots[1]+rows*strides[1]<=roots[0];
+        const bool separate=t.assert_true("routed K and V encodings occupy disjoint existing scratch",disjoint);
+#ifdef KV_STREAM_WRITER_EVENT_TRACE
+        const bool host=t.assert_true("canonical download completion belongs to a separate same-device backend",host_backend);
+        const bool reuse=t.assert_true("scratch reuse waits on the previous host download",reuse_wait);
+        if (!separate || !host || !reuse) return;
+#else
+        if (!separate) return;
+#endif
+        writer->release_completed();
+    }
+}
+
 int main(int argc, char ** argv) {
     const bool baseline_only = argc > 1 && std::strcmp(argv[1], "--bench-baseline") == 0;
     const bool bench = baseline_only || (argc > 1 && std::strcmp(argv[1], "--bench") == 0);
-    const bool cuda = bench || (argc > 1 && std::strcmp(argv[1], "--cuda") == 0);
+    const bool cache_bound=argc>1 && !std::strcmp(argv[1],"--cuda-routed-source-bound");
+    const bool cache_sources=cache_bound || (argc>1 && !std::strcmp(argv[1],"--cuda-routed-source-cache"));
+    const bool routed_publication=cache_sources || (argc>1 && !std::strcmp(argv[1],"--cuda-routed-publication"));
+    const bool cuda = bench || routed_publication || (argc > 1 && std::strcmp(argv[1], "--cuda") == 0);
     ggml_backend_ptr backend;
     if (cuda) { ggml_backend_load_all(); auto * dev = ggml_backend_dev_by_name("CUDA0"); if (!dev) return 1; backend.reset(ggml_backend_dev_init(dev, nullptr)); }
     else backend.reset(ggml_backend_cpu_init());
+    if (routed_publication) {
+        testing t;t.test("routed_device_publication_precedes_independent_canonical_download",[&](testing & t) {check_routed_publication(t,backend.get(),cache_sources,cache_bound ? 65 : 3);});
+        return t.summary();
+    }
     if (bench) {
         std::cout << "policy,batch,median_us,p95_us,d2h_bytes,d2h_calls,h2d_bytes,h2d_calls,d2d_bytes,d2d_calls\n";
         for (size_t rows : {size_t(32), size_t(256), size_t(512)}) {
@@ -233,6 +410,152 @@ int main(int argc, char ** argv) {
                 t.assert_true(std::all_of(plane+512*control.row_bytes, plane+513*control.row_bytes,
                     [](uint8_t byte) { return byte == 0; }));
             }
+        }
+    });
+    t.test("joint_writer_routes_native_encoded_rows_to_independent_registered_histories", [&](testing & t) {
+        const ggml_type types[]={GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16,GGML_TYPE_Q8_0,GGML_TYPE_Q5_0,GGML_TYPE_Q5_1,GGML_TYPE_Q4_0,GGML_TYPE_Q4_1};
+        size_t profiles=0;
+        for (uint32_t dimension : {256u,512u}) for (auto key : types) for (auto val : types) for (bool value : {false,true}) {
+            writer_fixture f(backend.get(),cuda,key,val,false,dimension);encoder e(f,257,value ? val : key);
+            e.run();std::vector<uint8_t> expected(e.rows*e.row_bytes);
+            ggml_backend_tensor_get(e.output,expected.data(),0,expected.size());
+            std::unique_ptr<llama_kv_stream_host_reservation> hosts[2];
+            for (uint32_t slot=0;slot<2;++slot) {
+                auto config=f.host->config();config.cache_id=610+slot;
+                if (cuda) hosts[slot]=llama_kv_stream_host_reservation::create(config,ggml_backend_get_device(backend.get()),65536);
+                else hosts[slot]=llama_kv_stream_host_reservation::create(config,ggml_backend_cpu_buffer_type(),
+                    [](ggml_backend_buffer_t owner) {owner->buft=ggml_backend_cpu_buffer_type();return ggml_backend_buffer_retain(owner);},65536);
+                if (!t.assert_true(hosts[slot] && hosts[slot]->prepare(300))) return;
+            }
+            size_t cursors[2]={7,13};
+            std::vector<llama_kv_stream_host_range> routes;
+            for (size_t row=0;row<e.rows;++row) {
+                const size_t slot=row%2;
+                std::vector<llama_kv_stream_host_range> ranges;
+                if (!t.assert_true(hosts[slot]->ranges(0,value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,
+                        cursors[slot]++*e.row_bytes,e.row_bytes,ranges))) return;
+                for (auto & range : ranges) routes.push_back(std::move(range));
+            }
+            for (const auto & range : routes) ggml_backend_buffer_clear(range.buffer.get(),0xa5);
+            auto * type=ggml_backend_get_default_buffer_type(backend.get());size_t bytes=0;
+            if (!t.assert_true(llama_kv_stream_writer::requirements(type,f.host->config().shape,32,bytes))) return;
+            ggml_backend_buffer_ptr scratch(ggml_backend_buft_alloc_buffer(type,bytes));
+            auto writer=llama_kv_stream_writer::create(backend.get(),scratch.get(),bytes,f.host->config().shape,512);
+            if (!t.assert_true(writer!=nullptr)) return;
+            llama_kv_stream_writer_completion rejected;
+            t.assert_true(!writer->generate_async_registered(e.source,value,routes,{},rejected));
+            t.assert_equal(size_t(0),writer->stats().graph_submissions);
+            for (int fault=0;fault<4;++fault) {
+                std::vector<llama_kv_stream_host_range> invalid;
+                for (const auto & range : routes) invalid.push_back({ggml_backend_buffer_ptr(ggml_backend_buffer_retain(range.buffer.get())),range.offset,range.bytes});
+                if (fault==0) {
+                    size_t duplicate=1;
+                    while (duplicate<invalid.size() && invalid[duplicate].bytes!=invalid[0].bytes) ++duplicate;
+                    if (!t.assert_true(duplicate<invalid.size())) return;
+                    invalid[duplicate].buffer.reset(ggml_backend_buffer_retain(invalid[0].buffer.get()));invalid[duplicate].offset=invalid[0].offset;
+                } else if (fault==1) invalid.back().offset=ggml_backend_buffer_get_size(invalid.back().buffer.get())+1;
+                else if (fault==2) invalid.back().offset=SIZE_MAX;
+                else invalid.pop_back();
+                llama_kv_stream_writer_completion refused;
+                t.assert_true(!writer->generate_async_routed(e.source,value,invalid,{},refused));
+                t.assert_equal(size_t(0),writer->stats().graph_submissions);
+                t.assert_true(!refused.device && !refused.host);
+            }
+            std::vector<std::pair<const uint8_t *,size_t>> addresses;
+            for (const auto & range : routes) {
+                const auto * address=static_cast<const uint8_t *>(ggml_backend_buffer_get_base(range.buffer.get()))+range.offset;
+                if (!t.assert_true(std::all_of(address,address+range.bytes,[](uint8_t byte) {return byte==0xa5;}))) return;
+                addresses.push_back({address,range.bytes});
+            }
+            llama_kv_stream_writer_completion completion;
+            if (!t.assert_true(writer->generate_async_routed(e.source,value,routes,{},completion))) return;
+            routes.clear();hosts[0].reset();hosts[1].reset();
+            if (!t.assert_true(completion.device && completion.host && completion.device->synchronize() && completion.host->synchronize())) return;
+            size_t offset=0;
+            for (const auto & range : addresses) {
+                if (!t.assert_true("joint publication keeps native encoding and query order",!std::memcmp(expected.data()+offset,range.first,range.second))) return;
+                offset+=range.second;
+            }
+            t.assert_equal(expected.size(),offset);
+            t.assert_equal(expected.size(),writer->stats().d2h_bytes);
+            t.assert_true(writer->stats().graph_submissions>1);
+            writer->release_completed();
+            ++profiles;
+            t.out << "routed writer D=" << dimension << " K=" << ggml_type_name(key) << " V=" << ggml_type_name(val) << " value=" << value << std::endl;
+        }
+        t.assert_equal(size_t(256),profiles);
+    });
+    t.test("registered_writer_tiles_keep_native_bits_across_download_boundaries", [&](testing & t) {
+        for (uint32_t dimension : {256u,512u}) for (bool value : {false,true}) {
+            writer_fixture f(backend.get(), cuda);
+            encoder e(f,257,value ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0);
+            e.run();
+            std::vector<uint8_t> expected(e.rows*e.row_bytes), actual(expected.size());
+            ggml_backend_tensor_get(e.output, expected.data(), 0, expected.size());
+            auto c = f.host->config(); c.cache_id = 93;
+            c.shape.head_dim_k=c.shape.head_dim_v=dimension;
+            c.shape.heads=1024/dimension;
+            std::unique_ptr<llama_kv_stream_host_reservation> sparse;
+            if (cuda) sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_get_device(backend.get()), 65536);
+            else sparse = llama_kv_stream_host_reservation::create(c, ggml_backend_cpu_buffer_type(),
+                [](ggml_backend_buffer_t owner) {
+                    owner->buft = ggml_backend_cpu_buffer_type();
+                    return ggml_backend_buffer_retain(owner);
+                }, 65536);
+            if (!t.assert_true(sparse && sparse->prepare(e.rows))) return;
+            std::vector<llama_kv_stream_host_range> ranges;
+            if (!t.assert_true(sparse->ranges(0,value ? ggml_kv_stream_operand::v : ggml_kv_stream_operand::k,0,expected.size(),ranges) && ranges.size() > 1)) return;
+            std::vector<std::pair<const void *, size_t>> addresses;
+            for (const auto & range : ranges) addresses.push_back({
+                static_cast<const char *>(ggml_backend_buffer_get_base(range.buffer.get())) + range.offset, range.bytes});
+            auto * type = ggml_backend_get_default_buffer_type(backend.get());
+            size_t bytes = 0;
+            if (!t.assert_true(llama_kv_stream_writer::requirements(type, c.shape, 512, bytes))) return;
+            ggml_backend_buffer_ptr scratch(ggml_backend_buft_alloc_buffer(type, bytes));
+            auto writer = llama_kv_stream_writer::create(backend.get(), scratch.get(), bytes, c.shape, 512);
+            if (!t.assert_true(writer != nullptr)) return;
+            for (const auto & range : ranges) ggml_backend_buffer_clear(range.buffer.get(),0xa5);
+            std::vector<llama_kv_stream_host_range> duplicated;
+            for (const auto & range : ranges) duplicated.push_back({
+                ggml_backend_buffer_ptr(ggml_backend_buffer_retain(range.buffer.get())),range.offset,range.bytes});
+            duplicated[1].buffer.reset(ggml_backend_buffer_retain(duplicated[0].buffer.get()));
+            llama_kv_stream_writer_completion invalid;
+            const bool accepted=writer->generate_async_registered(e.source,value,duplicated,{},invalid);
+            if (accepted) {
+                if (invalid.device) invalid.device->synchronize();
+                if (invalid.host) invalid.host->synchronize();
+            }
+            t.assert_true("duplicate registrations reject before publication",!accepted);
+            if (!accepted) {
+                t.assert_equal(size_t(0),writer->stats().graph_submissions);
+                bool untouched=true;
+                for (const auto & range : addresses) {
+                    const auto * first=static_cast<const uint8_t *>(range.first);
+                    untouched &= std::all_of(first,first+range.second,[](uint8_t value) { return value == 0xa5; });
+                }
+                t.assert_true(untouched);
+            }
+            writer->release_completed();
+            duplicated.clear();
+            release_probe freed(ranges.front().buffer.get());
+            llama_kv_stream_writer_completion completion;
+            if (!t.assert_true(writer->generate_async_registered(e.source,value,ranges, {}, completion))) return;
+            const auto stats = writer->stats();
+            t.assert_equal(size_t(2), stats.graph_submissions);
+            t.assert_equal(expected.size(), stats.d2h_bytes);
+            t.assert_true(stats.d2h_calls >= ranges.size());
+            t.assert_equal(bytes, stats.device_scratch_bytes);
+            ranges.clear(); sparse.reset();
+            t.assert_equal(0, freed.frees);
+            t.assert_true(completion.device && completion.host && completion.device->synchronize() && completion.host->synchronize());
+            size_t copied = 0;
+            for (const auto & range : addresses) {
+                std::memcpy(actual.data() + copied, range.first, range.second);
+                copied += range.second;
+            }
+            t.assert_true(actual == expected);
+            writer->release_completed();
+            t.assert_equal(1, freed.frees);
         }
     });
     t.test("writer_quote_uses_independent_row_traits_and_bounded_tiles", [&](testing & t) {

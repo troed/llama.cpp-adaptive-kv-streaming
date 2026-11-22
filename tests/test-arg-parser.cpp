@@ -104,7 +104,7 @@ static void test(void) {
         for (int change=0;change<7;++change) {
             auto invalid=dflash;
             switch (change) {
-                case 0: invalid.n_parallel=2; break;
+                case 0: invalid.n_parallel=int32_t(llama_max_parallel_sequences()+1); break;
                 case 1: invalid.speculative.draft.n_max=8; break;
                 case 2: invalid.kv_stream_auxiliary_layers=1; break;
                 case 3: invalid.fit_params=true; break;
@@ -228,6 +228,19 @@ static void test(void) {
         }
         auto invalid=shared; invalid.n_parallel=2;
         assert(rejects(invalid));
+        auto grouped=shared;grouped.n_parallel=2;grouped.kv_unified=true;
+        for (int32_t depth=1;depth<=3;++depth) {
+            grouped.speculative.draft.n_max=depth;
+            bool accepted=false;
+            try {accepted=common_kv_stream_verify_max(grouped,true)==uint32_t(depth+1);}
+            catch (const std::invalid_argument &) {}
+            assert(accepted && "two-slot unified arena MTP retains per-sequence verification width");
+        }
+        auto invalid_group=grouped;invalid_group.n_parallel=int32_t(llama_max_parallel_sequences()+1);assert(rejects(invalid_group));
+        invalid_group=grouped;invalid_group.kv_unified=false;assert(rejects(invalid_group));
+        invalid_group=grouped;invalid_group.shared_device_memory_bytes=0;invalid_group.kv_stream_pool_bytes=1024;
+        assert(rejects(invalid_group));
+        invalid_group=grouped;invalid_group.n_ubatch=3;assert(rejects(invalid_group));
         invalid=shared; invalid.n_batch=3; invalid.n_ubatch=0;
         assert(rejects(invalid));
         invalid=shared; invalid.n_batch=4; invalid.n_ubatch=3;
@@ -246,6 +259,10 @@ static void test(void) {
         assert(common_kv_stream_verify_max(shared,true) == 4);
         shared.shared_device_memory_bytes=0;
         assert(common_kv_stream_verify_max(shared,true) == 0);
+        bool missing_model=false;
+        try {(void)common_context_params_to_llama(shared,nullptr);}
+        catch (const std::invalid_argument &) {missing_model=true;}
+        assert(missing_model);
     }
 
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
@@ -624,6 +641,17 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // --ignore-eos is not supported with a grammar
+    {
+        common_params grammar_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--grammar", "root ::= \"ok\""};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), grammar_params, LLAMA_EXAMPLE_COMMON));
+
+        common_params grammar_eos_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--grammar", "root ::= \"ok\"", "--ignore-eos"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), grammar_eos_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -717,6 +745,33 @@ static void test(void) {
     assert(params.lora_adapters[1].path == "file2,2.gguf");
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
+
+    {
+        std::string ts_exact;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            ts_exact += (i > 0 ? "," : "") + std::to_string(i + 1);
+        }
+        common_params p_ts;
+        argv = {"binary_name", "-m", "model.gguf", "-ts", ts_exact};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_ts, LLAMA_EXAMPLE_COMMON));
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            assert(p_ts.tensor_split[i] == static_cast<float>(i + 1));
+        }
+
+        common_params p_fitt;
+        argv = {"binary_name", "-m", "model.gguf", "-fitt", ts_exact};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_fitt, LLAMA_EXAMPLE_COMMON));
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            assert(p_fitt.fit_params_target[i] == static_cast<size_t>(i + 1) * 1024 * 1024);
+        }
+
+        std::string ts_too_many = ts_exact + ",99";
+        argv = {"binary_name", "-m", "model.gguf", "-ts", ts_too_many};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_ts, LLAMA_EXAMPLE_COMMON));
+
+        argv = {"binary_name", "-m", "model.gguf", "-fitt", ts_too_many};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_fitt, LLAMA_EXAMPLE_COMMON));
+    }
 
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32

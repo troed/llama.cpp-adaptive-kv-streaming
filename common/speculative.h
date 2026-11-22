@@ -4,6 +4,7 @@
 #include "common.h"
 
 struct common_speculative;
+class llama_context_group;
 
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
@@ -36,6 +37,10 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
 common_params common_base_params_to_speculative(const common_params & params);
+
+// Partition complete native draft blocks; zero rows exclude a sequence. Failure preserves output.
+bool common_speculative_partition_draft_blocks(const std::vector<uint32_t> & rows,uint32_t microbatch,
+        std::vector<std::vector<llama_seq_id>> & output);
 
 struct common_speculative_output_limits {
     int32_t total;
@@ -78,7 +83,7 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
-    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash (DFlash2 only) sample
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
     // the target's temp and seed, read only when the drafter samples probabilistically
@@ -89,6 +94,9 @@ struct common_speculative_draft_params {
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+
+// Rebind matched MTP or DFlash contexts at an idle boundary, before destroying old contexts.
+bool common_speculative_rebind(common_speculative * spec,llama_context * target,llama_context * draft);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
@@ -138,6 +146,7 @@ typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_s
 
 struct common_speculative_init_result {
     common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    common_speculative_init_result(common_params & params,llama_model * model_tgt,llama_context * ctx_tgt,llama_context_group * group);
     ~common_speculative_init_result();
 
     llama_model   * model();
@@ -151,3 +160,6 @@ private:
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+// The result owns optional sidecar weights and must outlive the group and its borrowed contexts.
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params,llama_model * model_tgt,
+    llama_context * ctx_tgt,llama_context_group * group);

@@ -5,6 +5,12 @@
 class llama_kv_stream_logical_cache;
 class llama_context_memory;
 
+#include <atomic>
+
+// IDs must also admit their four derived resource IDs without overflow.
+uint64_t llama_kv_stream_cache_ids_reserve(std::atomic<uint64_t> & next, uint32_t count) noexcept;
+uint64_t llama_kv_stream_cache_ids_reserve(uint32_t count) noexcept;
+
 enum class llama_kv_stream_access_role : uint32_t { append, read };
 
 // Scheduling intent only. Read frontiers/generations are resolved after publication, not inferred from cache membership.
@@ -61,6 +67,8 @@ struct llama_kv_stream_model_config {
     uint32_t verify_width = 1;
     // Quote all target decode widths up to this limit before binding the phase arena.
     uint32_t max_decode_rows = 4;
+    // Internal backing choice; multi-slot server admission remains separately gated.
+    bool demand_host = false;
 };
 
 // Own the host-KV execution buffer and a serial session; proxy-buffer references retain the runtime state.
@@ -183,4 +191,59 @@ private:
     struct implementation;
     std::shared_ptr<implementation> impl;
     ggml_backend_buffer_t proxy = nullptr;
+};
+
+class llama_kv_stream_slot_table;
+class llama_kv_stream_group_producer;
+class llama_kv_cells;
+struct llama_kv_stream_slot_projection;
+struct llama_ubatch;
+
+struct llama_kv_stream_group_model_config {
+    ggml_backend_t backend = nullptr;
+    std::shared_ptr<llama_kv_stream_slot_table> table;
+    ggml_kv_stream_shape shape;
+    uint32_t layers = 0, query_heads = 0, maximum_rows = 0, maximum_verify_rows = 0, maximum_selected = 0;
+};
+
+// Native full-cache projection only. The table owns canonical histories; the common
+// group owner supplies admitted arena-backed publication and attention callbacks.
+class llama_kv_stream_group_model {
+public:
+    static std::unique_ptr<llama_kv_stream_group_model> create(const llama_kv_stream_group_model_config & config);
+    ~llama_kv_stream_group_model();
+    ggml_backend_buffer_t buffer() const noexcept;
+    bool layer(uint32_t index, llama_kv_stream_host_layer & output) const noexcept;
+    bool matches(const ggml_kv_stream_shape & shape,uint32_t heads,uint32_t layers,size_t tokens) const noexcept;
+    bool accepts_projection(const llama_kv_stream_slot_projection & projection) const noexcept;
+    std::shared_ptr<llama_kv_stream_slot_table> source_table() const noexcept;
+    bool bound() const noexcept;
+    uint32_t maximum_verify_rows() const noexcept;
+    // Caller retires native model graphs first; no physical grants survive this binding.
+    bool unbind() noexcept;
+    bool bind(std::shared_ptr<llama_kv_stream_group_producer> producer,
+        std::function<bool(uint32_t,ggml_tensor *)> attention, std::function<bool()> admitted);
+    bool bind_projection(std::shared_ptr<llama_kv_stream_slot_projection> projection);
+    bool begin(std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_ubatch & batch,
+        const std::vector<uint32_t> & native_indices,llama_memory_work_phase phase);
+    // Copy native placement after memory apply, preserving the producer's abort snapshot.
+    bool apply_cells(const llama_kv_cells & cells);
+    bool finish();
+    // Borrow committed source rows without publishing KV or changing their frontier.
+    // Finish or abort before releasing the source owner's admission and workspace.
+    bool begin_shared_read(ggml_backend_t consumer,const llama_ubatch & batch,const std::vector<uint32_t> & layers,
+        std::function<bool(uint32_t,ggml_tensor *)> attention,std::function<bool()> admitted);
+    bool finish_shared_read();
+    bool shared_read_active() const noexcept;
+    bool abort() noexcept;
+    bool suffix(llama_seq_id sequence,llama_pos begin,llama_pos end,size_t & retained,
+        const llama_kv_cells ** cells = nullptr) const noexcept;
+    // The common owner drains readers and admits every semantic mutation.
+    void bind_mutation(std::function<bool(const std::function<bool()> &)> mutation);
+    bool remove_suffix(llama_seq_id sequence,llama_pos begin,llama_pos end,llama_kv_cells & native);
+private:
+    llama_kv_stream_group_model() = default;
+    struct implementation;
+    std::shared_ptr<implementation> impl;
+    ggml_backend_buffer_ptr execution;
 };

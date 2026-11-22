@@ -151,6 +151,50 @@ struct recurrent_copy_backend_probe {
     }
 };
 
+// Inject after a completed native byte copy, including partially restored candidate banks.
+struct recurrent_buffer_transfer_fault {
+    inline static recurrent_buffer_transfer_fault * active=nullptr;
+    ggml_backend_buffer_ptr buffer;
+    decltype(ggml_backend_buffer_i::get_tensor) get;
+    decltype(ggml_backend_buffer_i::set_tensor) set;
+    size_t calls=0,fail_at;
+    recurrent_buffer_transfer_fault(ggml_backend_buffer_t source,bool upload,size_t fail_at) :
+        buffer(ggml_backend_buffer_retain(source)),get(source->iface.get_tensor),set(source->iface.set_tensor),fail_at(fail_at) {
+        GGML_ASSERT(!active);active=this;
+        if (upload) source->iface.set_tensor=[](ggml_backend_buffer_t b,ggml_tensor * tensor,const void * data,size_t offset,size_t bytes) {
+            active->set(b,tensor,data,offset,bytes);
+            if (++active->calls==active->fail_at) throw std::runtime_error("after current-state upload");
+        };
+        else source->iface.get_tensor=[](ggml_backend_buffer_t b,const ggml_tensor * tensor,void * data,size_t offset,size_t bytes) {
+            active->get(b,tensor,data,offset,bytes);
+            if (++active->calls==active->fail_at) throw std::runtime_error("after current-state download");
+        };
+    }
+    ~recurrent_buffer_transfer_fault() {
+        buffer->iface.get_tensor=get;buffer->iface.set_tensor=set;active=nullptr;
+    }
+};
+
+struct recurrent_stage_bind_fault {
+    inline static recurrent_stage_bind_fault * active=nullptr;
+    llama_memory_recurrent & memory;
+    ggml_backend_buffer_type_t type;
+    decltype(ggml_backend_buffer_type_i::get_alloc_size) allocate;
+    bool fired=false;
+    recurrent_stage_bind_fault(llama_memory_recurrent & memory,ggml_backend_buffer_type_t type) :
+        memory(memory),type(type),allocate(type->iface.get_alloc_size) {
+        GGML_ASSERT(!active);active=this;
+        type->iface.get_alloc_size=[](ggml_backend_buffer_type_t type,const ggml_tensor * tensor) -> size_t {
+            const auto * first=active->memory.spill_bank(0),* second=active->memory.spill_bank(1);
+            if (!active->fired && first && second && first->staged_publication_enabled() && second->publication_stage_parked()) {
+                active->fired=true;throw std::runtime_error("after the first selected stage rebound");
+            }
+            return active->allocate ? active->allocate(type,tensor) : ggml_nbytes(tensor);
+        };
+    }
+    ~recurrent_stage_bind_fault() {type->iface.get_alloc_size=allocate;active=nullptr;}
+};
+
 struct recurrent_bytes_writer : llama_io_write_i {
     std::vector<uint8_t> bytes;
     void write(const void * source,size_t size) override {
@@ -438,6 +482,19 @@ int main(int argc, char ** argv) {
             ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),producer.get()));
             if (!t.assert_true(bool(buffer))) return;
             auto * graph=ggml_new_graph_custom(ctx.get(),256,false);
+            struct retire_graphs {
+                ggml_backend_t backend;
+                void (*release)(ggml_backend_t);
+                ~retire_graphs() {
+                    if (release) { ggml_backend_synchronize(backend);release(backend); }
+                }
+            };
+            auto * reg=ggml_backend_dev_backend_reg(device);
+            const auto retire=reinterpret_cast<void (*)(ggml_backend_t)>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_release_all"));
+            const auto captured=reinterpret_cast<bool (*)(ggml_backend_t,const void *)>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_is_captured"));
+            if (gpu && !t.assert_true(retire && captured)) return;
+            // Native captures cannot outlive their tensor metadata or backing buffers.
+            retire_graphs retirement{producer.get(),retire};
             for (bool value : {false,true}) {
                 const uint32_t count=value ? width-1 : 7;
                 std::vector<ggml_tensor *> copies;
@@ -464,6 +521,25 @@ int main(int argc, char ** argv) {
                 const auto i=(snapshot-1)*2+size_t(value);
                 const auto * bytes=static_cast<const uint8_t *>(bank->snapshot_data(0,value,snapshot,1));
                 t.assert_true(bytes && std::all_of(bytes,bytes+ggml_nbytes(inputs[i]),[&](uint8_t b) { return b==i+1; }));
+            }
+            for (uint64_t epoch : {2u,3u}) {
+                if (!t.assert_true(bank->begin_staged_capture({107,0,epoch},width) &&
+                        ggml_backend_graph_compute(producer.get(),graph)==GGML_STATUS_SUCCESS &&
+                        bank->publish_capture() && bank->complete_capture())) return;
+                for (bool value : {false,true}) for (uint32_t snapshot=1;snapshot<=7;++snapshot) {
+                    const bool touched=!value || snapshot<width;
+                    t.assert_equal(touched ? epoch : uint64_t(0),bank->snapshot_generation(0,value,snapshot));
+                    if (!touched) { t.assert_true(bank->snapshot_pristine(0,value,snapshot));continue; }
+                    const auto i=(snapshot-1)*2+size_t(value);
+                    const auto * bytes=static_cast<const uint8_t *>(bank->snapshot_data(0,value,snapshot,epoch));
+                    t.assert_true(bytes && std::all_of(bytes,bytes+ggml_nbytes(inputs[i]),[&](uint8_t byte) {return byte==i+1;}));
+                }
+            }
+            if (gpu) {
+                bool replayed=false;
+                for (int node=0;node<ggml_graph_n_nodes(graph);++node)
+                    replayed|=captured(producer.get(),ggml_graph_node(graph,node));
+                t.assert_true("the live graph reached native CUDA capture/replay",replayed);
             }
         }
     });
@@ -663,6 +739,685 @@ int main(int argc, char ** argv) {
             t.assert_equal(456u,sentinel.verification_rows);
             t.assert_equal(789u,sentinel.workspace_rows);
         }
+    });
+    t.test("selected_current_bank_accepts_logical_id_without_allocating_unchosen_rows", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,1,2,0,nullptr,false,true);
+        if (!t.assert_true(memory.configure_selected_sequences({1}))) return;
+        ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+        if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
+        t.assert_equal(int64_t(1),memory.r_l[0]->ne[1]);
+        t.assert_equal(int64_t(1),memory.s_l[0]->ne[1]);
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+        const auto alignment=ggml_backend_buft_get_alignment(type);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),91,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+            ggml_backend_memory_arena_acquire(arena.get(),91),ggml_backend_memory_lease_free);
+        if (!t.assert_true(lease && memory.bind_current_storage(lease.get()))) return;
+        llama_batch_allocr allocator(1);
+        auto batch=allocator.ubatch_reserve(2,1);
+        llama_seq_id id=1;
+        batch.n_seq_id[0]=batch.n_seq_id[1]=1;
+        batch.seq_id[0]=batch.seq_id[1]=&id;
+        batch.pos[0]=0;batch.pos[1]=1;
+        if (!t.assert_true("selected logical sequence uses the sole physical current row",memory.prepare({batch}) && memory.find_slot(batch))) return;
+        t.assert_equal(uint32_t(1),memory.used);
+        t.assert_equal(llama_pos(-1),memory.seq_pos_max(0));
+        t.assert_equal(llama_pos(1),memory.seq_pos_max(1));
+        t.assert_true(memory.cells[0].has_seq_id(1));
+        std::vector<float> values(ggml_nelements(memory.s_l[0]),-0.125f);values[0]=-0.0f;
+        ggml_backend_tensor_set(memory.s_l[0],values.data(),0,ggml_nbytes(memory.s_l[0]));
+        recurrent_bytes_writer saved;memory.state_write(saved,1,0);
+        if (!t.assert_true(!saved.bytes.empty())) return;
+        id=0;batch.pos[0]=2;batch.pos[1]=3;
+        t.assert_true(!memory.prepare({batch}) && !memory.find_slot(batch));
+        t.assert_equal(llama_pos(1),memory.seq_pos_max(1));
+        t.assert_true(memory.seq_rm(1,0,-1));
+        t.assert_equal(llama_pos(-1),memory.seq_pos_max(1));
+        recurrent_bytes_reader restore(saved.bytes);memory.state_read(restore,1,0);
+        t.assert_equal(saved.bytes.size(),restore.cursor);
+        recurrent_bytes_writer again;memory.state_write(again,1,0);
+        t.assert_true(saved.bytes==again.bytes);
+        t.assert_true(memory.cells[0].has_seq_id(1));
+        t.assert_true(!memory.configure_selected_sequences({0}));
+        memory.clear(false);
+        t.assert_equal(llama_pos(-1),memory.seq_pos_max(1));
+        id=1;batch.pos[0]=0;batch.pos[1]=1;
+        t.assert_true(memory.prepare({batch}) && memory.find_slot(batch));
+    });
+    t.test("compact_selected_current_rows_restore_native_sequence_images_independently", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        std::vector<std::vector<uint8_t>> references;
+        for (uint32_t slot=0;slot<4;++slot) {
+            llama_memory_recurrent native(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,1,1,0,nullptr);
+            llama_batch_allocr allocator(1);auto batch=allocator.ubatch_reserve(2,1);
+            llama_seq_id sequence=0;
+            batch.n_seq_id[0]=batch.n_seq_id[1]=1;batch.seq_id[0]=batch.seq_id[1]=&sequence;
+            batch.pos[0]=llama_pos(10+slot*5);batch.pos[1]=batch.pos[0]+1;
+            if (!t.assert_true(native.find_slot(batch))) return;
+            for (auto * tensor : {native.r_l[0],native.s_l[0]}) {
+                std::vector<float> values(ggml_nelements(tensor),float(slot+1)*-0.125f);values[0]=-0.0f;
+                ggml_backend_tensor_set(tensor,values.data(),0,ggml_nbytes(tensor));
+            }
+            recurrent_bytes_writer saved;native.state_write(saved,0,0);references.push_back(std::move(saved.bytes));
+        }
+        for (const auto & ids : std::vector<std::vector<llama_seq_id>>{{0},{1},{3},{0,3},{3,1},{2,0}}) {
+            llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,uint32_t(ids.size()),4,0,nullptr,false,true);
+            if (!t.assert_true(memory.configure_selected_sequences(ids))) return;
+            t.assert_true(!memory.configure_selected_sequences({-1}));
+            t.assert_true(!memory.configure_selected_sequences({4}));
+            t.assert_true(!memory.configure_selected_sequences({1,1}));
+            ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
+            if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
+            const size_t alignment=ggml_backend_buft_get_alignment(type);
+            std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+                ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+            if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),92,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_commit(arena.get()))) return;
+            std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+                ggml_backend_memory_arena_acquire(arena.get(),92),ggml_backend_memory_lease_free);
+            if (!t.assert_true(lease && memory.bind_current_storage(lease.get()))) return;
+            auto load_order=ids;std::sort(load_order.begin(),load_order.end());
+            for (auto id : load_order) {
+                recurrent_bytes_reader source(references[id]);memory.state_read(source,id,0);
+                t.assert_equal(references[id].size(),source.cursor);
+            }
+            const auto exact=[&] {
+                for (auto id : ids) {
+                    recurrent_bytes_writer saved;memory.state_write(saved,id,0);
+                    if (!t.assert_true("selected source image matches its native single-sequence control",saved.bytes==references[id])) return false;
+                    t.assert_equal(llama_pos(11+id*5),memory.seq_pos_max(id));
+                }
+                return true;
+            };
+            if (!exact()) return;
+            for (llama_seq_id id=0;id<4;++id)
+                if (std::find(ids.begin(),ids.end(),id)==ids.end()) t.assert_equal(llama_pos(-1),memory.seq_pos_max(id));
+            llama_batch_allocr allocator(1);auto batch=allocator.ubatch_reserve(2,uint32_t(ids.size()));
+            auto logical_ids=ids;
+            std::fill(batch.data->seq_idx.begin(),batch.data->seq_idx.end(),-1);
+            for (size_t seq=0;seq<ids.size();++seq) {
+                batch.seq_id_unq[seq]=ids[seq];batch.seq_idx[ids[seq]]=int32_t(seq);
+            }
+            for (size_t seq=0;seq<ids.size();++seq) for (size_t row=0;row<2;++row) {
+                const size_t token=seq*2+row;
+                batch.n_seq_id[token]=1;batch.seq_id[token]=&logical_ids[seq];
+                batch.pos[token]=llama_pos(12+ids[seq]*5+llama_pos(row));
+            }
+            if (!t.assert_true(memory.prepare({batch}) && memory.prepare({batch}) && exact())) return;
+            if (!t.assert_true(memory.park_current_storage())) return;
+            ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(arena.get()),0xa5);
+            if (!t.assert_true(memory.restore_current_storage(lease.get()) && exact())) return;
+            if (!t.assert_true(memory.find_slot(batch))) return;
+            t.assert_equal(uint32_t(ids.size()),memory.n);
+            for (auto id : ids) t.assert_equal(llama_pos(13+id*5),memory.seq_pos_max(id));
+        }
+    });
+    t.test("deferred_current_geometry_rejects_invalid_rows_before_allocation", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        for (const auto & shape : std::vector<std::array<uint32_t,3>>{{0,1,0},{1,0,0},{3,1,0},{2,2,UINT32_MAX},{1,LLAMA_MAX_SEQ+1,0}}) {
+            bool rejected=false;
+            try {
+                llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,
+                    shape[0],shape[1],shape[2],nullptr,false,true);
+            } catch (const std::runtime_error &) { rejected=true; }
+            t.assert_true("invalid selected-state geometry fails before tensor allocation",rejected);
+        }
+    });
+    t.test("deferred_current_state_rebind_preserves_raw_rows_and_logical_cells", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=3;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,2,2,0,
+            [](int32_t layer) { return layer!=1; },false,true);
+        auto * type=ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t measured=nullptr;size_t bytes=0;
+        if (!t.assert_true(memory.current_storage_pending() && memory.current_storage_requirements(measured,bytes))) return;
+        t.assert_true(measured==type && bytes>0 && !memory.r_l[1] && !memory.s_l[1]);
+        t.assert_true(!memory.r_l[0]->data && !memory.s_l[2]->data && !memory.prepare({}));
+        recurrent_bytes_writer unavailable;
+        bool rejected=false;
+        try { memory.state_write(unavailable,0,0); } catch (const std::runtime_error &) { rejected=true; }
+        t.assert_true("unbound current storage rejects state export before writing metadata",rejected && unavailable.bytes.empty());
+        recurrent_bytes_reader unavailable_read(unavailable.bytes);
+        rejected=false;
+        try { memory.state_read(unavailable_read,0,0); } catch (const std::runtime_error &) { rejected=true; }
+        t.assert_true("unbound current storage rejects state import before reading metadata",rejected && unavailable_read.cursor==0);
+        const size_t a=ggml_backend_buft_get_alignment(type);
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,bytes+2*a),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),51,a,bytes,a,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+            ggml_backend_memory_arena_acquire(arena.get(),51),ggml_backend_memory_lease_free);
+        if (!t.assert_true("initial current binding",lease && memory.bind_current_storage(lease.get()))) return;
+        t.assert_true(!memory.current_storage_pending());
+        std::vector<std::vector<float>> rows;
+        for (size_t layer : {0u,2u}) for (bool value : {false,true}) {
+            auto * tensor=value ? memory.s_l[layer] : memory.r_l[layer];
+            std::vector<float> values(ggml_nelements(tensor),float(3+layer+size_t(value)));values[0]=-0.0f;
+            ggml_backend_tensor_set(tensor,values.data(),0,ggml_nbytes(tensor));rows.push_back(std::move(values));
+        }
+        memory.used=2;
+        for (uint32_t seq=0;seq<2;++seq) { memory.cells[seq].pos=llama_pos(17+seq);memory.cells[seq].tail=seq;memory.cells[seq].seq_id.insert(seq); }
+        if (!t.assert_true("release current roots",memory.release_current_storage())) return;
+        t.assert_true(memory.current_storage_pending() && !memory.r_l[0]->data && !memory.s_l[2]->data);
+        t.assert_true("release current roots",memory.release_current_storage());
+        t.assert_equal(uint32_t(2),memory.used);
+        t.assert_equal(llama_pos(18),memory.cells[1].pos);
+        lease.reset();
+        if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),52,a,bytes,a,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease.reset(ggml_backend_memory_arena_acquire(arena.get(),52));
+        if (!t.assert_true(bool(lease))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0xa5);
+        if (!t.assert_true("rebind current roots",memory.bind_current_storage(lease.get()))) return;
+        size_t index=0;
+        for (size_t layer : {0u,2u}) for (bool value : {false,true}) {
+            auto * tensor=value ? memory.s_l[layer] : memory.r_l[layer];
+            ggml_backend_tensor_set(tensor,rows[index].data(),0,ggml_nbytes(tensor));
+            std::vector<float> actual(rows[index].size());ggml_backend_tensor_get(tensor,actual.data(),0,ggml_nbytes(tensor));
+            t.assert_true(!std::memcmp(actual.data(),rows[index].data(),ggml_nbytes(tensor)));++index;
+        }
+        t.assert_equal(llama_pos(17),memory.cells[0].pos);
+        t.assert_equal(int32_t(1),memory.cells[1].tail);
+        t.assert_true(memory.cells[0].has_seq_id(0) && memory.cells[1].has_seq_id(1));
+    });
+    t.test("owned_current_parking_preserves_provisional_rows_and_rollback_indices", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,2,2,3,nullptr,false,true);
+        auto * type=ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t measured=nullptr;size_t bytes=0;
+        if (!t.assert_true(memory.current_storage_requirements(measured,bytes))) return;
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),61,0,bytes,ggml_backend_buft_get_alignment(type),
+                    GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) && ggml_backend_memory_arena_commit(arena.get()))) return;
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+            ggml_backend_memory_arena_acquire(arena.get(),61),ggml_backend_memory_lease_free);
+        if (!t.assert_true(lease && memory.bind_current_storage(lease.get()))) return;
+        std::vector<float> r(ggml_nelements(memory.r_l[0])),s(ggml_nelements(memory.s_l[0]));
+        for (size_t i=0;i<r.size();++i) r[i]=float(i+1);
+        for (size_t i=0;i<s.size();++i) s[i]=-float(i+1);
+        r[0]=-0.0f;
+        ggml_backend_tensor_set(memory.r_l[0],r.data(),0,ggml_nbytes(memory.r_l[0]));
+        ggml_backend_tensor_set(memory.s_l[0],s.data(),0,ggml_nbytes(memory.s_l[0]));
+        memory.rs_idx={2,3};memory.used=2;memory.head=1;memory.n=2;memory.rs_z=1;
+        for (uint32_t seq=0;seq<2;++seq) {
+            memory.cells[seq].pos=llama_pos(29+seq);memory.cells[seq].tail=seq;
+            memory.cells[seq].src=int32_t(1-seq);memory.cells[seq].src0=int32_t(seq);memory.cells[seq].seq_id.insert(seq);
+        }
+        {
+            recurrent_buffer_transfer_fault fault(memory.r_l[0]->buffer,false,2);
+            t.assert_true(!memory.park_current_storage());
+            t.assert_equal(size_t(2),fault.calls);
+            t.assert_true(!memory.current_storage_parked() && !memory.current_storage_pending());
+        }
+        if (!t.assert_true(memory.park_current_storage())) return;
+        t.assert_true(memory.current_storage_pending() && memory.current_storage_parked());
+        t.assert_true("parked current rows cannot start a restore",!memory.restore_spill_async(nullptr));
+        t.assert_true("parked current rows cannot materialize device state",!memory.materialize_spill_for_device_state());
+        t.assert_true("parked current rows cannot capture new snapshots",!memory.capture_spill(nullptr,{}));
+        lease.reset();
+        if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),62,0,bytes,ggml_backend_buft_get_alignment(type),
+                    GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) && ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease.reset(ggml_backend_memory_arena_acquire(arena.get(),62));
+        if (!t.assert_true(bool(lease))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0xa5);
+        t.assert_true(!memory.bind_current_storage(lease.get()));
+        {
+            recurrent_buffer_transfer_fault fault(ggml_backend_memory_lease_buffer(lease.get()),true,2);
+            t.assert_true(!memory.restore_current_storage(lease.get()));
+            t.assert_equal(size_t(2),fault.calls);
+            t.assert_true(memory.current_storage_parked() && memory.current_storage_pending() && !memory.r_l[0]->data);
+            t.assert_true(!memory.prepare({}));
+        }
+        if (!t.assert_true(memory.restore_current_storage(lease.get()))) return;
+        t.assert_true(!memory.current_storage_parked() && !memory.current_storage_pending());
+        std::vector<float> actual_r(r.size()),actual_s(s.size());
+        ggml_backend_tensor_get(memory.r_l[0],actual_r.data(),0,ggml_nbytes(memory.r_l[0]));
+        ggml_backend_tensor_get(memory.s_l[0],actual_s.data(),0,ggml_nbytes(memory.s_l[0]));
+        t.assert_true(!std::memcmp(r.data(),actual_r.data(),r.size()*sizeof(float)));
+        t.assert_true(!std::memcmp(s.data(),actual_s.data(),s.size()*sizeof(float)));
+        t.assert_true(memory.rs_idx==std::vector<uint32_t>({2,3}));
+        t.assert_equal(2u,memory.used);t.assert_equal(1u,memory.head);t.assert_equal(2u,memory.n);t.assert_equal(1,memory.rs_z);
+        t.assert_equal(llama_pos(30),memory.cells[1].pos);
+        t.assert_equal(1,memory.cells[0].src);t.assert_equal(1,memory.cells[1].src0);
+        t.assert_true(memory.cells[0].has_seq_id(0) && memory.cells[1].has_seq_id(1));
+        if (!t.assert_true(memory.park_current_storage())) return;
+        memory.clear(true);
+        if (!t.assert_true(memory.restore_current_storage(lease.get()))) return;
+        ggml_backend_tensor_get(memory.r_l[0],actual_r.data(),0,ggml_nbytes(memory.r_l[0]));
+        ggml_backend_tensor_get(memory.s_l[0],actual_s.data(),0,ggml_nbytes(memory.s_l[0]));
+        const auto zero=[](const std::vector<float> & values) {
+            return std::all_of(values.begin(),values.end(),[](float value) { uint32_t bits;std::memcpy(&bits,&value,sizeof(bits));return bits==0; });
+        };
+        t.assert_true("clearing a parked bank cannot resurrect its previous rows",zero(actual_r) && zero(actual_s));
+        t.assert_true(memory.used==0 && memory.cells[0].is_empty() && memory.cells[1].is_empty() &&
+            memory.rs_idx==std::vector<uint32_t>({0,0}));
+    });
+    t.test("selected_recurrent_rollback_describes_only_the_chosen_logical_sequences", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        for (const auto & selected : {std::vector<llama_seq_id>{0,1},std::vector<llama_seq_id>{1}}) {
+            llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,uint32_t(selected.size()),2,3,nullptr,true,true,true);
+            if (!t.assert_true(memory.configure_selected_sequences(selected))) return;
+            t.assert_equal(uint32_t(3),memory.n_rs_seq);
+            t.assert_true(memory.current_storage_pending() && !memory.prepare({}));
+            t.assert_true(!memory.spill_bank() && !memory.spill_bank(-1) && !memory.spill_bank(2));
+            const llama_recurrent_spill_bank * previous=nullptr;
+            for (llama_seq_id sequence=0;sequence<2;++sequence) {
+                const auto * bank=memory.spill_bank(sequence);
+                const bool chosen=std::find(selected.begin(),selected.end(),sequence)!=selected.end();
+                if (!t.assert_equal(chosen,bank!=nullptr)) return;
+                if (!chosen) continue;
+                t.assert_true(bank!=previous && bank->host_bytes()>0 && !bank->allocated_host_bytes());
+                previous=bank;
+                const auto * r=bank->staging_tensor(0,false,1),* state=bank->staging_tensor(0,true,1);
+                if (!t.assert_true(r && state)) return;
+                t.assert_equal(int64_t(model->hparams.n_embd_r()),ggml_nelements(r));
+                t.assert_equal(int64_t(model->hparams.n_embd_s()),ggml_nelements(state));
+            }
+            t.assert_true(!memory.configure_selected_sequences(selected));
+        }
+    });
+    t.test("selected_publication_banks_borrow_disjoint_slices_of_one_stage_grant", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        auto * type=ggml_backend_cpu_buffer_type();const size_t alignment=ggml_backend_buft_get_alignment(type);
+        using arena_ptr=std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)>;
+        using lease_ptr=std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
+        ggml_backend_ptr backend(ggml_backend_cpu_init());auto * raw=backend.get();
+        ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(&raw,nullptr,1,128,false,true));
+        for (uint32_t depth=3;depth<=7;++depth) for (const auto & selected : {std::vector<llama_seq_id>{0,1},std::vector<llama_seq_id>{1}}) {
+            llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,uint32_t(selected.size()),2,depth,nullptr,true,true,true);
+            if (!t.assert_true(memory.configure_selected_sequences(selected))) return;
+            ggml_backend_buffer_type_t measured=nullptr;size_t current_bytes=0,stage_bytes=0;
+            if (!t.assert_true(memory.current_storage_requirements(measured,current_bytes) && measured==type &&
+                    memory.spill_stage_requirements(measured,stage_bytes) && measured==type)) return;
+            size_t expected=0;
+            for (auto sequence : selected) expected+=memory.spill_bank(sequence)->staged_device_bytes();
+            if (!t.assert_equal(expected,stage_bytes)) return;
+            const auto root=[&](size_t bytes) {
+                arena_ptr arena(ggml_backend_memory_arena_new(type,bytes),ggml_backend_memory_arena_free);
+                if (!arena || !ggml_backend_memory_arena_begin(arena.get(),0) ||
+                        !ggml_backend_memory_arena_reserve_at(arena.get(),82,0,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) ||
+                        !ggml_backend_memory_arena_commit(arena.get())) return arena_ptr(nullptr,ggml_backend_memory_arena_free);
+                return arena;
+            };
+            auto short_arena=root(stage_bytes-1);if (!t.assert_true(short_arena!=nullptr)) return;
+            lease_ptr short_stage(ggml_backend_memory_arena_acquire(short_arena.get(),82),ggml_backend_memory_lease_free);
+            const auto * unchanged=memory.spill_bank(selected.front());
+            t.assert_true(!memory.bind_spill_stage(short_stage.get()) && memory.spill_bank(selected.front())==unchanged &&
+                !unchanged->allocated_host_bytes());
+            arena_ptr arena(ggml_backend_memory_arena_new(type,current_bytes+stage_bytes),ggml_backend_memory_arena_free);
+            if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),81,0,current_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),82,current_bytes,stage_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_commit(arena.get()))) return;
+            lease_ptr current(ggml_backend_memory_arena_acquire(arena.get(),81),ggml_backend_memory_lease_free),
+                stage(ggml_backend_memory_arena_acquire(arena.get(),82),ggml_backend_memory_lease_free);
+            if (!t.assert_true(current && stage && memory.bind_current_storage(current.get()))) return;
+            t.assert_true(memory.current_storage_pending() && !memory.prepare({}));
+            if (!t.assert_true(memory.bind_spill_stage(stage.get()))) return;
+            for (auto * tensor : {memory.r_l[0],memory.s_l[0]}) ggml_backend_sched_set_tensor_backend(scheduler.get(),tensor,backend.get());
+            auto * buffer=ggml_backend_memory_lease_buffer(stage.get());const auto base=uintptr_t(ggml_backend_buffer_get_base(buffer));
+            size_t offset=0;
+            for (auto sequence : selected) {
+                const auto * bank=memory.spill_bank(sequence);const auto * tensor=bank ? bank->staging_tensor(0,false,1) : nullptr;
+                if (!t.assert_true(bank && tensor && bank->staged_publication_enabled() && bank->allocated_host_bytes()==bank->host_bytes())) return;
+                t.assert_equal(base+offset,uintptr_t(ggml_backend_buffer_get_base(tensor->buffer)));
+                offset+=bank->staged_device_bytes();
+            }
+            t.assert_equal(stage_bytes,offset);
+            t.assert_true(!memory.bind_spill_stage(stage.get()));
+            current.reset();stage.reset();
+            if (!t.assert_equal("both outer grants stay leased after caller handles retire",size_t(2),ggml_backend_memory_arena_lease_count(arena.get()))) return;
+            const auto capture=[&](std::vector<llama_seq_id> sequences,bool cancel=false) {
+                llama_batch_allocr allocator(1);auto input=allocator.ubatch_reserve(depth+1,uint32_t(sequences.size()));
+                for (size_t i=0;i<sequences.size();++i) for (size_t row=0;row<=depth;++row) {
+                    input.n_seq_id[i*(depth+1)+row]=1;input.seq_id[i*(depth+1)+row]=&sequences[i];
+                    input.pos[i*(depth+1)+row]=memory.seq_pos_max(sequences[i])+1+llama_pos(row);
+                }
+                if (!t.assert_true("complete current/publication grants admit native selected rows",memory.find_slot(input))) return false;
+                llm_graph_result result(256);result.reset();auto * context=result.get_ctx();auto * graph=result.get_gf();
+                llama_memory_recurrent_context native(&memory);
+                struct row {llama_seq_id sequence;uint32_t slot;bool value;ggml_tensor * source;size_t offset;std::vector<float> data;};
+                std::vector<row> expected;
+                const std::array<uint64_t,2> before{memory.spill_generation(0),memory.spill_generation(1)};
+                for (bool value : {false,true}) {
+                    std::vector<ggml_tensor *> copies;
+                    for (uint32_t slot=1;slot<=depth;++slot) {
+                        const auto * stage=memory.spill_bank(sequences.front())->staging_tensor(0,value,slot);
+                        const auto width=ggml_nelements(stage);
+                        auto * source=value ? ggml_new_tensor_2d(context,GGML_TYPE_F32,width,int64_t(sequences.size())) :
+                            ggml_new_tensor_3d(context,GGML_TYPE_F32,1,width,int64_t(sequences.size()));
+                        for (size_t index=0;index<sequences.size();++index) {
+                            const auto sequence=sequences[index];std::vector<float> data(size_t(width),0);
+                            for (size_t i=0;i<data.size();++i) data[i]=float(sequence*1000+value*100+slot*10+i);
+                            expected.push_back({sequence,slot,value,source,index*size_t(width)*sizeof(float),std::move(data)});
+                        }
+                        if (!t.assert_true(native.stage_sequence_snapshot(context,result,source,0,value,slot,value ? 1 : 2,input,copies))) return false;
+                    }
+                    if (!t.assert_true(native.publish_staged(context,graph,0,value,copies))) return false;
+                }
+                const auto & outputs=result.get_recurrent_snapshots();
+                ggml_backend_buffer_ptr inputs(ggml_backend_alloc_ctx_tensors(context,backend.get()));
+                if (!t.assert_true(inputs && scheduler)) return false;
+                for (const auto & row : expected) ggml_backend_tensor_set(row.source,row.data.data(),row.offset,row.data.size()*sizeof(float));
+                if (!t.assert_true(memory.begin_spill_capture(input))) return false;
+                t.assert_true(!memory.begin_spill_capture(input));
+                if (!t.assert_equal(GGML_STATUS_SUCCESS,ggml_backend_graph_compute(backend.get(),graph))) return false;
+                if (cancel) {
+                    memory.abort_spill_capture();
+                    for (auto sequence : sequences) {
+                        t.assert_equal(before[sequence],memory.spill_generation(sequence));
+                        t.assert_true(!memory.spill_bank(sequence)->snapshot_data(0,true,1,before[sequence]));
+                    }
+                    if (!t.assert_true(memory.begin_spill_capture(input) &&
+                            ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS)) return false;
+                }
+                if (sequences.size()==2) {
+                    auto missing=outputs;
+                    missing.erase(std::remove_if(missing.begin(),missing.end(),[&](const auto & output) {return output.sequence==sequences.back();}),missing.end());
+                    if (!t.assert_true("a neighboring sequence cannot supply missing snapshot proof",!memory.capture_spill(scheduler.get(),missing))) return false;
+                }
+                if (!t.assert_true(memory.capture_spill(scheduler.get(),outputs) && memory.complete_spill())) return false;
+                for (const auto & row : expected) {
+                    const auto generation=memory.spill_generation(row.sequence);
+                    const auto * actual=memory.spill_bank(row.sequence)->snapshot_data(0,row.value,row.slot,generation);
+                    if (!t.assert_true(generation==before[row.sequence]+1 && actual && !std::memcmp(actual,row.data.data(),row.data.size()*sizeof(float)))) return false;
+                }
+                llama_seq_id invalid=2;input.seq_id[0]=&invalid;
+                t.assert_true(!memory.begin_spill_capture(input));
+                for (auto sequence : sequences) t.assert_equal(before[sequence]+1,memory.spill_generation(sequence));
+                return true;
+            };
+            if (!capture(selected)) return;
+            if (selected.size()==2) {
+                const auto generation=memory.spill_generation(0);
+                const auto * bank=memory.spill_bank(0);const auto * tensor=bank->staging_tensor(0,true,1);
+                const auto * data=static_cast<const uint8_t *>(bank->snapshot_data(0,true,1,generation));
+                std::vector<uint8_t> unchanged(data,data+ggml_nbytes(tensor));
+                if (!capture({1},true)) return;
+                const auto * retained=bank->snapshot_data(0,true,1,generation);
+                t.assert_true(memory.spill_generation(0)==generation && retained && !std::memcmp(retained,unchanged.data(),unchanged.size()));
+                if (!capture(selected)) return;
+                t.assert_equal(uint64_t(2),memory.spill_generation(0));t.assert_equal(uint64_t(3),memory.spill_generation(1));
+            }
+            const auto rolled=selected.back();
+            const auto physical=[&](llama_seq_id sequence) {
+                for (uint32_t row=0;row<memory.size;++row) if (memory.cells[row].has_seq_id(sequence)) return row;
+                return memory.size;
+            };
+            const auto mark=[&] {
+                for (auto * tensor : {memory.r_l[0],memory.s_l[0]}) {
+                    std::vector<float> values(size_t(ggml_nelements(tensor)));
+                    for (size_t i=0;i<values.size();++i) values[i]=float(7000+i);
+                    ggml_backend_tensor_set(tensor,values.data(),0,values.size()*sizeof(float));
+                }
+            };
+            const auto verify_restore=[&](uint32_t destination,uint32_t snapshot) {
+                const auto generation=memory.spill_generation(rolled);const auto * bank=memory.spill_bank(rolled);
+                for (bool value : {false,true}) {
+                    auto * tensor=value ? memory.s_l[0] : memory.r_l[0];const auto count=size_t(tensor->ne[0]);
+                    std::vector<float> actual(size_t(ggml_nelements(tensor)));
+                    ggml_backend_tensor_get(tensor,actual.data(),0,actual.size()*sizeof(float));
+                    const auto * expected=bank->snapshot_data(0,value,snapshot,generation);
+                    if (!t.assert_true(expected && !std::memcmp(actual.data()+destination*count,expected,count*sizeof(float)))) return false;
+                    for (uint32_t row=0;row<memory.size;++row) if (row!=destination)
+                        for (size_t i=0;i<count;++i) if (!t.assert_equal(float(7000+row*count+i),actual[row*count+i])) return false;
+                }
+                return true;
+            };
+            mark();const auto row=physical(rolled);const auto last=memory.seq_pos_max(rolled);
+            if (!t.assert_true("selected rollback records one native snapshot",row<memory.size && memory.seq_rm(rolled,last-1,-1) && memory.rs_idx[rolled]==2)) return;
+            if (!t.assert_true("state export materializes the selected physical row",memory.materialize_spill_for_device_state())) return;
+            if (!verify_restore(row,2)) return;
+            t.assert_equal(uint32_t(0),memory.rs_idx[rolled]);
+            t.assert_true(!memory.seq_rm(rolled,memory.seq_pos_max(rolled),-1));
+            if (!capture(selected)) return;
+            mark();const auto source=physical(rolled);
+            if (!t.assert_true(memory.seq_rm(rolled,memory.seq_pos_max(rolled)-1,-1))) return;
+            auto reversed=selected;std::reverse(reversed.begin(),reversed.end());
+            llama_batch_allocr allocator(1);auto next=allocator.ubatch_reserve(1,uint32_t(reversed.size()));
+            for (size_t i=0;i<reversed.size();++i) {
+                next.n_seq_id[i]=1;next.seq_id[i]=&reversed[i];next.pos[i]=memory.seq_pos_max(reversed[i])+1;
+            }
+            if (!t.assert_true("native input rows can reorder the selected physical banks",memory.find_slot(next))) return;
+            if (!t.assert_true(memory.restore_spill_async(scheduler.get()))) return;
+            if (!t.assert_true("the next capture completes its pending selected rollback restore",memory.begin_spill_capture(next))) return;
+            memory.abort_spill_capture();
+            if (!t.assert_true("rollback restore follows the pre-input source row",memory.complete_restore_spill())) return;
+            if (!verify_restore(source,2)) return;
+            llama_memory_recurrent_context reordered(&memory);
+            t.assert_equal(int32_t(source),reordered.s_copy(0));
+            t.assert_equal(uint32_t(0),memory.rs_idx[rolled]);
+            std::array<std::vector<uint8_t>,2> parked;
+            for (bool value : {false,true}) {
+                auto * tensor=value ? memory.s_l[0] : memory.r_l[0];auto & bytes=parked[value];bytes.resize(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor,bytes.data(),0,bytes.size());
+            }
+            const std::array<uint64_t,2> epochs{memory.spill_generation(0),memory.spill_generation(1)};
+            ggml_backend_sched_reset(scheduler.get());
+            if (!t.assert_true(memory.park_current_storage() && memory.current_storage_parked())) return;
+            if (!t.assert_equal("park releases both current and publication grants",size_t(0),ggml_backend_memory_arena_lease_count(arena.get()))) return;
+            size_t quote=0;
+            if (!t.assert_true(memory.spill_stage_requirements(measured,quote))) return;
+            t.assert_equal(stage_bytes,quote);
+            if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) && ggml_backend_memory_arena_commit(arena.get()))) return;
+            ggml_backend_buffer_clear(ggml_backend_memory_arena_parent(arena.get()),0x5a);
+            if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),81,0,current_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_reserve_at(arena.get(),82,current_bytes,stage_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                    ggml_backend_memory_arena_commit(arena.get()))) return;
+            current.reset(ggml_backend_memory_arena_acquire(arena.get(),81));stage.reset(ggml_backend_memory_arena_acquire(arena.get(),82));
+            if (!t.assert_true(current && stage && !memory.restore_current_storage(current.get()) && memory.current_storage_pending())) return;
+            if (selected.size()==2) {
+                {
+                    recurrent_stage_bind_fault fault(memory,type);
+                    t.assert_true(!memory.restore_current_storage(current.get(),stage.get()) && fault.fired);
+                }
+                current.reset();stage.reset();
+                const bool live=memory.spill_bank(0)->staged_publication_enabled() || memory.spill_bank(1)->staged_publication_enabled();
+                if (!t.assert_true("a failed partial rebind cannot leave unleased live stage views",
+                        !live || ggml_backend_memory_arena_lease_count(arena.get())>0)) return;
+                current.reset(ggml_backend_memory_arena_acquire(arena.get(),81));stage.reset(ggml_backend_memory_arena_acquire(arena.get(),82));
+            }
+            if (!t.assert_true(current && stage && memory.restore_current_storage(current.get(),stage.get()) && !memory.current_storage_pending())) return;
+            for (bool value : {false,true}) {
+                auto * tensor=value ? memory.s_l[0] : memory.r_l[0];std::vector<uint8_t> actual(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor,actual.data(),0,actual.size());t.assert_true(actual==parked[value]);
+            }
+            for (auto sequence : selected) {
+                t.assert_equal(epochs[sequence],memory.spill_generation(sequence));
+                t.assert_true(memory.spill_bank(sequence)->snapshot_data(0,true,1,epochs[sequence])!=nullptr);
+            }
+            current.reset();stage.reset();t.assert_equal(size_t(2),ggml_backend_memory_arena_lease_count(arena.get()));
+            recurrent_bytes_writer checkpoint;memory.state_write(checkpoint,rolled,0);
+            recurrent_bytes_reader imported(checkpoint.bytes);memory.state_read(imported,rolled,0);
+            recurrent_bytes_writer exact;memory.state_write(exact,rolled,0);
+            if (!t.assert_true(checkpoint.bytes==exact.bytes)) return;
+            if (!t.assert_true("replacing one logical state invalidates only its old snapshot proof",
+                    !memory.spill_bank(rolled)->snapshot_data(0,true,1,epochs[rolled]))) return;
+            if (selected.size()==2) t.assert_true(memory.spill_bank(0)->snapshot_data(0,true,1,epochs[0])!=nullptr);
+            t.assert_true(!memory.seq_rm(rolled,memory.seq_pos_max(rolled),-1));
+            memory.clear(false);
+            for (auto sequence : selected) t.assert_true(!memory.spill_bank(sequence)->snapshot_data(0,true,1,memory.spill_generation(sequence)));
+        }
+    });
+    t.test("current_and_publication_bindings_admit_execution_together", [](testing & t) {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN35,llama_model_default_params()));
+        model->hparams.n_layer_all=1;model->hparams.ssm_d_conv=2;model->hparams.ssm_d_inner=8;
+        model->hparams.ssm_d_state=8;model->hparams.ssm_n_group=1;
+        llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,1,1,3,nullptr,true,true);
+        auto * type=ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t measured=nullptr;size_t current_bytes=0;
+        if (!t.assert_true(memory.current_storage_requirements(measured,current_bytes))) return;
+        llama_recurrent_spill_layout rows;
+        llama_recurrent_stage_layout stage;
+        const size_t alignment=ggml_backend_buft_get_alignment(type);
+        if (!t.assert_true(llama_recurrent_spill_layout_make({{GGML_TYPE_F32,GGML_TYPE_F32,
+                    uint64_t(model->hparams.n_embd_r()),uint64_t(model->hparams.n_embd_s()),true}},1,3,rows) &&
+                llama_recurrent_stage_layout_make(rows,2,alignment,stage))) return;
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,current_bytes+stage.total_bytes),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),81,0,current_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),82,current_bytes,stage.total_bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> current(
+            ggml_backend_memory_arena_acquire(arena.get(),81),ggml_backend_memory_lease_free), publication(
+            ggml_backend_memory_arena_acquire(arena.get(),82),ggml_backend_memory_lease_free);
+        if (!t.assert_true(current && publication && memory.bind_current_storage(current.get()))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(current.get()),0);
+        t.assert_true("current rows alone cannot admit execution without publication storage",!memory.prepare({}));
+        t.assert_true("missing publication storage cannot silently fall back to native capture",!memory.begin_spill_capture(4));
+        if (!t.assert_true(memory.bind_spill_stage(publication.get()) && memory.prepare({}))) return;
+        if (!t.assert_true(memory.park_current_storage())) return;
+        t.assert_true(memory.spill_bank()->publication_stage_parked() && memory.current_storage_parked());
+        t.assert_true(!memory.restore_current_storage(current.get()));
+        t.assert_true(!memory.restore_current_storage(current.get(),current.get()));
+        t.assert_true(memory.current_storage_pending());
+        if (!t.assert_true(memory.restore_current_storage(current.get(),publication.get()))) return;
+        t.assert_true(memory.prepare({}) && memory.staged_publication_enabled() && !memory.current_storage_parked());
+    });
+    t.test("deferred_publication_prepares_resources_without_private_stage_allocation", [&](testing & t) {
+        const bool gpu=argc>1 && !std::strcmp(argv[1],"--cuda");
+        ggml_backend_load_all();
+        auto * device=ggml_backend_dev_by_name(gpu ? "CUDA0" : "CPU");
+        if (!t.assert_true(device!=nullptr)) return;
+        auto * type=ggml_backend_dev_buffer_type(device);
+        auto * host=ggml_backend_dev_host_buffer_type(device);
+        if (!host) host=ggml_backend_cpu_buffer_type();
+        llama_recurrent_spill_layout layout;
+        if (!t.assert_true(llama_recurrent_spill_layout_make({{GGML_TYPE_F32,GGML_TYPE_F32,32,64,true}},1,3,layout))) return;
+        auto bank=llama_recurrent_spill_bank::create(layout,host,131,0);
+        if (!t.assert_true(bool(bank))) return;
+        size_t allocations=0;
+        const auto allocate=type->iface.alloc_buffer;
+        static size_t * observed=nullptr;observed=&allocations;
+        type->iface.alloc_buffer=[](ggml_backend_buffer_type_t,size_t) -> ggml_backend_buffer_t { ++*observed;return nullptr; };
+        bool prepared=false;
+        try { prepared=bank->enable_publication(device,type,2,true); } catch (...) {}
+        type->iface.alloc_buffer=allocate;observed=nullptr;
+        if (!t.assert_true("deferred publication setup does not allocate a device stage",prepared && allocations==0)) return;
+        t.assert_true(bank->publication_stage_parked() && !bank->staged_publication_enabled() && bank->staged_device_bytes()==0);
+        t.assert_true(!bank->begin_capture({131,0,1}) && !bank->begin_staged_capture({131,0,1},4));
+        llama_recurrent_stage_layout stage;
+        if (!t.assert_true(llama_recurrent_stage_layout_make(layout,2,ggml_backend_buft_get_alignment(type),stage))) return;
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,stage.total_bytes),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),71,0,stage.total_bytes,stage.alignment,
+                    GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) && ggml_backend_memory_arena_commit(arena.get()))) return;
+        std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)> lease(
+            ggml_backend_memory_arena_acquire(arena.get(),71),ggml_backend_memory_lease_free);
+        if (!t.assert_true(lease && bank->bind_publication_stage(lease.get()))) return;
+        t.assert_true(bank->staged_publication_enabled() && !bank->publication_stage_parked() && bank->staged_device_bytes()==stage.total_bytes);
+    });
+    t.test("parking_publication_releases_device_stage_without_erasing_host_or_peer", [&](testing & t) {
+        const bool gpu=argc>1 && !std::strcmp(argv[1],"--cuda");
+        ggml_backend_load_all();
+        auto * device=ggml_backend_dev_by_name(gpu ? "CUDA0" : "CPU");
+        if (!t.assert_true(device != nullptr)) return;
+        auto * type=ggml_backend_dev_buffer_type(device);
+        auto * host=ggml_backend_dev_host_buffer_type(device);
+        if (!host) host=ggml_backend_cpu_buffer_type();
+        ggml_backend_ptr backend(ggml_backend_dev_init(device,nullptr));
+        llama_recurrent_spill_layout layout;
+        if (!t.assert_true(llama_recurrent_spill_layout_make({{GGML_TYPE_F32,GGML_TYPE_F32,4,8,true}},1,3,layout))) return;
+        auto bank=llama_recurrent_spill_bank::create(layout,host,127,0);
+        auto peer=llama_recurrent_spill_bank::create(layout,host,127,1);
+        if (!t.assert_true(bank && peer)) return;
+        recurrent_copy_backend_probe probe(device);
+        if (!t.assert_true(bank->enable_publication(device,type,2))) return;
+        device->iface.init_backend=probe.original;
+        if (!t.assert_true(peer->enable_publication(device,type,2))) return;
+        const auto * peer_stage=peer->staging_tensor(0,true,3);
+        const size_t bytes=bank->staged_device_bytes(),alignment=ggml_backend_buft_get_alignment(type);
+        std::unique_ptr<ggml_backend_memory_arena,decltype(&ggml_backend_memory_arena_free)> arena(
+            ggml_backend_memory_arena_new(type,bytes+2*alignment),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),9,alignment,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        auto * lease=ggml_backend_memory_arena_acquire(arena.get(),9);
+        if (!t.assert_true(lease && bank->bind_publication_stage(lease))) return;
+        ggml_backend_memory_lease_free(lease);
+        ggml_context_ptr ctx(ggml_init({32768,nullptr,true}));
+        auto * r=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,4);
+        auto * state=ggml_new_tensor_1d(ctx.get(),GGML_TYPE_F32,8);
+        ggml_backend_buffer_ptr input(ggml_backend_alloc_ctx_tensors(ctx.get(),backend.get()));
+        if (!t.assert_true(bool(input))) return;
+        const float expected_r[]={-0.0f,1.25f,-2.5f,3.75f};
+        const float expected_s[]={-0.0f,2,3,4,5,6,7,8};
+        ggml_backend_tensor_set(r,expected_r,0,sizeof(expected_r));
+        ggml_backend_tensor_set(state,expected_s,0,sizeof(expected_s));
+        for (auto * item : {bank.get(),peer.get()}) {
+            const uint64_t sequence=item==bank.get() ? 0 : 1;
+            if (!t.assert_true(item->begin_capture({127,sequence,1}) && item->capture(backend.get(),0,false,2,r,0) &&
+                    item->capture(backend.get(),0,true,2,state,0) && item->publish_capture() && item->complete_capture())) return;
+        }
+        const auto * saved=bank->snapshot_data(0,false,2,1);
+        if (!t.assert_true(saved && bank->begin_staged_capture({127,0,2},4))) return;
+        t.assert_true(!bank->park_publication_stage());
+        bank->cancel();
+        const auto * before_park=bank->staging_tensor(0,false,1);
+        probe.fail_prepare=true;
+        t.assert_true(!bank->park_publication_stage());
+        t.assert_true(!bank->publication_stage_parked() && bank->staging_tensor(0,false,1)==before_park);
+        t.assert_equal(bytes,bank->staged_device_bytes());
+        if (!t.assert_true(bank->park_publication_stage() && bank->publication_stage_parked())) return;
+        t.assert_equal(size_t(0),bank->staged_device_bytes());
+        t.assert_true(!bank->staging_tensor(0,true,3) && !bank->publication_tensor(0,false,2));
+        t.assert_true(bank->park_publication_stage());
+        t.assert_true(!bank->enable_publication(device,type,2));
+        t.assert_true(!bank->begin_staged_capture({127,0,2},4));
+        const bool direct=bank->begin_capture({127,0,2});
+        if (direct) bank->cancel();
+        t.assert_true("parked publication cannot fall back to a direct capture",!direct);
+        t.assert_true(peer->staging_tensor(0,true,3)==peer_stage);
+        t.assert_true(bank->snapshot_data(0,false,2,1)==saved && !std::memcmp(saved,expected_r,sizeof(expected_r)));
+        t.assert_equal(uint64_t(1),peer->snapshot_generation(0,false,2));
+        if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),10,alignment,bytes,alignment,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        auto * replacement=ggml_backend_memory_arena_acquire(arena.get(),10);
+        if (!t.assert_true(replacement != nullptr)) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(replacement),0xa5);
+        t.assert_true(!std::memcmp(saved,expected_r,sizeof(expected_r)));
+        probe.fail_prepare=true;
+        t.assert_true(!bank->bind_publication_stage(replacement));
+        t.assert_true(bank->publication_stage_parked() && !bank->staging_tensor(0,false,1));
+        t.assert_true(bank->snapshot_data(0,false,2,1)==saved);
+        t.assert_true(bank->bind_publication_stage(replacement));
+        ggml_backend_memory_lease_free(replacement);
+        t.assert_true(!bank->publication_stage_parked() && bank->staged_device_bytes()==bytes);
+        t.assert_true(bank->staging_tensor(0,true,3) != nullptr);
+        t.assert_true(bank->begin_restore({127,0,1},2) && bank->restore(backend.get(),0,false,r,0) &&
+            bank->restore(backend.get(),0,true,state,0) && bank->publish_restore() && bank->complete_restore());
+        float actual_r[4],actual_s[8];
+        ggml_backend_tensor_get(r,actual_r,0,sizeof(actual_r));ggml_backend_tensor_get(state,actual_s,0,sizeof(actual_s));
+        t.assert_true(!std::memcmp(actual_r,expected_r,sizeof(actual_r)) && !std::memcmp(actual_s,expected_s,sizeof(actual_s)));
+        t.assert_true(!bank->begin_restore({127,1,1},2));
     });
     t.test("publication_stage_can_borrow_exact_persistent_storage_but_not_during_capture", [](testing & t) {
         auto * type=ggml_backend_cpu_buffer_type();
@@ -932,6 +1687,92 @@ int main(int argc, char ** argv) {
         t.assert_equal(original,stage.total_bytes);
     });
 
+    t.test("stage_metadata_matches_real_storage_without_allocating_payload", [](testing & t) {
+        const std::vector<llama_recurrent_spill_layer> layers={
+            {GGML_TYPE_F32,GGML_TYPE_F32,7,13,true},
+            {GGML_TYPE_F32,GGML_TYPE_F32,0,0,false},
+            {GGML_TYPE_F32,GGML_TYPE_F32,32,64,true}};
+        auto * type=ggml_backend_cpu_buffer_type();
+        for (uint32_t cells : {1u,2u}) for (uint32_t depth : {3u,7u}) {
+            llama_recurrent_spill_layout layout;
+            if (!t.assert_true(llama_recurrent_spill_layout_make(layers,cells,depth,layout))) return;
+            auto real=llama_recurrent_stage_buffer::create(layout,2,type);
+            auto metadata=llama_recurrent_stage_buffer::create_measurement(layout,2,type);
+            if (!t.assert_true(real && metadata)) return;
+            t.assert_equal(real->bytes(),metadata->bytes());
+            t.assert_true(ggml_backend_buffer_get_size(real->buffer())>=real->bytes());
+            t.assert_equal(size_t(0),ggml_backend_buffer_get_size(metadata->buffer()));
+            for (size_t layer=0;layer<layers.size();++layer) for (uint32_t slot=0;slot<2;++slot)
+            for (uint32_t snapshot=1;snapshot<=depth;++snapshot) for (bool value : {false,true}) {
+                const auto * expected=real->tensor(layer,value,snapshot,slot);
+                const auto * actual=metadata->tensor(layer,value,snapshot,slot);
+                t.assert_equal(expected != nullptr,actual != nullptr);
+                if (!expected || !actual) continue;
+                t.assert_equal(expected->type,actual->type);
+                t.assert_true(!std::memcmp(expected->ne,actual->ne,sizeof(expected->ne)));
+                t.assert_true(!std::memcmp(expected->nb,actual->nb,sizeof(expected->nb)));
+                t.assert_true(actual->buffer==metadata->buffer() && actual->data==nullptr);
+                auto * plane=metadata->plane_span(layer,value,slot);
+                t.assert_equal(real->plane_span(layer,value,slot) != nullptr,plane != nullptr);
+                if (plane) t.assert_true(plane->buffer==metadata->buffer() && plane->data==nullptr);
+            }
+        }
+    });
+    t.test("publication_metadata_has_native_shapes_but_cannot_capture_or_restore", [](testing & t) {
+        ggml_backend_ptr producer(ggml_backend_cpu_init());
+        auto * device=ggml_backend_get_device(producer.get());
+        auto * type=ggml_backend_get_default_buffer_type(producer.get());
+        const std::vector<llama_recurrent_spill_layer> layers={
+            {GGML_TYPE_F32,GGML_TYPE_F32,7,13,true},
+            {GGML_TYPE_F32,GGML_TYPE_F32,32,64,true}};
+        for (uint32_t cells : {1u,2u}) for (uint32_t depth : {3u,7u}) {
+            llama_recurrent_spill_layout layout;
+            if (!t.assert_true(llama_recurrent_spill_layout_make(layers,cells,depth,layout))) return;
+            auto real=llama_recurrent_spill_bank::create(layout,type,981,0);
+            if (!t.assert_true(real && real->enable_publication(device,type,2))) return;
+            auto metadata=llama_recurrent_spill_bank::create_measurement(layout,device,type,2,982,0);
+            if (!t.assert_true(metadata != nullptr)) return;
+            t.assert_equal(real->host_bytes(),metadata->host_bytes());
+            t.assert_true(real->allocated_host_bytes()>=real->host_bytes());
+            t.assert_equal(size_t(0),metadata->allocated_host_bytes());
+            t.assert_equal(real->staged_device_bytes(),metadata->staged_device_bytes());
+            for (size_t layer=0;layer<layers.size();++layer) for (uint32_t snapshot=1;snapshot<=depth;++snapshot)
+            for (bool value : {false,true}) {
+                auto * expected=real->publication_tensor(layer,value,snapshot);
+                auto * actual=metadata->publication_tensor(layer,value,snapshot);
+                if (!t.assert_true(expected && actual)) return;
+                t.assert_true(!std::memcmp(expected->ne,actual->ne,sizeof(expected->ne)));
+                t.assert_true(!std::memcmp(expected->nb,actual->nb,sizeof(expected->nb)));
+                auto * stage=metadata->staging_tensor(layer,value,snapshot);
+                if (!t.assert_true(stage != nullptr)) return;
+                t.assert_equal(size_t(0),ggml_backend_buffer_get_size(stage->buffer));
+                t.assert_true(stage->data==nullptr);
+            }
+            t.assert_true(!metadata->begin_capture({982,0,1}));
+            t.assert_true(!metadata->begin_staged_capture({982,0,1},depth+1));
+            t.assert_true(!metadata->begin_restore({982,0,1},1));
+            t.assert_true(!metadata->snapshot_pristine(0,false,1));
+            metadata->reset(true);
+            t.assert_true(!metadata->snapshot_pristine(0,false,1));
+            metadata->cancel();
+            t.assert_true(!metadata->stage_ready());
+            ggml_context_ptr ctx(ggml_init({4096+ggml_graph_overhead_custom(16,false)+8*ggml_tensor_overhead(),nullptr,true}));
+            auto * destination=metadata->publication_tensor(0,false,1);
+            auto * source=ggml_dup_tensor(ctx.get(),destination);
+            auto * copy=ggml_cpy(ctx.get(),source,destination);
+            auto * graph=ggml_new_graph_custom(ctx.get(),16,false);
+            ggml_build_forward_expand(graph,copy);
+            ggml_backend_buffer_ptr backing(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),type));
+            if (!t.assert_true(backing != nullptr)) return;
+            const std::vector<float> original(size_t(ggml_nelements(source)),3.25f);
+            ggml_backend_tensor_set(source,original.data(),0,original.size()*sizeof(float));
+            t.assert_equal(GGML_STATUS_FAILED,ggml_backend_graph_compute(producer.get(),graph));
+            std::vector<float> after(original.size());
+            ggml_backend_tensor_get(source,after.data(),0,after.size()*sizeof(float));
+            t.assert_true(original==after);
+            t.assert_equal(size_t(0),metadata->allocated_host_bytes());
+        }
+    });
     t.test("typed_stage_tensors_alias_only_their_planned_ring_regions", [](testing & t) {
         llama_recurrent_spill_layout snapshots;
         if (!t.assert_true(llama_recurrent_spill_layout_make(

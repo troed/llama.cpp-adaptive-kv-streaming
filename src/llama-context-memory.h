@@ -4,12 +4,91 @@
 #include "llama-memory-phase.h"
 #include "llama-memory-plan.h"
 #include "llama-context-workspace.h"
+#include <algorithm>
 #include <functional>
 #include <utility>
+
+// Native recurrent graphs have equal rows per sequence; unified attention graphs use flat rows.
+struct llama_context_group_graph_profile {
+    std::vector<uint32_t> rows;
+    std::vector<uint32_t> outputs;
+};
+
+inline bool llama_context_group_graph_profiles(uint32_t selected, uint32_t width, uint32_t maximum,
+        uint32_t output_maximum, uint32_t outputs_per_sequence, bool recurrent,
+        const std::function<bool(const llama_context_group_graph_profile &)> & visit) {
+    if (!selected || selected > uint32_t(llama_max_parallel_sequences()) || !width || !maximum || maximum > INT32_MAX || !outputs_per_sequence || !visit) return false;
+    const auto emit = [&](std::vector<uint32_t> rows) {
+        uint32_t available = 0;
+        for (auto count : rows) available += std::min(count, outputs_per_sequence);
+        for (uint32_t count = 0; count <= std::min(available, output_maximum); ++count) {
+            llama_context_group_graph_profile profile{rows, std::vector<uint32_t>(selected)};
+            auto remaining = count;
+            for (uint32_t i = 0; i < selected; ++i) {
+                profile.outputs[i] = std::min(remaining, std::min(rows[i], outputs_per_sequence));
+                remaining -= profile.outputs[i];
+            }
+            if (!visit(profile)) return false;
+        }
+        return true;
+    };
+    if (recurrent) {
+        for (uint32_t rows = 1; rows <= std::min(width, maximum); ++rows) {
+            for (uint32_t active = 1; active <= std::min(selected, maximum / rows); ++active) {
+                std::vector<uint32_t> counts(selected);
+                std::fill_n(counts.begin(), active, rows);
+                if (!emit(std::move(counts))) return false;
+            }
+        }
+    } else {
+        const auto limit = uint32_t(std::min(uint64_t(maximum), uint64_t(selected) * width));
+        for (uint32_t total = 1; total <= limit; ++total) {
+            std::vector<uint32_t> counts(selected);
+            auto remaining = total;
+            for (auto & count : counts) { count = std::min(remaining, width); remaining -= count; }
+            if (!emit(std::move(counts))) return false;
+        }
+    }
+    return true;
+}
+
+// Keep bounded storage distinct from every owning cache in this operation; retain legacy IDs when available.
+inline bool llama_context_group_bounded_identity(const std::vector<llama_memory_phase_cache_identity> & sources,
+        const std::vector<llama_memory_phase_cache_identity> & auxiliary,llama_memory_phase_cache_identity & output) {
+    const auto maximum=size_t(llama_max_parallel_sequences());
+    if (sources.empty() || sources.size()>maximum || auxiliary.size()>maximum) return false;
+    for (const auto * list : {&sources,&auxiliary})
+        for (const auto & cache : *list) if (!cache.id || !cache.generation) return false;
+    uint64_t candidate=sources.front().id<=(UINT64_MAX-1)/4 ? sources.front().id*4+1 : 1;
+    for (size_t attempt=0;attempt<=sources.size()+auxiliary.size();++attempt) {
+        bool used=false;
+        for (const auto * list : {&sources,&auxiliary})
+            for (const auto & cache : *list) used=used || cache.id==candidate;
+        if (!used) {output={candidate,1};return true;}
+        candidate=candidate==UINT64_MAX ? 1 : candidate+1;
+    }
+    return false;
+}
+
+// Native state banks grow monotonically with selected count. This bound does not admit graph workspaces or attention.
+inline bool llama_context_group_state_limit(uint32_t maximum,size_t capacity,
+        const std::function<bool(uint32_t,size_t &)> & measure,uint32_t & output) {
+    if (!maximum || maximum>uint32_t(llama_max_parallel_sequences()) || !capacity || !measure) return false;
+    uint32_t low=0,high=maximum+1;
+    while (high-low>1) {
+        const auto count=low+(high-low)/2;size_t bytes=0;
+        if (!measure(count,bytes)) return false;
+        if (bytes<=capacity) low=count;
+        else high=count;
+    }
+    output=low;return true;
+}
 
 class llama_kv_stream_model;
 struct llama_memory_bounded_kv_layout;
 class llama_context_memory;
+class llama_memory_workspace;
+struct llama_memory_workspace_group;
 
 // Return a persistent cache region after its stock tensors and pending work have been released.
 class llama_context_memory_loan {
@@ -79,6 +158,13 @@ public:
             llama_context_memory * serial_parent = nullptr, bool suspended_workspace = false,
             const std::function<bool()> & before_capture = {}, size_t serial_parent_bytes = 0,
             llama_context_memory_create_result * result = nullptr);
+    // The common group coordinator supplies grants and gates the complete model submission.
+    // This factory creates no parent or backend workspace allocation.
+    static std::unique_ptr<llama_context_memory> create_external_workspace(ggml_backend_sched_t sched,
+        const std::vector<ggml_backend_t> & backends, std::vector<llama_memory_workspace_group> groups,
+        const std::function<bool()> & submission_allowed, const std::function<bool()> & before_capture = {});
+    llama_memory_workspace * external_workspace() noexcept;
+    bool capture_external_workspace() noexcept;
     // Reserve a fixed cache suffix inside the declared parent, not a second backend allocation.
     LLAMA_API std::unique_ptr<llama_context_memory_loan> reserve_bounded_cache(const llama_memory_bounded_kv_layout & layout);
     // Quote all phase minima before mutation; required_bytes describes a restart with movable fixed suffixes.

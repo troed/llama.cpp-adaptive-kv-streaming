@@ -10,7 +10,7 @@ static __global__ void ggml_cuda_fattn_mma_runtime(
         int32_t ne00, uint3 ne01, int32_t ne02, int32_t ne03, int32_t nb01, int32_t nb02, int32_t nb03,
         int32_t ne10, int32_t ne11, int32_t ne12, int32_t ne13, int32_t nb11, int32_t nb12, int64_t nb13,
         int32_t nb21, int32_t nb22, int64_t nb23,
-        int32_t ne31, int32_t ne32, int32_t ne33, int32_t nb31, int32_t nb32, int64_t nb33,
+        int32_t ne31, int32_t ne32, int32_t ne33, int32_t nb31, int64_t nb32, int64_t nb33,
         const ggml_cuda_kv_span * spans, int count, int offset, uint32_t flags,
         ggml_cuda_fattn_mma_resume_control control, ggml_type key, ggml_type value) {
     ggml_cuda_pdl_sync();
