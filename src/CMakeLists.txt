@@ -26,10 +26,12 @@ set(LLAMA_CORE_SOURCES
     llama-kv-stream-logical-cache.cpp
     llama-kv-stream-model.cpp
     llama-kv-stream-mtp-proxy.cpp
+    llama-kv-stream-aggregate.cpp
     llama-kv-stream-policy.cpp
     llama-kv-stream-positions.cpp
     llama-kv-stream-publication.cpp
     llama-kv-stream-resident.cpp
+    llama-kv-stream-selection.cpp
     llama-kv-stream-session.cpp
     llama-kv-stream-writer.cpp
     llama-memory-budget.cpp

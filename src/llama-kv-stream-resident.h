@@ -3,6 +3,7 @@
 #include "llama-kv-stream-binding.h"
 #include "llama-kv-stream-content.h"
 #include "llama-kv-stream-publication.h"
+#include "../ggml/src/ggml-kv-stream-copy.h"
 #include <memory>
 
 class llama_kv_stream_ring_guard;
@@ -133,6 +134,82 @@ public:
 
 private:
     llama_kv_stream_resident() = default;
+    struct implementation;
+    std::unique_ptr<implementation> impl;
+};
+
+class llama_kv_stream_group_buffering {
+public:
+    static std::shared_ptr<llama_kv_stream_group_buffering> create(
+        const std::vector<std::shared_ptr<llama_kv_stream_content>> & owners,
+        std::function<bool()> quiesce = {});
+    static std::shared_ptr<llama_kv_stream_group_buffering> create_aggregate(
+        const std::vector<std::vector<std::shared_ptr<llama_kv_stream_content>>> & requests,
+        std::function<bool()> quiesce = {});
+    static std::shared_ptr<llama_kv_stream_group_buffering> create_aggregate(
+        const std::vector<std::vector<std::shared_ptr<llama_kv_stream_content>>> & requests,
+        std::function<bool()> quiesce,const std::vector<uint32_t> & resident_roles);
+    ~llama_kv_stream_group_buffering();
+    llama_kv_stream_policy_state snapshot() const;
+private:
+    friend class llama_kv_stream_group_reader;
+    llama_kv_stream_group_buffering() = default;
+    struct implementation;
+    std::unique_ptr<implementation> impl;
+};
+
+struct llama_kv_stream_group_reader_source {
+    std::shared_ptr<llama_kv_stream_host> host;
+    ggml_backend_memory_lease_t pool = nullptr;
+    size_t pages = 0, tokens = 0;
+    std::shared_ptr<void> prepared_copies;
+    // Opt in to the owning cache's existing resident/ring policy and mirror bookkeeping.
+    std::shared_ptr<llama_kv_stream_content> content = {};
+    size_t stable_tokens = SIZE_MAX;
+    // Homogeneous owning caches sharing this pool, in native layer order.
+    std::vector<std::shared_ptr<llama_kv_stream_host>> owning_caches = {};
+    std::shared_ptr<llama_kv_stream_group_buffering> buffering = {};
+};
+
+struct llama_kv_stream_group_frontier {
+    size_t tokens = 0, stable_tokens = 0;
+};
+
+// Gather native attention columns from exclusive selected-source grants. The caller
+// owns source admission and native attention; finish drains users before grants retire.
+class llama_kv_stream_group_reader {
+public:
+    static std::unique_ptr<llama_kv_stream_group_reader> create(ggml_backend_t backend,
+        const std::vector<llama_kv_stream_group_reader_source> & sources,
+        ggml_backend_memory_lease_t staging, std::function<bool(uint32_t)> source_current);
+    ~llama_kv_stream_group_reader();
+    // Replan only before a producer starts publishing a new frame.
+    bool prepare_frame(const std::vector<llama_kv_stream_group_frontier> & sources,
+        llama_kv_stream_feedback_context context={1,true,false});
+    // Update live rows while idle. Aggregate bindings need prepare_frame before adding a new page.
+    // A rewind needs a newer content generation and the same mirror epoch.
+    bool update_frontiers(const std::vector<llama_kv_stream_group_frontier> & sources);
+    bool can_publish(ggml_backend_memory_lease_t encoded,uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & rows) const;
+    bool publish_encoded(ggml_backend_memory_lease_t encoded,uint32_t layer,bool value,const ggml_tensor * source,
+        size_t first,size_t count,const std::vector<ggml_kv_stream_gather_row> & rows);
+    // The owner orders device writes before this reader and completes canonical host publication before the second acknowledgement.
+    bool complete_publication(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & rows,bool host_committed);
+    bool begin(uint32_t layer, const std::vector<ggml_kv_stream_gather_row> & columns);
+    // Submit one 256-column tile in increasing native order. Attention consumes it before the next tile.
+    bool gather(size_t first);
+    // Consume the exact native column order with the original query, mask and checkpoint plan.
+    bool attention(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
+        ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode);
+    // Keep caller-owned inputs and workspace live until finish; subsequent GPU work uses this same backend.
+    bool enqueue_attention(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
+        ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode);
+    bool finish() noexcept;
+    size_t resident_upload_bytes() const noexcept;
+    llama_kv_stream_prefetch_stats sequence_stats() const noexcept;
+private:
+    llama_kv_stream_group_reader() = default;
+    bool attention_impl(uint32_t layer,const std::vector<ggml_kv_stream_gather_row> & columns,
+        ggml_tensor * op,ggml_backend_memory_lease_t workspace,bool decode,bool queued);
     struct implementation;
     std::unique_ptr<implementation> impl;
 };

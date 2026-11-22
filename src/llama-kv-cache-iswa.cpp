@@ -15,9 +15,12 @@
 bool llama_kv_cache_iswa::bounded_storage_requirements(const llama_hparams & hp, const llama_memory_params & params,
         const llama_cparams & cp, ggml_backend_buffer_type_t buft,
         llama_memory_phase_cache_identity identity, llama_memory_bounded_kv_layout & output) noexcept {
-    if (!buft || !identity.id || !identity.generation || params.swa_full || cp.n_seq_max != 1 ||
+    if (!buft || !identity.id || !identity.generation || params.swa_full || !cp.n_seq_max || cp.n_seq_max>LLAMA_MAX_SEQ ||
+            (cp.n_seq_max>1 && (!cp.kv_unified || !cp.n_ctx)) ||
             !cp.n_ctx_seq || !cp.n_ubatch || !hp.n_swa || !hp.n_layer_all || hp.n_layer_all > LLAMA_MAX_LAYERS ||
             hp.n_layer_nextn > hp.n_layer_all || hp.swa_type == LLAMA_SWA_TYPE_NONE) return false;
+    if (!llama_memory_selected_sequences_valid(params,cp.n_seq_max)) return false;
+    const auto selected=params.kv_stream_selected_sequences.empty() ? cp.n_seq_max : uint32_t(params.kv_stream_selected_sequences.size());
     int32_t kt, vt;
     std::memcpy(&kt,&params.type_k,sizeof(kt)); std::memcpy(&vt,&params.type_v,sizeof(vt));
     if (kt < 0 || kt >= GGML_TYPE_COUNT || vt < 0 || vt >= GGML_TYPE_COUNT) return false;
@@ -27,8 +30,9 @@ bool llama_kv_cache_iswa::bounded_storage_requirements(const llama_hparams & hp,
         if (ids.empty()) return false;
         llama_memory_cache_requirement cache;
         cache.identity=identity; cache.role=llama_memory_cache_role::bounded_resident;
-        cache.layers=uint32_t(ids.size()); cache.history_rows=cp.n_ctx_seq;
+        cache.layers=uint32_t(ids.size()); cache.history_rows=cp.n_seq_max==1 ? cp.n_ctx_seq : cp.n_ctx;
         cache.window_rows=hp.n_swa; cache.headroom_rows=cp.n_ubatch; cache.row_padding=256;
+        cache.sequence_capacity=selected;
         const auto first=ids.front();
         cache.format={params.type_k,params.type_v,hp.n_embd_head_k(first),hp.n_embd_head_v(first),hp.n_head_kv(first),!cp.flash_attn};
         for (auto il : ids) if (hp.n_embd_head_k(il) != cache.format.key_head_dim ||
@@ -89,9 +93,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_share_cb & share, const llama_memory_params * stream) : unified(unified) {
 
     const bool streaming=stream && (stream->kv_stream_pool_bytes || stream->shared_device_memory_bytes);
+    const bool measure_only=stream && stream->measure_only;
     if (streaming && swa_full) throw std::runtime_error("KV streaming requires bounded SWA storage (swa_full=false)");
     llama_memory_params base_params{};
-    if (streaming) {
+    if (streaming || measure_only) {
         base_params=*stream;
         base_params.bounded_cache_lease=nullptr;
         base_params.defer_bounded_cache=false;
@@ -118,7 +123,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t selected=n_seq_max;
+    if (stream && !stream->kv_stream_selected_sequences.empty()) {
+        if (!unified || (!measure_only && !stream->defer_bounded_cache && !stream->bounded_cache_lease) ||
+                !llama_memory_selected_sequences_valid(*stream,n_seq_max))
+            throw std::runtime_error("selected SWA sequences require valid deferred unified storage");
+        selected=uint32_t(stream->kv_stream_selected_sequences.size());
+    }
+    const uint64_t local_rows=std::min(uint64_t(size_base),uint64_t(hparams.n_swa)*(unified ? selected : 1)+n_ubatch);
+    if (local_rows>UINT32_MAX-255) throw std::runtime_error("SWA storage padding exceeds native row capacity");
+    uint32_t size_swa=uint32_t((local_rows+255)/256*256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -140,11 +154,18 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
+    const llama_memory_params * base_stream=(streaming || measure_only) ? &base_params : nullptr;
+    if (model.arch==LLM_ARCH_DFLASH && stream && stream->defer_full_cache && stream->defer_bounded_cache) {
+        bool full=false;
+        for (uint32_t layer=0;layer<hparams.n_layer();++layer) full=full || (hparams.has_kv(layer) && filter_base(layer));
+        // An all-local draft's empty full cache retains native cell metadata only.
+        if (!full) base_stream=nullptr;
+    }
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            "", streaming ? &base_params : nullptr);
+            "", base_stream);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
@@ -152,7 +173,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share,
-            "", stream && (stream->bounded_cache_lease || stream->defer_bounded_cache) ? stream : nullptr);
+            "", stream && (stream->bounded_cache_lease || stream->defer_bounded_cache || measure_only) ? stream : nullptr);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
@@ -161,12 +182,13 @@ void llama_kv_cache_iswa::clear(bool data) {
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    size_t retained=0;
-    if (!kv_base->kv_stream_can_remove(seq_id,p0,p1,&retained) || !kv_swa->kv_stream_can_remove(seq_id,p0,p1)) return false;
-    const auto * stream=kv_base->get_kv_stream();
-    if (stream && retained && retained < stream->tokens() &&
-            !kv_swa->bounded_prefix_available(kv_base->get_cells(0),retained)) return false;
-    return kv_base->seq_rm(seq_id,p0,p1) && kv_swa->seq_rm(seq_id,p0,p1);
+    const auto remove = [&] {
+        size_t retained=0;
+        if (!kv_base->kv_stream_can_remove(seq_id,p0,p1,&retained) || !kv_swa->kv_stream_can_remove(seq_id,p0,p1)) return false;
+        if (!kv_base->kv_stream_bounded_suffix_available(*kv_swa,seq_id,p0,p1)) return false;
+        return kv_base->seq_rm(seq_id,p0,p1) && kv_swa->seq_rm(seq_id,p0,p1);
+    };
+    return group_remove ? group_remove(seq_id,p0,p1,remove) : remove();
 }
 
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

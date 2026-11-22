@@ -1,12 +1,17 @@
 #include "llama-kv-stream-model.h"
 #include "llama.h"
+#include "llama-kv-stream-positions.h"
 #include "llama-kv-stream-logical-cache.h"
 #include "llama-kv-stream-writer.h"
 #include "llama-context-memory.h"
+#include "llama-kv-cells.h"
+#include "llama-batch.h"
 #include "../ggml/src/ggml-backend-execution.h"
 #include "../ggml/src/ggml-kv-stream-device.h"
+#include "../ggml/src/ggml-kv-stream-registered-copy.h"
 #include "ggml-cpp.h"
 #include "llama-impl.h"
+#include "llama-hparams.h"
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -18,6 +23,20 @@ using mtp_lease_ptr = std::unique_ptr<llama_kv_stream_complete_layer_lease,
     decltype(&llama_kv_stream_complete_layer_lease_free)>;
 using model_lease_ptr = std::unique_ptr<ggml_backend_memory_lease,decltype(&ggml_backend_memory_lease_free)>;
 static std::atomic<uint64_t> model_cache_id{1};
+
+uint64_t llama_kv_stream_cache_ids_reserve(std::atomic<uint64_t> & next, uint32_t count) noexcept {
+    const uint64_t limit = (UINT64_MAX - 3)/4;
+    if (!count) return 0;
+    uint64_t first = next.load(std::memory_order_relaxed);
+    for (;;) {
+        if (!first || first > limit || uint64_t(count) > limit - first + 1) return 0;
+        if (next.compare_exchange_weak(first, first + count, std::memory_order_relaxed)) return first;
+    }
+}
+
+uint64_t llama_kv_stream_cache_ids_reserve(uint32_t count) noexcept {
+    return llama_kv_stream_cache_ids_reserve(model_cache_id,count);
+}
 
 // Strict prefill uses native attention even when decode has a compiled streamed implementation.
 static bool native_attention_available(const llama_kv_stream_model_config & config,uint32_t & unavailable) {
@@ -138,7 +157,7 @@ std::unique_ptr<llama_kv_stream_read_proxy> llama_kv_stream_read_proxy::create(l
         auto state=std::make_shared<implementation>();
         state->source=&source; state->parent=&parent; state->host=host; state->device=device;
         state->layer=layer; state->heads=heads; state->queries=queries;
-        state->alias_id=model_cache_id.fetch_add(1,std::memory_order_relaxed);
+        state->alias_id=llama_kv_stream_cache_ids_reserve(model_cache_id,1);
         if (!state->alias_id || state->alias_id > (UINT64_MAX-3)/4) return {};
         state->metadata.reset(ggml_init({4096+2*ggml_tensor_overhead(),nullptr,true}));
         if (!state->metadata) return {};
@@ -156,7 +175,7 @@ std::unique_ptr<llama_kv_stream_read_proxy> llama_kv_stream_read_proxy::create(l
         auto context=std::make_unique<std::shared_ptr<implementation>>(state);
         std::unique_ptr<llama_kv_stream_read_proxy> result(new llama_kv_stream_read_proxy);
         result->impl=state;
-        result->proxy=ggml_backend_execution_buffer_new(device,host->buffer(),ops,context.get());
+        result->proxy=host->execution_buffer(device,ops,context.get());
         if (!result->proxy) return {};
         context.release();
         llama_kv_stream_host_layer planes;
@@ -569,7 +588,7 @@ struct llama_kv_stream_model::implementation {
     bool reset(bool clear) {
         if (session && session->device_suspended()) return false;
         abort();
-        if (clear) ggml_backend_buffer_clear(host->buffer(),0);
+        if (clear && !host->clear()) return false;
         if (!content->invalidate()) return false;
         external_mutation = false;
         suspended_tokens = 0;
@@ -621,6 +640,15 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
     auto * type = llama_kv_stream_device_buffer_type(dev);
     auto * host_type = llama_kv_stream_host_buffer_type(dev);
     if (!type || !host_type) return {};
+    if (config.demand_host) {
+        const auto get_registered = reinterpret_cast<ggml_kv_stream_registered_copy_ops_get>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev),"ggml_backend_kv_stream_registered_copy_ops"));
+        const auto * registered = get_registered ? get_registered() : nullptr;
+        if (!registered || !registered->version || !registered->create || !registered->enqueue) {
+            LLAMA_LOG_ERROR("%s: missing registered host-range transport for demand-backed KV\n",__func__);
+            return {};
+        }
+    }
     uint32_t unavailable = 0;
     if (!native_attention_available(config,unavailable)) {
         if (unavailable_queries) *unavailable_queries = unavailable;
@@ -653,7 +681,8 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
     try {
         auto s = std::make_shared<implementation>(); s->config = config;
         if (!llama_kv_stream_writer::requirements(type,config.host.shape,config.max_batch_rows,s->writer_bytes)) return {};
-        s->config.host.cache_id = model_cache_id.fetch_add(config.auxiliary_cache_layers ? 2 : 1, std::memory_order_relaxed);
+        // The second identity belongs to auxiliary full KV or the target's bounded cache.
+        s->config.host.cache_id = llama_kv_stream_cache_ids_reserve(model_cache_id,2);
         if (!s->config.host.cache_id ||
                 s->config.host.cache_id > (UINT64_MAX-3)/4 - config.auxiliary_cache_layers) return {};
         const uint64_t auxiliary_id = s->config.host.cache_id + config.auxiliary_cache_layers;
@@ -668,14 +697,18 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
         llama_kv_stream_policy_state initial;
         if (llama_kv_stream_policy_initialize(s->physical_policy, initial).status !=
                 llama_kv_stream_policy_status::success) return {};
-        s->host = llama_kv_stream_host::create(s->config.host,host_type);
+        const auto make_host = [&](const llama_kv_stream_host_config & host) {
+            return config.demand_host ? llama_kv_stream_host::from_reservation(
+                llama_kv_stream_host_reservation::create(host,dev)) : llama_kv_stream_host::create(host,host_type);
+        };
+        s->host = make_host(s->config.host);
         if (!s->host) { LLAMA_LOG_ERROR("%s: authoritative host KV allocation/registration failed\n",__func__); return {}; }
         s->content = std::make_shared<llama_kv_stream_content>(s->host);
         if (config.auxiliary_cache_layers) {
             auto auxiliary_host_config = s->config.host;
             auxiliary_host_config.cache_id = auxiliary_id;
             auxiliary_host_config.layers = config.auxiliary_cache_layers;
-            auto auxiliary_host = llama_kv_stream_host::create(auxiliary_host_config, host_type);
+            auto auxiliary_host = make_host(auxiliary_host_config);
             if (!auxiliary_host) { LLAMA_LOG_ERROR("%s: auxiliary host KV allocation/registration failed\n",__func__); return {}; }
             auto auxiliary = llama_kv_stream_logical_cache::create(std::move(auxiliary_host));
             if (!auxiliary) return {};
@@ -789,7 +822,7 @@ std::unique_ptr<llama_kv_stream_model> llama_kv_stream_model::create(const llama
         auto owner = std::make_unique<std::shared_ptr<implementation>>(s);
         std::unique_ptr<llama_kv_stream_model> result(new llama_kv_stream_model);
         result->impl = s;
-        result->proxy = ggml_backend_execution_buffer_new(dev,s->host->buffer(),ops,owner.get());
+        result->proxy = s->host->execution_buffer(dev,ops,owner.get());
         if (!result->proxy) return {};
         owner.release(); return result;
     } catch (const std::bad_alloc &) { LLAMA_LOG_ERROR("%s: host KV metadata allocation failed\n",__func__); return {}; }
@@ -1121,6 +1154,7 @@ bool llama_kv_stream_model::begin(size_t active,uint32_t queries,bool decode) {
             (decode && queries > s.config.verify_width) ||
             active < s.session->tokens() || active-s.session->tokens() != queries ||
             active > s.host->config().context_tokens) return false;
+    if (s.host->demand_backed() && !s.host->prepare(active)) return false;
     // A new KV page can require physical repartition; retire the MTP guard
     // before admitting that page, never after an already submitted target copy.
     const size_t page = s.config.host.shape.page_tokens;
@@ -1383,4 +1417,458 @@ bool llama_kv_stream_model::runtime_diagnostics(
         copies.copy_bytes,copies.copy_calls,timing.copy_ms,timing.elapsed_ms,policy.decode_active_pages != 0,
     };
     return true;
+}
+
+struct llama_kv_stream_group_model::implementation {
+    llama_kv_stream_group_model_config config;
+    ggml_kv_stream_layout layout;
+    std::unique_ptr<ggml_backend_host_reservation,decltype(&ggml_backend_host_reservation_free)>
+        address{nullptr,ggml_backend_host_reservation_free};
+    std::shared_ptr<llama_kv_stream_group_producer> producer;
+    std::shared_ptr<llama_kv_stream_slot_projection> projection;
+    std::function<bool(uint32_t,ggml_tensor *)> attention;
+    std::function<bool()> admitted;
+    std::vector<uint32_t> indices;
+    std::vector<const void *> checked;
+    std::vector<bool> attended;
+    ggml_backend_buffer_ptr pending_owner;
+    const ggml_tensor * pending_key=nullptr;
+    uint32_t pending_layer=0;
+    bool active=false,applied=false,failed=false;
+    ggml_backend_t read_backend=nullptr;
+    std::vector<llama_kv_stream_logical_checkpoint> read_sources;
+    std::vector<uint32_t> read_layers;
+    size_t read_cursor=0;
+    uint32_t read_rows=0;
+    bool read_failed=false;
+    std::function<bool(uint32_t,ggml_tensor *)> read_attention;
+    std::function<bool()> read_admitted;
+
+    bool read_current() const {
+        if (failed || !read_backend || read_failed || !read_admitted || !read_admitted() || !projection ||
+                !config.table->projection_current(*projection) || read_sources.size()!=projection->handles.size()) return false;
+        for (size_t i=0;i<read_sources.size();++i) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!config.table->get(projection->handles[i],projection->role,cache) || !cache->ready()) return false;
+            const auto & source=read_sources[i];const auto current=cache->checkpoint();const auto frontiers=cache->frontiers();
+            if (current.id!=source.id || current.generation!=source.generation || current.tokens!=source.tokens ||
+                    frontiers.reserved!=source.tokens || frontiers.host!=source.tokens || frontiers.committed!=source.tokens) return false;
+        }
+        return true;
+    }
+    void clear_read() {
+        read_backend=nullptr;read_sources.clear();read_layers.clear();read_cursor=0;read_rows=0;
+        read_failed=false;read_attention={};read_admitted={};active=false;applied=false;
+    }
+
+    bool layer(uint32_t index,llama_kv_stream_host_layer & output) const noexcept {
+        if (index>=config.layers) return false;
+        auto * base=static_cast<uint8_t *>(ggml_backend_host_reservation_base(address.get()));
+        output={base+index*layout.bytes,base+index*layout.bytes+layout.v_offset};return true;
+    }
+    bool plane(const ggml_tensor * tensor,uint32_t & index,bool & value) const noexcept {
+        if (!tensor || !tensor->data) return false;
+        for (uint32_t i=0;i<config.layers;++i) {
+            llama_kv_stream_host_layer planes;
+            if (!layer(i,planes)) return false;
+            if (tensor->data==planes.k && tensor->type==config.shape.type_k) {index=i;value=false;return true;}
+            if (tensor->data==planes.v && tensor->type==config.shape.type_v) {index=i;value=true;return true;}
+        }
+        return false;
+    }
+    bool read(const ggml_tensor * tensor,void * output,size_t offset,size_t bytes) const {
+        uint32_t layer_index=0;bool value=false;
+        if (active || failed || !projection || !admitted || !config.table->projection_current(*projection) ||
+                !plane(tensor,layer_index,value) || (!output && bytes)) return false;
+        const size_t row_bytes=value ? layout.v_token_bytes : layout.k_token_bytes;
+        const size_t plane_bytes=value ? layout.v_bytes : layout.k_bytes;
+        if (!row_bytes || offset>plane_bytes || bytes>plane_bytes-offset) return false;
+        std::vector<std::pair<const uint8_t *,size_t>> runs;
+        for (size_t copied=0;copied<bytes;) {
+            const size_t at=offset+copied,column=at/row_bytes,within=at%row_bytes;
+            if (column>=projection->columns.size()) return false;
+            const auto selected=projection->columns[column];
+            if (selected.source>=projection->handles.size() || projection->cells->is_empty(uint32_t(column)) ||
+                    projection->cells->seq_count(uint32_t(column))!=1 ||
+                    !projection->cells->seq_has(uint32_t(column),llama_seq_id(projection->handles[selected.source].slot))) return false;
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!config.table->get(projection->handles[selected.source],projection->role,cache) || !cache->ready() ||
+                    selected.token>=cache->tokens()) return false;
+            const auto & source_layout=cache->host()->layout();
+            const auto & shape=cache->host()->config().shape;
+            if (source_layout.k_token_bytes!=layout.k_token_bytes || source_layout.v_token_bytes!=layout.v_token_bytes ||
+                    shape.type_k!=config.shape.type_k || shape.type_v!=config.shape.type_v ||
+                    shape.head_dim_k!=config.shape.head_dim_k || shape.head_dim_v!=config.shape.head_dim_v ||
+                    shape.heads!=config.shape.heads || selected.token>=source_layout.tokens) return false;
+            llama_kv_stream_host_layer planes;
+            if (!cache->host()->layer(layer_index,planes)) return false;
+            const size_t count=std::min(bytes-copied,row_bytes-within);
+            const auto * source=static_cast<const uint8_t *>(value ? planes.v : planes.k)+selected.token*row_bytes+within;
+            runs.emplace_back(source,count);copied+=count;
+        }
+        auto * destination=static_cast<uint8_t *>(output);
+        for (const auto & run : runs) {std::memcpy(destination,run.first,run.second);destination+=run.second;}
+        return true;
+    }
+    bool supports(const ggml_tensor * op) const noexcept {
+        if (!op) return false;
+        if (op->op==GGML_OP_NONE || op->op==GGML_OP_VIEW || op->op==GGML_OP_RESHAPE ||
+                op->op==GGML_OP_PERMUTE || op->op==GGML_OP_TRANSPOSE) return true;
+        uint32_t index;bool value;
+        if (op->op==GGML_OP_SET_ROWS) {
+            if (!plane(op->src[2],index,value) || !op->src[0] || !op->src[1]) return false;
+            const auto * input=op->src[0],* coordinates=op->src[1];
+            return input->type==GGML_TYPE_F32 && input->ne[0]==config.shape.heads*
+                (value ? config.shape.head_dim_v : config.shape.head_dim_k) && input->ne[1]>0 &&
+                input->ne[1]<=config.maximum_rows && input->ne[2]==1 && input->ne[3]==1 &&
+                coordinates->type==GGML_TYPE_I64 && ggml_is_contiguous(coordinates) &&
+                ggml_nelements(coordinates)==input->ne[1] && (!value || op->src[3]);
+        }
+        if (op->op!=GGML_OP_FLASH_ATTN_EXT || op->type!=GGML_TYPE_F32 || !op->src[0] ||
+                !plane(op->src[1],index,value) || value || op->src[4] || (!op->src[3] && !op->src[5])) return false;
+        uint32_t other;bool side;
+        if (!plane(op->src[2],other,side) || !side || other!=index) return false;
+        const auto * query=op->src[0],* key=op->src[1],* val=op->src[2];
+        float params[3];std::memcpy(params,op->op_params,sizeof(params));
+        return query->type==GGML_TYPE_F32 && query->ne[0]==config.shape.head_dim_k && query->ne[1]>0 &&
+            query->ne[1]<=config.maximum_rows && query->ne[2]==config.query_heads && query->ne[3]==1 &&
+            key->ne[0]==config.shape.head_dim_k && val->ne[0]==config.shape.head_dim_v && key->ne[1]>0 &&
+            size_t(key->ne[1])<=layout.tokens && val->ne[1]==key->ne[1] &&
+            key->ne[2]==config.shape.heads && val->ne[2]==key->ne[2] && key->ne[3]==1 && val->ne[3]==1 &&
+            std::isfinite(params[0]) && params[0]>0 && params[1]==0 && params[2]==0;
+    }
+    bool validate_indices(const ggml_tensor * tensor) {
+        if (!tensor || !tensor->data || size_t(ggml_nelements(tensor))!=indices.size()) return false;
+        if (std::find(checked.begin(),checked.end(),tensor->data)!=checked.end()) return true;
+        std::vector<int64_t> actual(indices.size());
+        ggml_backend_tensor_get(tensor,actual.data(),0,actual.size()*sizeof(int64_t));
+        for (size_t i=0;i<indices.size();++i) if (actual[i]!=int64_t(indices[i])) return false;
+        checked.push_back(tensor->data);return true;
+    }
+    ggml_status compute(ggml_backend_t backend,ggml_tensor * op) {
+        const auto reject=[&](const char * reason) {
+            if (read_backend) read_failed=true;
+            LLAMA_LOG_ERROR("%s: grouped %s rejected: %s\n",__func__,op ? ggml_op_name(op->op) : "null",reason);
+            return GGML_STATUS_FAILED;
+        };
+        if (backend!=(read_backend ? read_backend : config.backend) || !supports(op)) return reject("backend or operator geometry");
+        if (op->op!=GGML_OP_SET_ROWS && op->op!=GGML_OP_FLASH_ATTN_EXT) return GGML_STATUS_SUCCESS;
+        if (read_backend) {
+            uint32_t index;bool value;
+            if (!active || !read_current() || op->op!=GGML_OP_FLASH_ATTN_EXT ||
+                    !plane(op->src[1],index,value) || read_cursor>=read_layers.size() || index!=read_layers[read_cursor] ||
+                    op->src[0]->ne[1]!=read_rows || size_t(op->src[1]->ne[1])>projection->columns.size() ||
+                    !projection->cells || projection->cells->used_max_p1()>uint32_t(op->src[1]->ne[1]))
+                return reject("invalid committed source read");
+            if (backend!=config.backend) ggml_backend_synchronize(backend);
+            const bool okay=read_attention(index,op);
+            if (backend!=config.backend) ggml_backend_synchronize(config.backend);
+            if (!okay) return reject("committed source attention failed");
+            ++read_cursor;return GGML_STATUS_SUCCESS;
+        }
+        if (failed || !active || !applied || !admitted || !admitted()) return reject("inactive or unadmitted frame");
+        uint32_t index;bool value;
+        if (op->op==GGML_OP_SET_ROWS) {
+            if (!plane(op->src[2],index,value) || !validate_indices(op->src[1])) return reject("publication coordinates");
+            if (!value) {
+                if (pending_key) return reject("unfinished key publication");
+                auto * owner=op->src[0]->view_src ? op->src[0]->view_src->buffer : op->src[0]->buffer;
+                if (!owner) return reject("missing key owner");
+                pending_owner.reset(ggml_backend_buffer_retain(owner));pending_key=op->src[0];pending_layer=index;
+                return GGML_STATUS_SUCCESS;
+            }
+            if (!pending_key || pending_layer!=index || op->src[3]!=pending_key) return reject("unpaired value publication");
+            const bool okay=producer->produce(index,pending_key,op->src[0]);
+            pending_key=nullptr;pending_owner.reset();return okay ? GGML_STATUS_SUCCESS : reject("registered publication");
+        }
+        if (pending_key || !plane(op->src[1],index,value) || !producer->layer_ready(index)) return reject("unpublished attention source");
+        if (!attention(index,op)) return reject("attention transport or execution");
+        attended[index]=true;return GGML_STATUS_SUCCESS;
+    }
+    std::function<bool(const std::function<bool()> &)> mutation;
+    bool abort() noexcept {
+        if (!active) return !failed;
+        try {
+            if (read_backend) {
+                ggml_backend_synchronize(read_backend);
+                if (read_backend!=config.backend) ggml_backend_synchronize(config.backend);
+                clear_read();return true;
+            }
+            ggml_backend_synchronize(config.backend);
+            const bool okay=!producer || producer->abort();
+            active=false;applied=false;pending_key=nullptr;pending_owner.reset();checked.clear();indices.clear();
+            if (!okay) failed=true;
+            return okay;
+        } catch (...) {failed=true;return false;}
+    }
+};
+
+std::unique_ptr<llama_kv_stream_group_model> llama_kv_stream_group_model::create(const llama_kv_stream_group_model_config & config) {
+    if (!config.backend || !config.table || !config.layers || !config.query_heads || !config.maximum_rows ||
+            !config.maximum_verify_rows || config.maximum_verify_rows>8 || !config.maximum_selected ||
+            config.maximum_selected>config.table->limits().slots ||
+            config.maximum_verify_rows>config.maximum_rows ||
+            config.maximum_rows>config.table->limits().slot_storage || config.shape.page_tokens!=256 ||
+            config.shape.heads<=0 || config.query_heads%config.shape.heads ||
+            !llama_kv_stream_device_buffer_type(ggml_backend_get_device(config.backend))) return {};
+    try {
+        auto result=std::unique_ptr<llama_kv_stream_group_model>(new llama_kv_stream_group_model);
+        auto s=std::make_shared<implementation>();s->config=config;
+        if (ggml_kv_stream_layout_make(config.shape,config.table->limits().slot_storage,s->layout).status!=ggml_kv_stream_status::success ||
+                s->layout.bytes>SIZE_MAX/config.layers) return {};
+        const size_t bytes=s->layout.bytes*config.layers,granularity=ggml_backend_host_reservation_granularity();
+        if (!granularity || bytes>SIZE_MAX-(granularity-1)) return {};
+        s->address.reset(ggml_backend_host_reservation_new((bytes+granularity-1)/granularity*granularity));
+        if (!s->address) return {};
+        using state=std::shared_ptr<implementation>;
+        auto owner=std::make_unique<state>(s);
+        const ggml_backend_execution_ops ops{
+            [](void * p,const ggml_tensor * op) {return (*static_cast<state *>(p))->supports(op);},
+            [](void * p,ggml_backend_t backend,ggml_tensor * op) {
+                try {return (*static_cast<state *>(p))->compute(backend,op);} catch (...) {return GGML_STATUS_FAILED;}
+            },
+            [](void * p) {const auto & s=**static_cast<state *>(p);return !s.active && !s.projection;},
+            [](void *) {},
+            [](void * p) {delete static_cast<state *>(p);},
+        };
+        const ggml_backend_execution_io io{
+            s.get(),
+            [](void * p,const ggml_tensor * tensor,void * output,size_t offset,size_t bytes) {
+                try {return static_cast<implementation *>(p)->read(tensor,output,offset,bytes);} catch (...) {return false;}
+            },
+            [](void *,const ggml_tensor *,const void *,size_t,size_t) {return false;},
+            [](void *,const ggml_tensor *,uint8_t,size_t,size_t) {return false;},
+            [](void * p,uint8_t value) {const auto & s=*static_cast<implementation *>(p);return !value && !s.active && !s.projection;},
+        };
+        result->execution.reset(ggml_backend_execution_buffer_new_address_space(ggml_backend_get_device(config.backend),
+            ggml_backend_host_reservation_base(s->address.get()),bytes,std::max(size_t(128),config.shape.alignment),ops,io,owner.get()));
+        if (!result->execution) return {};
+        owner.release();result->impl=std::move(s);return result;
+    } catch (const std::bad_alloc &) {return {};}
+}
+
+llama_kv_stream_group_model::~llama_kv_stream_group_model() {if (impl) impl->abort();}
+ggml_backend_buffer_t llama_kv_stream_group_model::buffer() const noexcept {return execution.get();}
+bool llama_kv_stream_group_model::layer(uint32_t index,llama_kv_stream_host_layer & output) const noexcept {return impl->layer(index,output);}
+
+bool llama_kv_stream_group_model::matches(const ggml_kv_stream_shape & shape,uint32_t heads,uint32_t layers,size_t tokens) const noexcept {
+    const auto & s=*impl;const auto & own=s.config.shape;
+    return own.type_k==shape.type_k && own.type_v==shape.type_v && own.head_dim_k==shape.head_dim_k &&
+        own.head_dim_v==shape.head_dim_v && own.heads==shape.heads && own.page_tokens==shape.page_tokens &&
+        own.alignment==shape.alignment && s.config.query_heads==heads && s.config.layers==layers && s.layout.tokens==tokens;
+}
+
+bool llama_kv_stream_group_model::accepts_projection(const llama_kv_stream_slot_projection & projection) const noexcept {
+    return !impl->active && !impl->failed && !impl->projection &&
+        projection.handles.size()<=impl->config.maximum_selected && impl->config.table->projection_current(projection);
+}
+
+std::shared_ptr<llama_kv_stream_slot_table> llama_kv_stream_group_model::source_table() const noexcept {return impl->config.table;}
+uint32_t llama_kv_stream_group_model::maximum_verify_rows() const noexcept {return impl->config.maximum_verify_rows;}
+bool llama_kv_stream_group_model::bound() const noexcept {
+    return !impl->failed && !impl->active && impl->producer && impl->attention && impl->admitted;
+}
+
+bool llama_kv_stream_group_model::bind(std::shared_ptr<llama_kv_stream_group_producer> producer,
+        std::function<bool(uint32_t,ggml_tensor *)> attention,std::function<bool()> admitted) {
+    auto & s=*impl;
+    if (s.active || s.failed || !producer || !attention || !admitted) return false;
+    s.producer=std::move(producer);s.attention=std::move(attention);s.admitted=std::move(admitted);return true;
+}
+
+bool llama_kv_stream_group_model::bind_projection(std::shared_ptr<llama_kv_stream_slot_projection> projection) {
+    auto & s=*impl;
+    if (!projection || !bound() || s.projection || projection->handles.size()>s.config.maximum_selected ||
+            !s.config.table->projection_current(*projection)) return false;
+    for (const auto & handle : projection->handles) {
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        if (!s.config.table->get(handle,projection->role,cache)) return false;
+        const auto & shape=cache->host()->config().shape;const auto & own=s.config.shape;
+        if (cache->host()->config().layers!=s.config.layers || cache->host()->layout().tokens!=s.layout.tokens ||
+                shape.type_k!=own.type_k || shape.type_v!=own.type_v || shape.head_dim_k!=own.head_dim_k ||
+                shape.head_dim_v!=own.head_dim_v || shape.heads!=own.heads || shape.page_tokens!=own.page_tokens ||
+                shape.alignment!=own.alignment) return false;
+    }
+    s.projection=std::move(projection);return true;
+}
+
+bool llama_kv_stream_group_model::begin(std::shared_ptr<llama_kv_stream_slot_projection> projection,const llama_ubatch & batch,
+        const std::vector<uint32_t> & indices,llama_memory_work_phase phase) {
+    auto & s=*impl;
+    if (s.failed || s.active || !s.producer || !s.admitted) return false;
+    try {
+        if (!s.admitted() || batch.n_tokens>s.config.maximum_rows || !projection ||
+                projection->handles.size()>s.config.maximum_selected || !s.config.table->projection_current(*projection)) return false;
+        if (phase==llama_memory_work_phase::target_verify) {
+            if (!batch.n_seq_id || !batch.seq_id) return false;
+            for (const auto & handle : projection->handles) {
+                uint32_t rows=0;
+                for (uint32_t i=0;i<batch.n_tokens;++i) {
+                    if (batch.n_seq_id[i]!=1 || !batch.seq_id[i]) return false;
+                    rows+=batch.seq_id[i][0]==llama_seq_id(handle.slot);
+                }
+                if (rows>s.config.maximum_verify_rows) return false;
+            }
+        }
+        auto positions=indices;
+        std::vector<bool> attended(s.config.layers,false);
+        if (!s.producer->begin(projection,batch,indices,phase)) return false;
+        s.indices=std::move(positions);s.attended=std::move(attended);s.projection=std::move(projection);
+        s.active=true;s.applied=false;s.checked.clear();return true;
+    } catch (...) {s.abort();return false;}
+}
+
+bool llama_kv_stream_group_model::apply_cells(const llama_kv_cells & cells) {
+    auto & s=*impl;
+    if (!s.active || s.applied || cells.size()!=s.projection->columns.size()) return false;
+    for (auto index : s.indices) {
+        const auto source=s.projection->columns[index].source;
+        if (cells.is_empty(index) || cells.seq_count(index)!=1 || source>=s.projection->handles.size() ||
+                !cells.seq_has(index,llama_seq_id(s.projection->handles[source].slot))) return false;
+    }
+    try {
+        const auto appended=cells.cp(s.indices);
+        s.projection->cells->set(s.indices,appended);s.applied=true;return true;
+    } catch (...) {s.abort();return false;}
+}
+
+bool llama_kv_stream_group_model::finish() {
+    auto & s=*impl;
+    if (s.read_backend || !s.active || !s.applied || s.failed || s.pending_key ||
+            !std::all_of(s.attended.begin(),s.attended.end(),[](bool value) {return value;})) return false;
+    try {
+        if (!s.admitted()) return false;
+        ggml_backend_synchronize(s.config.backend);
+        if (!s.producer->finish()) return false;
+        s.active=false;s.applied=false;s.checked.clear();s.indices.clear();return true;
+    } catch (...) {s.abort();return false;}
+}
+
+bool llama_kv_stream_group_model::begin_shared_read(ggml_backend_t consumer,const llama_ubatch & batch,
+        const std::vector<uint32_t> & layers,std::function<bool(uint32_t,ggml_tensor *)> attention,
+        std::function<bool()> admitted) {
+    auto & s=*impl;
+    if (!bound() || !s.projection || !consumer || ggml_backend_get_device(consumer)!=ggml_backend_get_device(s.config.backend) ||
+            !attention || !admitted || layers.empty() || layers.size()>LLAMA_MAX_LAYERS ||
+            !batch.n_tokens || batch.n_tokens>s.projection->handles.size() || batch.n_pos!=1 ||
+            !batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.output ||
+            !s.config.table->projection_current(*s.projection) ||
+            std::any_of(layers.begin(),layers.end(),[&](uint32_t layer) {return layer>=s.config.layers;})) return false;
+    try {
+        if (!admitted()) return false;
+        std::vector<bool> seen(s.projection->handles.size(),false);
+        for (uint32_t row=0;row<batch.n_tokens;++row) {
+            if (batch.n_seq_id[row]!=1 || !batch.seq_id[row] || !batch.output[row] || batch.token[row]<0) return false;
+            const auto found=std::find_if(s.projection->handles.begin(),s.projection->handles.end(),
+                [&](const auto & handle) {return llama_seq_id(handle.slot)==batch.seq_id[row][0];});
+            if (found==s.projection->handles.end()) return false;
+            const auto index=size_t(found-s.projection->handles.begin());
+            if (seen[index]) return false;
+            seen[index]=true;
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;std::shared_ptr<llama_kv_cells> cells;
+            if (!s.config.table->get(*found,s.projection->role,cache) || !cache->ready() || !cache->tokens() ||
+                    !s.config.table->get_cells(*found,s.projection->role,cells) || cells->get_used()!=cache->tokens()) return false;
+            const auto last=cells->pos_get(uint32_t(cache->tokens()-1));
+            if (last<0 || last==INT32_MAX || batch.pos[row]!=last+1) return false;
+        }
+        auto sources=s.projection->sources;auto ordered=layers;
+        s.read_sources=std::move(sources);s.read_layers=std::move(ordered);
+        s.read_attention=std::move(attention);s.read_admitted=std::move(admitted);s.read_rows=batch.n_tokens;
+        s.read_cursor=0;s.read_failed=false;s.read_backend=consumer;
+        if (!s.read_current()) {s.clear_read();return false;}
+        s.active=true;s.applied=true;return true;
+    } catch (...) {s.clear_read();return false;}
+}
+
+bool llama_kv_stream_group_model::finish_shared_read() {
+    auto & s=*impl;
+    try {
+        if (!s.active || !s.read_current() || s.read_cursor!=s.read_layers.size()) return false;
+        ggml_backend_synchronize(s.read_backend);
+        if (s.read_backend!=s.config.backend) ggml_backend_synchronize(s.config.backend);
+        if (!s.read_current()) return false;
+        s.clear_read();return true;
+    } catch (...) {s.read_failed=true;return false;}
+}
+
+bool llama_kv_stream_group_model::shared_read_active() const noexcept {return impl->read_backend!=nullptr;}
+
+bool llama_kv_stream_group_model::abort() noexcept {return impl->abort();}
+
+bool llama_kv_stream_group_model::suffix(llama_seq_id sequence,llama_pos begin,llama_pos end,
+        size_t & retained,const llama_kv_cells ** cells) const noexcept {
+    const auto & s=*impl;
+    if (s.active || s.failed || !s.projection || !s.config.table->projection_current(*s.projection)) return false;
+    for (const auto & handle : s.projection->handles) if (llama_seq_id(handle.slot)==sequence) {
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;std::shared_ptr<llama_kv_cells> canonical;
+        if (!s.config.table->get(handle,s.projection->role,cache) || !s.config.table->get_cells(handle,s.projection->role,canonical) ||
+                !llama_kv_stream_suffix(*canonical,cache->tokens(),begin,end,retained,sequence)) return false;
+        if (cells) *cells=canonical.get();
+        return true;
+    }
+    return false;
+}
+
+void llama_kv_stream_group_model::bind_mutation(std::function<bool(const std::function<bool()> &)> mutation) {
+    impl->mutation=std::move(mutation);
+}
+
+bool llama_kv_stream_group_model::remove_suffix(llama_seq_id sequence,llama_pos begin,llama_pos end,llama_kv_cells & native) {
+    auto & s=*impl;
+    if (sequence<-1 || s.active || s.failed || !s.projection || !s.mutation || native.size()!=s.projection->columns.size() ||
+            !s.config.table->projection_current(*s.projection)) return false;
+    try {
+        struct change {
+            size_t source,keep,before;
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            std::shared_ptr<llama_kv_cells> cells;
+            std::vector<uint32_t> columns;
+        };
+        std::vector<change> changes;
+        bool matched=false;
+        for (size_t i=0;i<s.projection->handles.size();++i) {
+            const auto handle=s.projection->handles[i];const auto id=llama_seq_id(handle.slot);
+            if (sequence>=0 && sequence!=id) continue;
+            matched=true;size_t keep=0;
+            if (!suffix(id,begin,end,keep)) return false;
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;std::shared_ptr<llama_kv_cells> cells;
+            if (!s.config.table->get(handle,s.projection->role,cache) || !s.config.table->get_cells(handle,s.projection->role,cells)) return false;
+            if (keep==cache->tokens()) continue;
+            if (cache->identity().generation==UINT64_MAX) return false;
+            change next{i,keep,cache->tokens(),std::move(cache),std::move(cells),{}};
+            std::vector<bool> covered(next.before-keep,false);
+            const auto & positions=native.seq_pos_get(id);
+            for (auto it=positions.lower_bound({std::max(llama_pos(0),begin),0});it!=positions.end() && (end<0 || it->first<end);++it) {
+                const auto row=it->second;
+                if (row>=s.projection->columns.size()) return false;
+                const auto column=s.projection->columns[row];
+                if (native.seq_count(row)!=1 || column.source!=i || column.token<keep || column.token>=next.before ||
+                        covered[column.token-keep] || s.projection->cells->is_empty(row) ||
+                        !s.projection->cells->seq_has(row,id) || native.pos_get(row)!=next.cells->pos_get(uint32_t(column.token))) return false;
+                covered[column.token-keep]=true;next.columns.push_back(row);
+            }
+            if (next.columns.size()!=next.before-keep) return false;
+            changes.push_back(std::move(next));
+        }
+        if (!matched) return false;
+        if (changes.empty()) return true;
+        return s.mutation([&] {
+            if (!s.config.table->projection_current(*s.projection)) return false;
+            for (auto & change : changes) {
+                if (!change.cache->truncate(change.keep)) return false;
+                for (uint32_t row=uint32_t(change.keep);row<change.before;++row) change.cells->rm(row);
+                for (auto row : change.columns) {
+                    native.rm(row);s.projection->cells->rm(row);s.projection->columns[row]={UINT32_MAX,0};
+                }
+                s.projection->sources[change.source]=change.cache->checkpoint();
+            }
+            return s.config.table->projection_current(*s.projection);
+        });
+    } catch (...) {return false;}
+}
+
+bool llama_kv_stream_group_model::unbind() noexcept {
+    if (!impl->abort()) return false;
+    impl->producer.reset();impl->attention={};impl->admitted={};impl->mutation={};impl->projection.reset();
+    impl->indices.clear();impl->checked.clear();impl->attended.clear();return true;
 }

@@ -19,7 +19,20 @@ public:
             size_t scratch_bytes, const ggml_kv_stream_shape & shape, size_t max_rows);
     bool accepts(const ggml_tensor * source, bool value) const;
     bool matches_shape(const ggml_kv_stream_shape & shape) const noexcept;
+    bool matches_backend(ggml_backend_t backend) const noexcept;
+    size_t maximum_rows() const noexcept;
     bool generate_async(const ggml_tensor * source, bool value, void * host,
+            const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+            llama_kv_stream_writer_completion & completion);
+    // Preserve native encoding tiles; split only downloads across consecutive registrations of one host plane.
+    // Destination owners remain retained until release_completed() or draining destruction.
+    bool generate_async_registered(const ggml_tensor * source, bool value,
+            const std::vector<llama_kv_stream_host_range> & destinations,
+            const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+            llama_kv_stream_writer_completion & completion);
+    // Destinations follow native encoded row order and may belong to disjoint slot histories.
+    bool generate_async_routed(const ggml_tensor * source, bool value,
+            const std::vector<llama_kv_stream_host_range> & destinations,
             const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
             llama_kv_stream_writer_completion & completion);
     // Queue private-host download and optional D2D publication; drain before scratch reuse.
@@ -33,4 +46,8 @@ private:
     llama_kv_stream_writer() = default;
     struct implementation;
     std::unique_ptr<implementation> impl;
+    bool generate_async_impl(const ggml_tensor * source, bool value, void * host,
+            const std::vector<llama_kv_stream_host_range> * destinations,
+            const std::function<bool(const ggml_tensor *, size_t, size_t)> & publish,
+            llama_kv_stream_writer_completion & completion, bool routed = false);
 };

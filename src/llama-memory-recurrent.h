@@ -26,7 +26,12 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter, bool stream_host_spill = false);
+        const layer_filter_cb & filter, bool stream_host_spill = false, bool defer_current = false);
+
+    llama_memory_recurrent(const llama_model & model, bool no_alloc, ggml_type type_r, ggml_type type_s, bool offload,
+            uint32_t mem_size, uint32_t n_seq_max, uint32_t n_rs_seq,
+            const layer_filter_cb & filter, bool stream_host_spill, bool defer_current, bool measurement);
+    bool prepare_measurement_publication(uint32_t active_cells);
 
     ~llama_memory_recurrent() override;
 
@@ -72,19 +77,39 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // Select logical identities for a deferred physical bank; no state may be live or bound.
+    bool configure_selected_sequences(const std::vector<llama_seq_id> & sequences);
+    bool current_storage_pending() const noexcept;
+    bool current_storage_requirements(ggml_backend_buffer_type_t & type, size_t & bytes) const noexcept;
+    // Opt an already drained native bank into explicit arena-owned parking on the same device.
+    bool enable_current_storage_parking(ggml_backend_buffer_type_t type);
+    // Retire graphs first. Restore captured raw rows before admitting execution on a rebound bank.
+    bool bind_current_storage(ggml_backend_memory_lease_t lease);
+    bool release_current_storage();
+    // Retire graphs and complete producer work first. Keep raw provisional and rollback rows in RAM.
+    bool park_current_storage();
+    bool current_storage_parked() const noexcept;
+    bool restore_current_storage(ggml_backend_memory_lease_t lease,
+            ggml_backend_memory_lease_t publication_lease = nullptr);
     bool spill_enabled() const noexcept;
     bool complete_spill();
     bool staged_publication_enabled() const noexcept;
     bool begin_spill_capture(uint32_t tokens);
+    bool begin_spill_capture(const llama_ubatch & batch);
     void abort_spill_capture() noexcept;
     bool restore_spill_async(ggml_backend_sched_t sched);
+    bool restore_spill_async(ggml_backend_sched_t sched,bool before_inputs);
     bool complete_restore_spill();
     bool materialize_spill_for_device_state();
     bool capture_spill(ggml_backend_sched_t sched,
             const std::vector<llm_graph_recurrent_snapshot> & outputs);
     const llama_recurrent_spill_bank * spill_bank() const noexcept;
+    const llama_recurrent_spill_bank * spill_bank(llama_seq_id sequence) const noexcept;
+    bool spill_stage_requirements(ggml_backend_buffer_type_t & type,size_t & bytes) const noexcept;
     bool bind_spill_stage(ggml_backend_memory_lease_t lease);
+    bool park_spill_stage();
     uint64_t spill_generation() const noexcept;
+    uint64_t spill_generation(llama_seq_id sequence) const noexcept;
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
@@ -134,9 +159,11 @@ public:
     std::vector<ggml_tensor *> p_l;
 
 private:
+    friend class llama_memory_recurrent_context;
     std::unique_ptr<llama_recurrent_spill_bank> spill;
     bool restore_spill_slot(uint32_t slot);
     bool spill_slot_valid(uint32_t slot);
+    bool spill_slot_valid(uint32_t slot,llama_seq_id sequence);
     uint64_t spill_cache_id = 0;
     uint64_t spill_epoch = 0;
     bool spill_pending = false;
@@ -149,6 +176,13 @@ private:
 
     // ggml contexts for the RS cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
+    struct current_storage_state;
+    std::unique_ptr<current_storage_state> selected_storage;
+    bool replace_current_storage(ggml_backend_memory_lease_t lease);
+    uint32_t sequence_capacity() const noexcept;
+    bool sequence_selected(llama_seq_id id) const noexcept;
+    int32_t & sequence_tail(llama_seq_id id);
+    int32_t sequence_tail(llama_seq_id id) const;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
@@ -195,6 +229,10 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     bool staged_publication_enabled() const;
+    bool sequence_spill_enabled() const;
+    bool stage_sequence_snapshot(ggml_context * ctx,llm_graph_result & result,ggml_tensor * source,
+        size_t layer,bool value,uint32_t snapshot,uint32_t sequence_axis,const llama_ubatch & batch,
+        std::vector<ggml_tensor *> & copies) const;
     bool publish_staged(ggml_context * ctx, ggml_cgraph * graph, size_t layer, bool value,
             const std::vector<ggml_tensor *> & copies) const;
     ggml_tensor * staging_tensor(size_t layer, bool value, uint32_t snapshot) const;

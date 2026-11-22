@@ -50,6 +50,12 @@ LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 // FIXME temporary function for better error messages
 LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 
+// Check roles, frozen geometry and existing sampler bindings without initializing or changing them.
+LLAMA_API bool llama_mtp_rebind_compatible(const llama_context * old_target,const llama_context * old_draft,
+        const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
+LLAMA_API bool llama_speculative_rebind_compatible(const llama_context * old_target,const llama_context * old_draft,
+        const llama_context * target,const llama_context * draft,llama_sampler * const * samplers,size_t count);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

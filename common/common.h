@@ -10,6 +10,7 @@
 
 #include <array>
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1052,6 +1053,9 @@ uint32_t common_kv_stream_verify_max(const common_params & params, bool shares_t
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+// Resolve loaded-model MTP metadata before deferred group contexts allocate any payload.
+struct llama_context_params common_context_params_to_llama(const common_params & params,const llama_model * model);
+void common_init_sampler_from_model(const llama_model * model, common_params_sampling & params);
 
 // apply --fit to mparams and cparams, no-op if params.fit_params is false
 void common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);
@@ -1350,6 +1354,8 @@ struct common_no_init_allocator : std::allocator<T> {
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
+struct llama_context_group_checkpoint;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1361,6 +1367,7 @@ struct common_prompt_checkpoint {
 
     common_state_data data_tgt;
     common_state_data data_dft;
+    std::shared_ptr<llama_context_group_checkpoint> streamed;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

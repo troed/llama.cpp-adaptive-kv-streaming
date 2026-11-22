@@ -6,6 +6,7 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1077,7 +1078,7 @@ bool tty_enable_ansi() {
 //
 
 // TODO: move to common/sampling
-static void common_init_sampler_from_model(
+void common_init_sampler_from_model(
     const llama_model * model,
     common_params_sampling & sparams) {
 
@@ -1135,6 +1136,27 @@ static void common_init_sampler_from_model(
     get_int32(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT),        sparams.mirostat,        common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT);
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_TAU),    sparams.mirostat_tau,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU);
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
+
+    const auto * vocab=llama_model_get_vocab(model);
+    if (sparams.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
+        sparams.ignore_eos = false;
+    }
+
+    // initialize once
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            sparams.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+
+    if (sparams.ignore_eos) {
+        // add EOG biases to the active set of logit biases
+        sparams.logit_bias.insert(
+                sparams.logit_bias.end(),
+                sparams.logit_bias_eog.begin(), sparams.logit_bias_eog.end());
+    }
 }
 
 struct common_init_result::impl {
@@ -1305,7 +1327,8 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
     if (const auto * error = common_streamed_kv_config_error(params)) return error;
     if (!params.shared_device_memory_bytes || params.kv_stream_pool_bytes || params.fit_params)
         return "adaptive DFlash2 requires a declared --kv-stream-arena-mib budget and --fit off";
-    if (params.n_parallel != 1 || params.kv_stream_auxiliary_layers ||
+    const bool grouped=params.n_parallel>1 && uint32_t(params.n_parallel)<=llama_max_parallel_sequences() && params.kv_unified;
+    if ((params.n_parallel != 1 && !grouped) || params.kv_stream_auxiliary_layers ||
             std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[](auto type) {
                 switch (type) {
                     case COMMON_SPECULATIVE_TYPE_NONE:
@@ -1319,7 +1342,7 @@ const char * common_streamed_dflash_config_error(const common_params & params) {
                     default:
                         return true;
                 }
-            })) return "adaptive DFlash2 requires one serial slot, no auxiliary MTP layers and no other speculative mode than ngram-*";
+            })) return "adaptive DFlash2 requires serial or valid unified multi-slot execution, no auxiliary MTP layers and no other speculative mode than ngram-*";
     if (params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > 7)
         return "adaptive DFlash2 supports 1-7 draft tokens";
     if (params.n_batch <= 0 || params.n_ubatch < 0 || params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED)
@@ -1437,11 +1460,30 @@ uint32_t common_kv_stream_verify_max(const common_params & params,bool shares_ta
     const int32_t depth=params.speculative.draft.n_max;
     if (depth < 1 || depth > 3) throw std::invalid_argument("shared-target MTP supports 1-3 draft tokens");
     const int32_t rows=depth+1;
-    if (params.n_parallel != 1 || params.n_batch <= 0 || params.n_ubatch < 0 ||
+    const bool grouped=params.n_parallel>1 && uint32_t(params.n_parallel)<=llama_max_parallel_sequences() &&
+        params.shared_device_memory_bytes && !params.kv_stream_pool_bytes && params.kv_unified;
+    if ((params.n_parallel != 1 && !grouped) || params.n_batch <= 0 || params.n_ubatch < 0 ||
             (params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch,params.n_ubatch)) < rows) {
-        throw std::invalid_argument("shared-target MTP requires one serial slot and verification within the target microbatch");
+        throw std::invalid_argument("shared-target MTP requires serial or valid unified arena slots and verification within the target microbatch");
     }
     return uint32_t(rows);
+}
+
+static void common_resolve_streaming_context_params(const common_params & params,const llama_model * model,
+        llama_context_params & cparams) {
+    if (!model) throw std::invalid_argument("context metadata resolution requires a loaded model");
+    char architecture[32]={};
+    const bool shared_target_kv=params.speculative.has_dft() &&
+        llama_model_meta_val_str(model,"general.architecture",architecture,sizeof(architecture))==6 && !std::strcmp(architecture,"gemma4");
+    cparams.kv_stream_auxiliary_layers=common_kv_stream_auxiliary_layers(params,llama_model_n_layer_nextn(model),shared_target_kv);
+    cparams.kv_stream_verify_max=common_kv_stream_verify_max(params,shared_target_kv);
+    if (shared_target_kv && common_params_uses_streamed_mtp(params)) cparams.n_rs_seq=0;
+}
+
+struct llama_context_params common_context_params_to_llama(const common_params & params,const llama_model * model) {
+    auto cparams=common_context_params_to_llama(params);
+    common_resolve_streaming_context_params(params,model,cparams);
+    return cparams;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
@@ -1463,13 +1505,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     try {
-        char architecture[32] = {};
-        const bool shared_target_kv = params.speculative.has_dft() &&
-            llama_model_meta_val_str(model,"general.architecture",architecture,sizeof(architecture)) == 6 &&
-            std::strcmp(architecture,"gemma4") == 0;
-        cparams.kv_stream_auxiliary_layers = common_kv_stream_auxiliary_layers(
-            params, llama_model_n_layer_nextn(model), shared_target_kv);
-        cparams.kv_stream_verify_max=common_kv_stream_verify_max(params,shared_target_kv);
+        common_resolve_streaming_context_params(params,model,cparams);
     } catch (const std::invalid_argument & error) {
         COM_ERR("%s\n", error.what());
         return;
@@ -1478,7 +1514,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_INF("adaptive MTP: using %u auxiliary KV layer(s) from model metadata\n", cparams.kv_stream_auxiliary_layers);
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
@@ -1535,26 +1570,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // updates params.sampling
     // TODO: fix naming
     common_init_sampler_from_model(model, params.sampling);
-
-    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
-        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
-        params.sampling.ignore_eos = false;
-    }
-
-    // initialize once
-    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
-        if (llama_vocab_is_eog(vocab, i)) {
-            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
-            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
-        }
-    }
-
-    if (params.sampling.ignore_eos) {
-        // add EOG biases to the active set of logit biases
-        params.sampling.logit_bias.insert(
-                params.sampling.logit_bias.end(),
-                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
-    }
 
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
@@ -2644,11 +2659,11 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    return data_tgt.size() + data_dft.size() + data_spec.size() + (streamed ? streamed->payload_size() : 0);
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return data_tgt.empty() && !streamed;
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2659,7 +2674,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
-    data_spec.clear();
+    data_spec.clear();streamed.reset();
 }
 
 void common_prompt_checkpoint::update_pos(

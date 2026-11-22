@@ -68,8 +68,29 @@ inline std::vector<float> stock_attention(fixture & f, block_inputs & input, uin
     ggml_prec_set_acc(out,GGML_PREC_F32);
     auto * graph=ggml_new_graph_custom(ctx.get(),64,false); ggml_build_forward_expand(graph,out);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(),f.backend)); GGML_ASSERT(buffer);
+    using release_fn=void (*)(ggml_backend_t,const void *);
+    release_fn release=nullptr;
+    if (f.cuda) {
+        auto * reg=ggml_backend_dev_backend_reg(ggml_backend_get_device(f.backend));
+        release=reinterpret_cast<release_fn>(ggml_backend_reg_get_proc_address(reg,"ggml_backend_cuda_graph_release"));
+    }
+    // This transient reference must retire captures before its metadata and buffers are freed.
+    struct retirement {
+        ggml_backend_t backend;const void * key;release_fn release;
+        ~retirement() {if (release) {ggml_backend_synchronize(backend);release(backend,key);}}
+    } captured{f.backend,ggml_graph_node(graph,0),release};
     llama_kv_stream_host_layer host; GGML_ASSERT(f.host->layer(layer,host));
-    ggml_backend_tensor_set(k,host.k,0,ggml_nbytes(k)); ggml_backend_tensor_set(v,host.v,0,ggml_nbytes(v));
+    std::vector<uint8_t> key_bytes,value_bytes;
+    const void * key_source=host.k, * value_source=host.v;
+    if (f.host->demand_backed()) {
+        std::vector<llama_kv_stream_host_range> ranges;
+        GGML_ASSERT(f.host->address_ranges(host.k,ggml_nbytes(k),ranges) && f.host->address_ranges(host.v,ggml_nbytes(v),ranges));
+        key_bytes.resize(ggml_nbytes(k)); value_bytes.resize(ggml_nbytes(v));
+        std::memcpy(key_bytes.data(),host.k,key_bytes.size());
+        std::memcpy(value_bytes.data(),host.v,value_bytes.size());
+        key_source=key_bytes.data(); value_source=value_bytes.data();
+    }
+    ggml_backend_tensor_set(k,key_source,0,ggml_nbytes(k)); ggml_backend_tensor_set(v,value_source,0,ggml_nbytes(v));
     GGML_ASSERT(ggml_backend_graph_compute(f.backend,graph) == GGML_STATUS_SUCCESS);
     if (native_override) GGML_ASSERT(native_override(f.backend,out));
     std::vector<float> result(ggml_nelements(out)); ggml_backend_tensor_get(out,result.data(),0,ggml_nbytes(out)); return result;

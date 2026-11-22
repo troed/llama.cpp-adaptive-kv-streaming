@@ -22,10 +22,15 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "mtmd-session.h"
+#include "mtmd-embeddings.h"
 #include "mtmd-workspace.h"
 #include "mtmd-projector-storage.h"
 #include "src/llama-context-memory.h"
 #include "base64.hpp"
+#include "src/llama-context.h"
+#include "src/llama-io.h"
+#include "src/llama-batch.h"
+#include "src/llama-kv-stream-logical-cache.h"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +39,8 @@
 #include <deque>
 #include <exception>
 #include <memory>
+#include <limits>
+#include <map>
 #include <filesystem>
 #include <random>
 #include <set>
@@ -48,6 +55,49 @@
 #endif
 #include <windows.h>
 #endif
+
+struct server_stream_checkpoint_writer : llama_io_write_i {
+    std::vector<uint8_t> * bytes=nullptr;
+    common_state_data * state_bytes=nullptr;
+    std::ostream * stream=nullptr;
+    size_t written=0;
+    server_stream_checkpoint_writer() = default;
+    explicit server_stream_checkpoint_writer(std::vector<uint8_t> & output) : bytes(&output) {bytes->clear();}
+    explicit server_stream_checkpoint_writer(common_state_data & output) : state_bytes(&output) {state_bytes->clear();}
+    explicit server_stream_checkpoint_writer(std::ostream & output) : stream(&output) {}
+    void write(const void * source,size_t size) override {
+        if (!size) return;
+        if (size>SIZE_MAX-written || size>size_t(std::numeric_limits<std::streamsize>::max())) throw std::runtime_error("checkpoint size overflow");
+        const auto * data=static_cast<const uint8_t *>(source);
+        if (bytes) bytes->insert(bytes->end(),data,data+size);
+        else if (state_bytes) state_bytes->insert(state_bytes->end(),data,data+size);
+        else if (stream && !stream->write(static_cast<const char *>(source),std::streamsize(size))) throw std::runtime_error("checkpoint write failed");
+        written+=size;
+    }
+    void write_tensor(ggml_tensor *,size_t,size_t) override {throw std::runtime_error("unexpected device checkpoint source");}
+    size_t n_bytes() override {return written;}
+};
+
+struct server_stream_checkpoint_reader : llama_io_read_i {
+    const std::vector<uint8_t> * bytes=nullptr;
+    const common_state_data * state_bytes=nullptr;
+    std::istream * stream=nullptr;
+    size_t cursor=0,available=0;
+    explicit server_stream_checkpoint_reader(const std::vector<uint8_t> & input) : bytes(&input),available(input.size()) {}
+    explicit server_stream_checkpoint_reader(const common_state_data & input) : state_bytes(&input),available(input.size()) {}
+    server_stream_checkpoint_reader(std::istream & input,size_t size) : stream(&input),available(size) {}
+    void read(void * destination,size_t size) override {
+        if (cursor>available || size>available-cursor || size>size_t(std::numeric_limits<std::streamsize>::max())) throw std::runtime_error("truncated stream checkpoint");
+        if (size) {
+            if (bytes) std::memcpy(destination,bytes->data()+cursor,size);
+            else if (state_bytes) std::memcpy(destination,state_bytes->data()+cursor,size);
+            else if (!stream->read(static_cast<char *>(destination),std::streamsize(size))) throw std::runtime_error("checkpoint read failed");
+        }
+        cursor+=size;
+    }
+    void read_tensor(ggml_tensor *,size_t,size_t) override {throw std::runtime_error("unexpected device checkpoint destination");}
+    size_t n_bytes() override {return cursor;}
+};
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -278,7 +328,9 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     bool vision_arena = false;
+    bool grouped_vision = false;
     mtmd::batch_ptr mbatch = nullptr;
+    std::map<size_t,mtmd_embedding_view> image_outputs;
 
     struct tts_ctx {
         mtmd_helper::gen_audio ctx;
@@ -363,6 +415,7 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    size_t stream_cached_tokens=0;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -497,6 +550,7 @@ struct server_slot {
         audio_commit_rows.clear();
         inp_embd.clear();
         rt.reset();
+        image_outputs.clear();
     }
 
     void init_sampler() const {
@@ -898,7 +952,7 @@ struct server_slot {
 
 // encode the mtmd chunk at idx, batched with as many of the next chunks as possible
 // returns 0 on success
-static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx) {
+static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx,llama_context_group * group=nullptr) {
     const auto & mctx = slot.mctx;
     const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
@@ -925,7 +979,8 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
-    res = slot.vision_arena ? mtmd_batch_encode_arena(mctx,mbatch.get(),slot.ctx_tgt) : mtmd_batch_encode(mbatch.get());
+    res = group ? mtmd_batch_encode_group(mctx,mbatch.get(),*group) :
+        slot.vision_arena ? mtmd_batch_encode_arena(mctx,mbatch.get(),slot.ctx_tgt) : mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
@@ -1013,6 +1068,14 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     }
 
     return try_decode();
+}
+
+static const float * retained_mtmd_chunk(const server_slot & slot,size_t index,const mtmd_input_chunk * chunk) {
+    if (slot.grouped_vision) {
+        const auto found=slot.image_outputs.find(index);
+        return found==slot.image_outputs.end() ? nullptr : found->second.data();
+    }
+    return slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(),chunk) : nullptr;
 }
 
 // add an encoded mtmd chunk to the batch of the text tokens, instead of decoding it on its own like process_mtmd_chunk()
@@ -1113,6 +1176,27 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
+    common_speculative_init_result_ptr spec_init;
+    std::unique_ptr<llama_context_group> stream_contexts;
+    std::unique_ptr<llama_kv_stream_request_group> stream_requests;
+    size_t stream_max_selected = 0;
+    llama_kv_stream_selection stream_selection;
+    llama_kv_stream_group_plan stream_proposal;
+    std::vector<std::array<uint32_t,2>> stream_shape;
+    bool stream_embedded = false;
+    bool stream_vision_primed = false;
+    llama_kv_stream_prefill_plan stream_prefill;
+    struct stream_prefill_attempt {
+        int task = -1;
+        size_t rows = 0, members = 0;
+    };
+    std::vector<stream_prefill_attempt> stream_deferred_prefills;
+    uint64_t stream_binding_revision = 0;
+    struct stream_selection_interrupted {};
+
+    static bool continue_stream_selection(void * data) {
+        return !static_cast<server_context_impl *>(data)->queue_tasks.has_pending_mutation();
+    }
 
     llama_context * ctx_tgt = nullptr;
 
@@ -1120,8 +1204,6 @@ private:
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
-
-    common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1170,7 +1252,6 @@ private:
 
     void destroy() {
         spec.reset();
-        spec_init.reset();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
@@ -1179,6 +1260,10 @@ private:
         mtmd_free(mctx);
         mctx = nullptr;
         vision_arena = false;
+        stream_requests.reset();stream_contexts.reset();stream_shape.clear();stream_selection={};stream_proposal={};
+        stream_embedded=false;stream_vision_primed=false;
+        stream_prefill={};stream_deferred_prefills.clear();stream_binding_revision=0;
+        spec_init.reset();
         llama_init.reset();
 
         ctx_tgt = nullptr;
@@ -1294,9 +1379,11 @@ private:
         };
         if (streamed_mtp && (!streaming || !spec_mtp ||
                 std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-                    unsupported_type) || params.n_parallel != 1 ||
+                    unsupported_type) ||
+                (params.n_parallel!=1 && !(params.n_parallel>1 && uint32_t(params.n_parallel)<=llama_max_parallel_sequences() &&
+                    params.shared_device_memory_bytes && params.kv_unified)) ||
                 params.speculative.draft.n_max < 1 || params.speculative.draft.n_max > LLAMA_KV_STREAM_MTP_DRAFT_MAX)) {
-            SRV_ERR("%s", "adaptive MTP requires serial embedded MTP with optional ngram self-speculation, 1-5 draft tokens, and an explicit KV stream pool or arena; shared-KV model pairing is checked during context initialization\n");
+            SRV_ERR("%s", "adaptive MTP requires serial or valid unified multi-slot arena execution, 1-5 draft tokens, and an explicit KV stream pool or arena; model pairing is checked during context initialization\n");
             return false;
         }
         if (streaming) {
@@ -1393,10 +1480,29 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        const bool multi_stream=params_base.shared_device_memory_bytes && params_base.n_parallel>1;
+        if (multi_stream && (uint32_t(params_base.n_parallel)>llama_max_parallel_sequences() ||
+                (has_spec && !streamed_mtp && !streamed_dflash) || params_base.embedding || !params_base.lora_adapters.empty() ||
+                !params_base.kv_unified || std::any_of(params_base.speculative.types.begin(),params_base.speculative.types.end(),
+                    [streamed_dflash](auto type) {return type!=COMMON_SPECULATIVE_TYPE_NONE && (streamed_dflash ?
+                        type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V :
+                        type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP);}))) {
+            SRV_ERR("%s\n","multi-slot KV streaming requires valid independent slots, unified KV and admitted target or speculative execution");return false;
+        }
+        llama_init = common_init_from_params(params_base,multi_stream);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
+        if (multi_stream && model_tgt) {
+            common_init_sampler_from_model(model_tgt,params_base.sampling);
+            stream_contexts=llama_context_group::create(*model_tgt,common_context_params_to_llama(params_base,model_tgt));
+            if (!stream_contexts) {SRV_ERR("%s\n","could not reserve configured canonical histories");return false;}
+            ctx_tgt=stream_contexts->metadata_context();
+            const auto verify_rows=uint32_t(server_output_limits(params_base).per_seq);
+            stream_max_selected=std::min(size_t(params_base.n_parallel),size_t(llama_n_batch(ctx_tgt)/verify_rows));
+            if (!stream_max_selected) {SRV_ERR("%s\n","native batch cannot fit a complete verification block");return false;}
+            SRV_INF("stream context capacities: configured=%d batch_selected_limit=%zu verify_rows=%u\n",params_base.n_parallel,stream_max_selected,verify_rows);
+        }
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -1433,7 +1539,7 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt, stream_contexts.get());
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
@@ -1452,6 +1558,19 @@ private:
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
+        }
+
+        if (stream_contexts) {
+            const auto batch_limit=stream_max_selected;uint32_t state_limit=0;
+            if (!stream_contexts->selected_state_limit(uint32_t(batch_limit),state_limit)) {
+                SRV_ERR("%s\n","could not measure native state selection bound");return false;
+            }
+            if (!state_limit) {SRV_ERR("%s\n","shared arena cannot hold a minimum native state bank");return false;}
+            stream_max_selected=state_limit;
+            stream_requests=std::make_unique<llama_kv_stream_request_group>(llama_kv_stream_selection_config{
+                stream_contexts->source_table()->limits().group_limit,size_t(params_base.n_parallel),stream_max_selected,
+                continue_stream_selection,this});
+            SRV_INF("stream state selection bound: configured=%d batch=%zu maximum=%zu\n",params_base.n_parallel,batch_limit,stream_max_selected);
         }
 
         if (has_mmproj) {
@@ -1489,10 +1608,10 @@ private:
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
             if (vision_arena) {
                 auto * owner = llama_context_compute_memory(ctx_tgt);
-                if (!owner || !owner->valid() || !owner->shares_kv_memory() || !owner->can_suspend_for_vision() ||
+                if ((!stream_contexts && (!owner || !owner->valid() || !owner->shares_kv_memory() || !owner->can_suspend_for_vision() ||
                         ((streamed_mtp || streamed_dflash) && (!ctx_dft || !llama_context_compute_memory(ctx_dft) ||
                             !llama_context_compute_memory(ctx_dft)->valid() ||
-                            !llama_context_compute_memory(ctx_dft)->borrows_serial_parent())) ||
+                            !llama_context_compute_memory(ctx_dft)->borrows_serial_parent())))) ||
                         !mtmd_vision_phase_compatible(mctx,model_tgt)) {
                     SRV_ERR("%s", "unsupported vision arena model/projector capabilities\n");
                     return false;
@@ -1573,7 +1692,9 @@ private:
 
         slots.clear();
 
-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        ctx_tgt_seq_rm_type = stream_contexts ?
+            ((streamed_mtp || streamed_dflash) ? (llama_n_rs_seq(ctx_tgt) ? COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART) : COMMON_CONTEXT_SEQ_RM_TYPE_FULL) :
+            common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1604,12 +1725,15 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            ctx_dft_seq_rm_type = stream_contexts ? COMMON_CONTEXT_SEQ_RM_TYPE_PART : common_context_can_seq_rm(ctx_dft);
         }
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
+            if (stream_contexts && has_spec) {
+                SRV_ERR("%s\n","selected MTP initialization failed");return false;
+            }
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
@@ -1632,6 +1756,7 @@ private:
 
             slot.mctx                   = mctx;
             slot.vision_arena            = vision_arena;
+            slot.grouped_vision          = vision_arena && stream_contexts!=nullptr;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             if (has_cap_tts()) {
@@ -1641,10 +1766,18 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                if (stream_requests && stream_contexts) {
+                    const auto & handles=stream_contexts->source_handles();
+                    if (id_slot>=0 && size_t(id_slot)<handles.size()) {
+                        llama_set_sampler(stream_contexts->metadata_context(),id_slot,nullptr);
+                        stream_requests->finish(uint32_t(id_slot),handles[id_slot].generation);
+                    }
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
+                if (stream_contexts && spec) common_speculative_get_state(spec.get(),slot.id,slots[slot.id].prompt.speculative_state);
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
@@ -1984,6 +2117,7 @@ private:
         }
 
         if (ret) {
+            if (stream_contexts && ret->prompt.tokens.empty()) update_cache=true;
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -1994,10 +2128,14 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                if (stream_contexts) {
+                    save_stream_prompt(*ret);
+                    if (!load_stream_prompt(*ret,task.tokens)) {
+                        park_stream_context();stream_contexts->reset_request(uint32_t(ret->id));ret->prompt.clear();
+                    }
+                } else {
+                    ret->prompt_save(*prompt_cache);
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) ret->prompt_clear();
                 }
 
                 prompt_cache->update();
@@ -2135,6 +2273,9 @@ private:
             return false;
         }
 
+        if (stream_contexts && (task.type!=SERVER_TASK_TYPE_COMPLETION || task.is_parent() || task.is_child())) {
+            send_error(task,"multi-slot KV streaming requires independent completions",ERROR_TYPE_INVALID_REQUEST);return false;
+        }
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         if (task.type == SERVER_TASK_TYPE_TTS) {
@@ -2189,10 +2330,11 @@ private:
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
             // TODO: tmp until backend sampling is fully implemented
+            auto * sampler_context=stream_contexts ? stream_contexts->metadata_context() : ctx_tgt;
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                llama_set_sampler(sampler_context, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                llama_set_sampler(sampler_context, slot.id, nullptr);
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2908,8 +3050,13 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (stream_contexts) {
+            park_stream_context();cur.streamed=std::make_shared<llama_context_group_checkpoint>();
+            if (!stream_contexts->save_request(uint32_t(slot.id),*cur.streamed,false)) throw std::runtime_error("stream checkpoint export failed");
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2959,6 +3106,127 @@ private:
         }
     }
 
+    static constexpr uint32_t STREAM_SLOT_MAGIC=0x4753534c;
+    static constexpr uint32_t STREAM_SLOT_VERSION=1;
+
+    bool stream_speculative_state_valid(llama_seq_id slot,const std::vector<uint8_t> & saved) const {
+        std::vector<uint8_t> current;
+        if (!spec || !common_speculative_get_state(spec.get(),slot,current)) return saved.empty();
+        return saved.size()==current.size() && saved.size()>=sizeof(uint32_t) &&
+            !std::memcmp(saved.data(),current.data(),sizeof(uint32_t));
+    }
+
+    size_t save_stream_slot(const std::string & filepath,const server_slot & slot,const std::vector<char> & packed) {
+        park_stream_context();
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        if (!stream_contexts->source_table()->get(stream_contexts->source_handles()[slot.id],0,cache) ||
+                cache->tokens()!=slot.prompt.tokens.size()) throw std::runtime_error("slot tokens do not match committed history");
+        std::ofstream file(std::filesystem::u8path(filepath),std::ios::binary|std::ios::trunc);
+        if (!file) throw std::runtime_error("unable to open stream slot file");
+        server_stream_checkpoint_writer output(file);
+        const std::array<uint32_t,2> header={STREAM_SLOT_MAGIC,STREAM_SLOT_VERSION};output.write(header.data(),sizeof(header));
+        const uint64_t packed_bytes=packed.size();output.write(&packed_bytes,sizeof(packed_bytes));output.write(packed.data(),packed.size());
+        std::vector<uint8_t> speculative;
+        if (spec && !common_speculative_get_state(spec.get(),slot.id,speculative) && common_params_uses_streamed_mtp(params_base))
+            throw std::runtime_error("MTP slot state is unavailable");
+        const uint64_t speculative_bytes=speculative.size();output.write(&speculative_bytes,sizeof(speculative_bytes));output.write(speculative.data(),speculative.size());
+        if (!stream_contexts->write_request(uint32_t(slot.id),output)) throw std::runtime_error("stream slot export failed");
+        file.flush();if (!file) throw std::runtime_error("incomplete stream slot file");
+        return output.n_bytes();
+    }
+
+    size_t load_stream_slot(const std::string & filepath,server_slot & slot) {
+        park_stream_context();
+        std::ifstream file(std::filesystem::u8path(filepath),std::ios::binary|std::ios::ate);
+        const auto end=file ? file.tellg() : std::streampos(-1);
+        if (end<0 || uint64_t(end)>SIZE_MAX || !file.seekg(0)) throw std::runtime_error("unable to open stream slot file");
+        const auto size=size_t(end);server_stream_checkpoint_reader input(file,size);
+        std::array<uint32_t,2> header{};input.read(header.data(),sizeof(header));
+        if (header!=std::array<uint32_t,2>{STREAM_SLOT_MAGIC,STREAM_SLOT_VERSION}) throw std::runtime_error("incompatible stream slot file");
+        uint64_t packed_bytes;input.read(&packed_bytes,sizeof(packed_bytes));
+        if (packed_bytes%sizeof(llama_token) || packed_bytes>size-input.n_bytes()) throw std::runtime_error("invalid stream slot token payload");
+        llama_tokens packed(size_t(packed_bytes/sizeof(llama_token)));input.read(packed.data(),size_t(packed_bytes));
+        auto tokens=server_tokens::deserialize(packed,mctx!=nullptr);
+        if (tokens.size()>size_t(slot.n_ctx) || !tokens.validate(ctx_tgt)) throw std::runtime_error("invalid stream slot tokens");
+        uint64_t speculative_bytes;input.read(&speculative_bytes,sizeof(speculative_bytes));
+        if (speculative_bytes>size-input.n_bytes()) throw std::runtime_error("invalid speculative slot payload");
+        std::vector<uint8_t> speculative(size_t(speculative_bytes),0);input.read(speculative.data(),speculative.size());
+        if (!stream_speculative_state_valid(slot.id,speculative)) throw std::runtime_error("incompatible speculative slot state");
+        if (!stream_contexts->read_request(uint32_t(slot.id),input,size-input.n_bytes())) throw std::runtime_error("stream slot restore failed");
+        std::shared_ptr<llama_kv_stream_logical_cache> cache;
+        if (!stream_contexts->source_table()->get(stream_contexts->source_handles()[slot.id],0,cache) || cache->tokens()!=tokens.size())
+            throw std::runtime_error("restored slot frontier does not match its tokens");
+        if (tokens.size()>=size_t(slot.n_ctx)) throw std::runtime_error("restored slot has no remaining logical context");
+        llama_kv_stream_selection selection;
+        if (llama_kv_stream_select({stream_contexts->source_table()->limits().group_limit,1},
+                {{uint32_t(slot.id),cache->tokens()}},selection)!=llama_kv_stream_selection_status::success)
+            throw std::runtime_error("restored slot cannot be selected");
+        auto batch=llama_batch_init(1,0,1);
+        struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{batch};
+        batch.n_tokens=1;batch.token[0]=0;batch.pos[0]=tokens.pos_next();batch.n_seq_id[0]=1;batch.seq_id[0][0]=slot.id;batch.logits[0]=true;
+        if (stream_binding_revision==UINT64_MAX || !stream_contexts->activate(selection,{stream_contexts->source_handles()[slot.id]},batch,
+                llama_memory_work_phase::target_verify,1,++stream_binding_revision))
+            throw std::runtime_error("invalid native state or insufficient restore workspace");
+        if (!stream_contexts->park()) {
+            if (!stream_contexts->discard()) throw std::runtime_error("restored native state could not retire");
+            throw std::runtime_error("restored native state could not be verified");
+        }
+        if (spec) common_speculative_set_state(spec.get(),slot.id,speculative);
+        slot.prompt.clear();slot.prompt.tokens=std::move(tokens);slot.prompt.speculative_state=std::move(speculative);
+        return input.n_bytes();
+    }
+
+    bool save_stream_prompt(server_slot & slot) {
+        if (!prompt_cache || slot.prompt.tokens.empty()) return false;
+        park_stream_context();
+        llama_context_group_checkpoint saved;
+        if (!stream_contexts->save_request(uint32_t(slot.id),saved,false) || saved.histories.front().tokens!=slot.prompt.tokens.size()) return false;
+        server_stream_checkpoint_writer count;
+        if (!stream_contexts->write_checkpoint(saved,count,true)) return false;
+        auto * entry=prompt_cache->alloc(slot.prompt,count.n_bytes(),0);
+        if (!entry) return false;
+        bool complete=false;
+        try {
+            server_stream_checkpoint_writer output(entry->data.main);
+            complete=stream_contexts->write_checkpoint(saved,output,true) && output.n_bytes()==count.n_bytes();
+            for (auto & checkpoint : entry->prompt.checkpoints) {
+                if (!complete || !checkpoint->streamed) continue;
+                // upstream checkpoints are shared and immutable; keep a private copy for the streamed payload
+                auto copy=std::make_shared<common_prompt_checkpoint>(*checkpoint);
+                server_stream_checkpoint_writer data(copy->data_tgt);
+                complete=stream_contexts->write_checkpoint(*copy->streamed,data,false);
+                copy->streamed.reset();
+                checkpoint=std::move(copy);
+            }
+            entry->prompt.speculative_state=slot.prompt.speculative_state;
+        } catch (const std::bad_alloc &) {complete=false;}
+        if (!complete) {
+            prompt_cache->states.pop_back();return false;
+        }
+        return true;
+    }
+
+    bool load_stream_prompt(server_slot & slot,const server_tokens & tokens) {
+        if (!prompt_cache) return true;
+        return prompt_cache->load(slot.prompt,tokens,[&](server_prompt_cache_state & saved) {
+            park_stream_context();server_stream_checkpoint_reader input(saved.data.main);
+            if (!stream_contexts->read_request(uint32_t(slot.id),input,saved.data.main.size()) || input.n_bytes()!=saved.data.main.size() ||
+                    !stream_speculative_state_valid(slot.id,saved.prompt.speculative_state)) return false;
+            std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
+            for (const auto & original : saved.prompt.checkpoints) {
+                auto checkpoint=std::make_shared<common_prompt_checkpoint>();
+                checkpoint->n_tokens=original->n_tokens;checkpoint->id_task=original->id_task;
+                checkpoint->pos_min=original->pos_min;checkpoint->pos_max=original->pos_max;checkpoint->data_spec=original->data_spec;
+                auto state=std::make_shared<llama_context_group_checkpoint>();server_stream_checkpoint_reader data(original->data_tgt);
+                if (!stream_speculative_state_valid(slot.id,checkpoint->data_spec) ||
+                        !stream_contexts->read_checkpoint(uint32_t(slot.id),data,original->data_tgt.size(),*state,true) ||
+                        data.n_bytes()!=original->data_tgt.size() || checkpoint->n_tokens<0 || uint64_t(checkpoint->n_tokens)!=state->histories.front().tokens) return false;
+                checkpoint->streamed=std::move(state);checkpoints.push_back(std::move(checkpoint));
+            }
+            saved.prompt.checkpoints=std::move(checkpoints);return true;
+        });
+    }
+
     // returns false if the appendix could not be written completely
     bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
         n_written = 0;
@@ -2981,7 +3249,11 @@ private:
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
+            if (cur.streamed) {
+                std::vector<uint8_t> bytes;server_stream_checkpoint_writer output(bytes);
+                if (!stream_contexts || !stream_contexts->write_checkpoint(*cur.streamed,output,false)) return false;
+                ckpt_write_buf(ofs,bytes,n_written);
+            } else ckpt_write_buf(ofs, cur.data_tgt, n_written);
             ckpt_write_buf(ofs, cur.data_dft,  n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
         }
@@ -3029,8 +3301,15 @@ private:
                 SLT_WRN(slot, "truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
                 return 0;
             }
+            if (stream_contexts) {
+                if (!stream_speculative_state_valid(slot.id,cur.data_spec)) return 0;
+                auto saved=std::make_shared<llama_context_group_checkpoint>();server_stream_checkpoint_reader input(cur.data_tgt);
+                if (!cur.data_dft.empty() || !stream_contexts->read_checkpoint(uint32_t(slot.id),input,cur.data_tgt.size(),*saved,true) ||
+                        cur.n_tokens<0 || uint64_t(cur.n_tokens)!=saved->histories.front().tokens) return 0;
+                cur.streamed=std::move(saved);cur.data_tgt.clear();cur.data_tgt.shrink_to_fit();
+            }
             // a saved checkpoint always holds a target state - an empty blob would roll back without restoring anything
-            if (cur.data_tgt.empty()) {
+            if (cur.empty()) {
                 SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
                 return 0;
             }
@@ -3212,14 +3491,16 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                if (stream_contexts ? save_stream_prompt(slot) : slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    if (stream_contexts) {
+                                        park_stream_context();stream_contexts->reset_request(uint32_t(slot.id));slot.prompt.clear();
+                                    } else slot.prompt_clear();
                                 }
                             }
                         }
@@ -3379,9 +3660,13 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    size_t nwrite=0;
+                    try {
+                        nwrite=stream_contexts ? save_stream_slot(filepath,*slot,packed) : llama_state_seq_save_file(
+                            ctx_tgt,filepath.c_str(),slot->id,reinterpret_cast<const llama_token *>(packed.data()),packed.size()/sizeof(llama_token));
+                    } catch (const std::exception & error) {
+                        send_error(task,std::string("Unable to save slot: ")+error.what(),ERROR_TYPE_SERVER);break;
+                    }
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
@@ -3434,6 +3719,9 @@ private:
 
                     size_t nread = 0;
                     try {
+                        if (stream_contexts) {
+                            nread=load_stream_slot(filepath,*slot);
+                        } else {
                         size_t n_packed = 0;
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
@@ -3458,8 +3746,11 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        }
                     } catch (const std::exception & err) {
-                        slot->prompt_clear();
+                        if (stream_contexts) {
+                            park_stream_context();stream_contexts->reset_request(uint32_t(slot->id));slot->prompt.clear();
+                        } else slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
@@ -3499,7 +3790,13 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    slot->prompt_clear();
+                    if (stream_contexts) {
+                        park_stream_context();
+                        if (!stream_contexts->reset_request(uint32_t(slot->id))) {
+                            send_error(task,"Unable to erase stream slot",ERROR_TYPE_SERVER);break;
+                        }
+                        slot->prompt.clear();
+                    } else slot->prompt_clear();
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -3582,6 +3879,11 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        if (stream_contexts) {
+            bind_stream_context(stream_contexts->metadata_context());
+            if (!stream_contexts->discard()) throw std::runtime_error("failed selected workload could not retire");
+            stream_shape.clear();
+        }
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3709,6 +4011,11 @@ private:
             }
 
             if (all_idle) {
+                if (stream_requests && stream_requests->phase()==llama_kv_stream_group_phase::retiring) {
+                    park_stream_context();
+                    if (!stream_requests->release()) throw std::runtime_error("idle request group could not retire");
+                    stream_prefill={};stream_deferred_prefills.clear();stream_selection={};stream_proposal={};
+                }
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
@@ -3727,6 +4034,9 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+        } catch (const stream_selection_interrupted &) {
+            SRV_DBG("%s", "stream selection interrupted for queued work\n");
+            return;
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -3773,7 +4083,7 @@ private:
         }
 
         int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
+        int32_t n_batch = stream_contexts ? std::min(llama_n_batch(ctx_tgt),llama_n_ubatch(ctx_tgt)) : llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3791,7 +4101,7 @@ private:
                     off_next = off + n_tokens;
 
                     // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
+                    n_batch = stream_contexts ? std::min(llama_n_batch(ctx_tgt),llama_n_ubatch(ctx_tgt)) : llama_n_batch(ctx_tgt);
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -3903,7 +4213,588 @@ private:
             std::find(types.begin(),types.end(),COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V)!=types.end();
     }
 
+    void bind_stream_context(llama_context * context) {
+        if (!context) throw std::runtime_error("missing selected-slot context");
+        auto * draft=stream_contexts && spec ?
+            (context==stream_contexts->metadata_context() ? stream_contexts->auxiliary_metadata_context() : stream_contexts->auxiliary_context()) : ctx_dft;
+        if (stream_contexts && spec && !common_speculative_rebind(spec.get(),context,draft))
+            throw std::runtime_error("selected speculative contexts could not be rebound");
+        ctx_tgt=context;ctx_dft=draft;
+        for (auto & slot : slots) {
+            slot.ctx_tgt=context;slot.ctx_dft=draft;slot.mem.init(context,draft);
+        }
+        if (batch.view.batch) batch.view.batch->mem=llama_get_memory(context);
+    }
+
+    void park_stream_context() {
+        bind_stream_context(stream_contexts->metadata_context());
+        if (stream_contexts->context() && !stream_contexts->park()) throw std::runtime_error("selected-slot retirement failed");
+        stream_shape.clear();
+        stream_embedded=false;
+        size_t capacity=0,committed=0,registered=0,checkpoints=0;
+        for (const auto & handle : stream_contexts->source_handles()) for (uint32_t role=0;role<=stream_contexts->metadata_context()->get_cparams().kv_stream_auxiliary_layers;++role) {
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!stream_contexts->source_table()->get(handle,role,cache)) throw std::runtime_error("parked memory source is stale");
+            capacity+=cache->host()->bytes();committed+=cache->host()->committed_bytes();registered+=cache->host()->registered_bytes();
+        }
+        for (const auto & slot : slots) for (const auto & checkpoint : slot.prompt.checkpoints) checkpoints+=checkpoint->size();
+        SRV_DBG("stream_host_memory: canonical_capacity_bytes=%zu committed_bytes=%zu registered_bytes=%zu parked_native_payload_bytes=%zu checkpoint_payload_bytes=%zu prompt_cache_payload_bytes=%zu\n",
+            capacity,committed,registered,stream_contexts->parked_payload_bytes(),checkpoints,prompt_cache ? prompt_cache->size() : 0);
+    }
+
+    bool prewarm_stream_vision(const server_slot & slot,const mtmd_input_chunk * chunk) {
+        if (stream_vision_primed) return true;
+        const auto table=stream_contexts->source_table();
+        const auto measure=[&](const std::vector<llama_seq_id> & selected,common_batch & batch,llama_memory_work_phase phase,bool causal) {
+            auto pending=make_pending_stream_contexts(selected);auto * target=pending.target.get();
+            std::vector<llama_memory_phase_cache_identity> sources,auxiliary;
+            for (auto id : selected) {
+                const auto handle=stream_contexts->source_handles().at(size_t(id));
+                std::shared_ptr<llama_kv_stream_logical_cache> cache;
+                if (!table->get(handle,0,cache) || !cache->ready()) return false;
+                sources.push_back({cache->identity().id,cache->content()->generation()});
+                if (target->get_cparams().kv_stream_auxiliary_layers) {
+                    if (!table->get(handle,1,cache) || !cache->ready()) return false;
+                    auxiliary.push_back({cache->identity().id,cache->content()->generation()});
+                }
+            }
+            llama_set_causal_attn(target,causal);llama_batch_allocr allocator(uint32_t(batch.get()->n_pos_per_embd));
+            if (!allocator.init(*batch.get(),*vocab,false)) return false;
+            llama_context_group_plan quote;llama_memory_phase_cache_identity bounded_identity;
+            if (!llama_context_group_bounded_identity(sources,auxiliary,bounded_identity)) return false;
+            const auto result=target->quote_target_group(allocator.get_batch(),sources,bounded_identity,phase,
+                1,SIZE_MAX,quote,pending.auxiliary.get(),auxiliary);
+            return result.status==llama_context_memory_create_status::success;
+        };
+        std::vector<llama_seq_id> selected{llama_seq_id(slot.id)};
+        for (const auto & handle : stream_contexts->source_handles())
+            if (selected.size()<stream_max_selected && handle.slot!=uint32_t(slot.id)) selected.push_back(llama_seq_id(handle.slot));
+        std::sort(selected.begin(),selected.end());
+        auto * metadata=stream_contexts->metadata_context();common_batch tokens(metadata);
+        for (auto id : selected) tokens.add(0,0,id,true);
+        if (!measure(selected,tokens,llama_memory_work_phase::target_verify,true)) return false;
+        const size_t rows=std::min(size_t(llama_n_ubatch(metadata)),mtmd_input_chunk_get_n_tokens(chunk));
+        const size_t width=llama_model_n_embd_inp(model_tgt);
+        if (!rows || !width || rows>SIZE_MAX/width) return false;
+        std::vector<float> values(rows*width);common_batch image(metadata);
+        for (size_t row=0;row<rows;++row) {
+            const llama_pos position[4]={llama_pos(row),llama_pos(row),llama_pos(row),0};
+            image.add_embd({values.data()+row*width,1,width},position,slot.id,false);
+        }
+        if (!measure({llama_seq_id(slot.id)},image,llama_memory_work_phase::target_prefill,!mtmd_decode_use_non_causal(mctx,chunk))) return false;
+        SRV_INF("stream vision setup: configured=%d verify_selected=%zu image_selected=1\n",params_base.n_parallel,selected.size());
+        stream_vision_primed=true;return true;
+    }
+
+    bool encode_stream_images(server_slot & slot) {
+        const auto & input=slot.task->tokens;
+        std::map<size_t,mtmd_embedding_view> outputs;
+        mtmd::batch_ptr encoded;
+        for (size_t index=slot.stream_cached_tokens;index<input.size();) {
+            if (input[index]!=LLAMA_TOKEN_NULL) {++index;continue;}
+            const auto & chunk=input.find_chunk(index);
+            if (mtmd_input_chunk_get_type(chunk.get())!=MTMD_INPUT_CHUNK_TYPE_IMAGE) return false;
+            const auto count=mtmd_input_chunk_get_n_tokens(chunk.get());
+            if (!count || count>input.size()-index) return false;
+            if (!outputs.count(index)) {
+                if (!prewarm_stream_vision(slot,chunk.get())) return false;
+                if (encode_mtmd_chunk(slot,encoded,index,stream_contexts.get())!=0) return false;
+                auto current=index;
+                while (true) {
+                    const auto & entry=input.find_chunk(current);mtmd_embedding_view view;
+                    if (!mtmd_batch_acquire_output_embd(encoded.get(),entry.get(),view)) break;
+                    if (view.n_tokens()!=mtmd_input_chunk_get_n_tokens(entry.get()) || view.n_embd()!=size_t(llama_model_n_embd_inp(model_tgt))) return false;
+                    outputs.emplace(current,std::move(view));
+                    auto next=input.find_next_media_chunk(current);
+                    if (!next.first) break;
+                    current=next.second;
+                }
+                encoded.reset();
+                if (!outputs.count(index)) return false;
+            }
+            index+=count;
+        }
+        slot.image_outputs=std::move(outputs);return true;
+    }
+
+    void fill_stream_work_batch(llama_batch & input, const llama_kv_stream_selection & selection,
+            size_t rows, llama_memory_work_phase phase) const {
+        input.n_tokens = 0;
+        for (const auto & member : selection.slots) {
+            const auto & slot = slots[member.id];
+            for (size_t query = 0; query < rows; ++query) {
+                const int row = input.n_tokens++;
+                const size_t token = slot.prompt.n_tokens() + query;
+                const bool prefill = phase == llama_memory_work_phase::target_prefill;
+                if (prefill && (token >= slot.task->tokens.size() || slot.task->tokens[token] == LLAMA_TOKEN_NULL))
+                    throw std::runtime_error("invalid text prefill representative");
+                input.token[row] = prefill ? slot.task->tokens[token] : slot.sampled;
+                input.pos[row] = slot.prompt.tokens.pos_next() + llama_pos(query);
+                input.n_seq_id[row] = 1;
+                input.seq_id[row][0] = llama_seq_id(member.id);
+                input.logits[row] = (!prefill || !spec) ? query + 1 == rows :
+                    slot.need_embd() || token + 1 == slot.task->tokens.size();
+            }
+        }
+    }
+
+    struct pending_stream_contexts {
+        std::unique_ptr<llama_context> target;
+        std::unique_ptr<llama_context> auxiliary;
+    };
+
+    pending_stream_contexts make_pending_stream_contexts(const std::vector<llama_seq_id> & selected) {
+        auto params=common_context_params_to_llama(params_base,model_tgt);
+        params.n_ctx=stream_contexts->source_table()->limits().slot_limit;
+        pending_stream_contexts result;result.target=std::make_unique<llama_context>(*model_tgt,params,selected);
+        auto & pending=*result.target;
+        if (!pending.bind_group_samplers_from(*stream_contexts->metadata_context()))
+            throw std::runtime_error("selected sampling graph could not be measured");
+        const auto & prepared=stream_contexts->metadata_context()->get_cparams();
+        pending.set_embeddings_nextn(prepared.embeddings_nextn,prepared.embeddings_nextn_masked);
+
+        if (spec) {
+            auto * metadata=stream_contexts->auxiliary_metadata_context();
+            const auto * model=llama_get_model(metadata);
+            const bool block=metadata->get_cparams().serial_block_rows!=0;
+            if (block) {
+                const auto * layers=llama_model_target_layer_ids(model);
+                for (uint32_t i=0;i<llama_model_target_layer_ids_n(model);++i) pending.set_embeddings_layer_inp(uint32_t(layers[i]),true);
+            }
+            auto child_params=common_context_params_to_llama(common_base_params_to_speculative(params_base));
+            child_params.ctx_type=block ? LLAMA_CONTEXT_TYPE_DEFAULT : LLAMA_CONTEXT_TYPE_MTP;child_params.ctx_other=&pending;
+            child_params.n_ctx=params.n_ctx;child_params.n_rs_seq=0;child_params.kv_stream_verify_max=0;
+            child_params.n_outputs_max=metadata->get_cparams().n_outputs_max;
+            child_params.n_outputs_max_per_seq=metadata->get_cparams().n_outputs_max_per_seq;
+            if (!block && !params.kv_stream_auxiliary_layers) child_params.n_batch=child_params.n_ubatch=
+                std::min({llama_n_seq_max(&pending),llama_n_batch(&pending),llama_n_ubatch(&pending)});
+            result.auxiliary=block ? std::make_unique<llama_context>(metadata->get_model(),child_params,selected,metadata->get_cparams().serial_block_rows) :
+                std::make_unique<llama_context>(metadata->get_model(),child_params,selected);
+            result.auxiliary->set_embeddings_nextn(true,!block);
+            if (!result.auxiliary->bind_group_samplers_from(*metadata)) throw std::runtime_error("selected speculative sampling graph could not be measured");
+        }
+        return result;
+    }
+
+    bool quote_stream_work(const llama_kv_stream_selection & selection, size_t rows, llama_memory_work_phase phase) {
+        auto & server = *this;
+        if (selection.slots.empty() || !rows || rows > size_t(INT32_MAX) / selection.slots.size()) return false;
+        const auto table=server.stream_contexts->source_table();
+        auto params=common_context_params_to_llama(server.params_base,server.model_tgt);params.n_ctx=table->limits().slot_limit;
+        std::vector<llama_seq_id> selected;
+        std::vector<llama_memory_phase_cache_identity> identities,auxiliary_identities;
+        auto batch=llama_batch_init(int32_t(rows * selection.slots.size()),0,1);
+        struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{batch};
+        fill_stream_work_batch(batch, selection, rows, phase);
+        for (size_t row=0;row<selection.slots.size();++row) {
+            const auto id=selection.slots[row].id;
+            const auto handle=server.stream_contexts->source_handles()[id];
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!table->get(handle,0,cache) || !cache->ready()) throw std::runtime_error("selected source is stale during admission");
+            selected.push_back(llama_seq_id(id));identities.push_back({cache->host()->cache_id(),cache->content()->generation()});
+            if (params.kv_stream_auxiliary_layers) {
+                if (!table->get(handle,1,cache) || !cache->ready()) throw std::runtime_error("selected MTP history is stale during admission");
+                auxiliary_identities.push_back({cache->host()->cache_id(),cache->content()->generation()});
+            }
+        }
+        auto contexts=make_pending_stream_contexts(selected);auto & pending=*contexts.target;
+        llama_context_group_plan quote;
+        llama_memory_phase_cache_identity bounded_identity;
+        if (!llama_context_group_bounded_identity(identities,auxiliary_identities,bounded_identity))
+            throw std::runtime_error("selected cache identities are invalid");
+        const auto result=pending.quote_target_group(batch,identities,bounded_identity,
+            phase,1,params.shared_device_memory_bytes,quote,contexts.auxiliary.get(),auxiliary_identities);
+        if (result.status==llama_context_memory_create_status::insufficient_budget) {
+            SRV_INF("stream selection capacity: selected=%zu required=%zu available=%zu\n",selected.size(),result.required_bytes,result.available_bytes);
+            return false;
+        }
+        if (result.status!=llama_context_memory_create_status::success)
+            throw std::runtime_error("native joint workload is unavailable during group selection");
+        return true;
+    }
+
+    static bool admit_stream_selection(const llama_kv_stream_selection & selection, void * data) {
+        return static_cast<server_context_impl *>(data)->quote_stream_work(selection, 1, llama_memory_work_phase::target_verify);
+    }
+
+    size_t stream_text_prefill_tokens(const server_slot & slot, size_t maximum) const {
+        const size_t used = slot.prompt.tokens.size();
+        if (used >= slot.task->tokens.size()) return 0;
+        const size_t limit = std::min(maximum, slot.task->tokens.size() - used);
+        size_t count = 0;
+        while (count < limit && slot.task->tokens[used + count] != LLAMA_TOKEN_NULL) ++count;
+        return count;
+    }
+
+    size_t stream_prefill_rows(const llama_kv_stream_selection & selection) const {
+        if (selection.slots.empty()) return 0;
+        size_t rows = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt)) / selection.slots.size();
+        for (const auto & member : selection.slots) {
+            const auto & slot = slots[member.id];
+            rows = std::min({rows, member.growth_tokens, stream_text_prefill_tokens(slot, rows)});
+        }
+        return rows;
+    }
+
+    static bool admit_stream_prefill(const llama_kv_stream_selection & selection, void * data) {
+        auto & server = *static_cast<server_context_impl *>(data);
+        const size_t rows = server.stream_prefill_rows(selection);
+        if (!rows) return false;
+        auto * active = server.stream_contexts->context();
+        if (active && !active->get_cparams().kv_stream_decode && !server.stream_embedded &&
+                server.stream_selection.slots.size() == selection.slots.size()) {
+            bool same = true;
+            for (size_t i = 0; i < selection.slots.size(); ++i) {
+                const auto & member = selection.slots[i];
+                same &= server.stream_selection.slots[i].id == member.id && server.stream_shape[member.id][0] == rows;
+            }
+            if (same) return true;
+        }
+        return server.quote_stream_work(selection, rows, llama_memory_work_phase::target_prefill);
+    }
+
+    llama_kv_stream_group_request prepare_stream_request(server_slot & slot) {
+        bool reused=false;slot.stream_cached_tokens=0;
+        std::vector<uint8_t> speculative_state;
+        if (slot.task->params.cache_prompt && !slot.task->tokens.empty() && !slot.prompt.tokens.empty()) {
+            const auto prefix=std::min(slot.prompt.tokens.get_common_prefix(slot.task->tokens),slot.task->tokens.size()-1);
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!stream_contexts->source_table()->get(stream_contexts->source_handles()[slot.id],0,cache))
+                throw std::runtime_error("cached source is unavailable");
+            if (cache->tokens() && cache->tokens()<=prefix && cache->tokens()==slot.prompt.tokens.size()) {
+                reused=stream_contexts->advance_request(uint32_t(slot.id));
+                if (reused) {slot.stream_cached_tokens=cache->tokens();speculative_state=slot.prompt.speculative_state;}
+            }
+            if (!reused) for (auto it=slot.prompt.checkpoints.rbegin();it!=slot.prompt.checkpoints.rend();++it) {
+                if ((*it)->n_tokens<=0 || uint64_t((*it)->n_tokens)>prefix) continue;
+                if ((*it)->streamed && stream_contexts->load_request(uint32_t(slot.id),*(*it)->streamed)) {
+                    slot.stream_cached_tokens=size_t((*it)->n_tokens);speculative_state=(*it)->data_spec;reused=true;break;
+                }
+            }
+        }
+        if (reused) slot.prompt.tokens.keep_first(slot.stream_cached_tokens);
+        else {
+            if (!stream_contexts->reset_request(uint32_t(slot.id))) throw std::runtime_error("slot namespace could not reset");
+            slot.prompt.clear();
+        }
+        if (spec) {
+            common_speculative_begin(spec.get(),slot.id,{});
+            if (!speculative_state.empty()) common_speculative_set_state(spec.get(),slot.id,speculative_state);
+        }
+        const auto handle=stream_contexts->source_handles()[slot.id];
+        bool images=false;
+        for (size_t index=slot.stream_cached_tokens;index<slot.task->tokens.size();++index)
+            if (slot.task->tokens[index]==LLAMA_TOKEN_NULL) {images=true;break;}
+        return {handle.slot,handle.generation,slot.stream_cached_tokens,0,images};
+    }
+
+    bool plan_stream_prefill(const llama_kv_stream_request_group & requests, llama_kv_stream_prefill_plan & output,
+            bool check_resources = true) {
+        std::vector<llama_kv_stream_prefill_slot> pending;
+        const size_t maximum = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+        const auto table = stream_contexts->source_table();
+        for (const auto & slot : slots) {
+            const auto handle = stream_contexts->source_handles()[slot.id];
+            if (!requests.preparing(handle.slot, handle.generation) || slot.state == SLOT_STATE_GENERATING) continue;
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!table->get(handle, 0, cache) || !cache->ready()) throw std::runtime_error("prefill source is unavailable");
+            const size_t used = slot.prompt.tokens.size();
+            if (used > slot.task->tokens.size()) throw std::runtime_error("prefill frontier exceeds its prompt");
+            if (used == slot.task->tokens.size() || slot.task->tokens[used] == LLAMA_TOKEN_NULL) {
+                llama_kv_stream_prefill_plan next;
+                if (llama_kv_stream_select({table->limits().group_limit, 1}, {{handle.slot, cache->tokens()}},
+                        next.selected) != llama_kv_stream_selection_status::success) return false;
+                next.tokens_per_slot = maximum;
+                output = std::move(next);
+                return true;
+            }
+            pending.push_back({handle.slot, cache->tokens(), stream_text_prefill_tokens(slot, maximum)});
+        }
+        auto config=llama_kv_stream_selection_config{table->limits().group_limit,table->limits().slots,stream_max_selected};
+        auto result=llama_kv_stream_selection_status::no_progress;
+        if (check_resources) {
+            config.continue_search=continue_stream_selection;config.control_data=this;
+            queue_tasks.yield_to_queue([&] {
+                result=llama_kv_stream_prefill_plan_make(config,pending,maximum,output,admit_stream_prefill,this);
+            });
+        } else result=llama_kv_stream_prefill_plan_make(config,pending,maximum,output);
+        if (result==llama_kv_stream_selection_status::interrupted) throw stream_selection_interrupted{};
+        return result==llama_kv_stream_selection_status::success;
+    }
+
+    void admit_stream_prefill_arrivals() {
+        for (const auto & member : slots) {
+            const auto handle = stream_contexts->source_handles()[member.id];
+            if (!stream_requests->preparing(handle.slot, handle.generation) || member.state == SLOT_STATE_GENERATING) continue;
+            const size_t used = member.prompt.tokens.size();
+            if (used < member.task->tokens.size() && member.task->tokens[used] == LLAMA_TOKEN_NULL) return;
+        }
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_STARTED || slot.task->tokens.empty()) continue;
+            auto handle = stream_contexts->source_handles()[slot.id];
+            if (stream_requests->busy(handle.slot, handle.generation)) continue;
+            bool needs_vision = false;
+            for (size_t i = 0; i < slot.task->tokens.size(); ++i) needs_vision |= slot.task->tokens[i] == LLAMA_TOKEN_NULL;
+            if (needs_vision) continue;
+            auto & attempted = stream_deferred_prefills.at(size_t(slot.id));
+            if (attempted.task != slot.task->id) {
+                park_stream_context();
+                prepare_stream_request(slot);
+                attempted = {slot.task->id, 0, 0};
+            }
+            handle = stream_contexts->source_handles()[slot.id];
+            const llama_kv_stream_group_request incoming{handle.slot, handle.generation, slot.stream_cached_tokens, 0, false};
+            auto proposed = *stream_requests;
+            llama_kv_stream_prefill_plan next;
+            bool accepted = proposed.admit({incoming}) && plan_stream_prefill(proposed, next, false);
+            size_t unfinished = 0;
+            for (const auto & member : slots) {
+                const auto source = stream_contexts->source_handles()[member.id];
+                unfinished += proposed.preparing(source.slot, source.generation) && member.state != SLOT_STATE_GENERATING;
+            }
+            if (attempted.rows == next.tokens_per_slot && attempted.members == unfinished) continue;
+            attempted.rows = next.tokens_per_slot;
+            attempted.members = unfinished;
+            if (accepted) {
+                park_stream_context();
+                try {accepted=plan_stream_prefill(proposed,next);}
+                catch (const stream_selection_interrupted &) {attempted.rows=attempted.members=0;throw;}
+            }
+            if (accepted) {
+                auto previous = stream_selection;
+                stream_selection = next.selected;
+                auto input = llama_batch_init(int32_t(next.tokens_per_slot * next.selected.slots.size()), 0, 1);
+                struct release_batch {llama_batch & batch; ~release_batch() {llama_batch_free(batch);}} release{input};
+                fill_stream_work_batch(input, next.selected, next.tokens_per_slot, llama_memory_work_phase::target_prefill);
+                llama_context_memory_create_result rejected;
+                if (ensure_stream_execution(&input, true, &rejected)) {
+                    *stream_requests = std::move(proposed);
+                    stream_prefill = std::move(next);
+                    SRV_INF("stream prefill join: slot=%d request=%" PRIu64 " selected=%zu\n", slot.id,
+                        incoming.request, stream_prefill.selected.slots.size());
+                    continue;
+                }
+                stream_selection = std::move(previous);
+                SRV_INF("stream prefill join deferred: slot=%d reason=%s\n", slot.id,
+                    llama_context_memory_create_status_name(rejected.status));
+            }
+        }
+    }
+
+    void prepare_stream_slots() {
+        if (!stream_contexts) return;
+        auto & requests=*stream_requests;
+        using phase=llama_kv_stream_group_phase;
+        auto current=requests.phase();
+        if (current == phase::prefill) {
+            admit_stream_prefill_arrivals();
+            for (auto & slot : slots) {
+                const auto handle = stream_contexts->source_handles()[slot.id];
+                if (slot.state != SLOT_STATE_GENERATING || !requests.preparing(handle.slot, handle.generation)) continue;
+                if (!requests.prepared(handle.slot,handle.generation,phase::prefill,size_t(slot.prompt.n_tokens())+1))
+                    throw std::runtime_error("prefill frontier could not be published to the request group");
+                park_stream_context();
+            }
+        }
+        current=requests.phase();
+        if (current==phase::retiring) {
+            park_stream_context();
+            if (!requests.release()) throw std::runtime_error("request group could not retire");
+            stream_prefill={};stream_selection={};stream_proposal={};current=phase::idle;
+        }
+        if (current==phase::idle) {
+            stream_deferred_prefills.assign(slots.size(), {});
+            std::vector<llama_kv_stream_group_request> admitted;
+            for (auto & slot : slots) if (slot.state==SLOT_STATE_STARTED) {
+                admitted.push_back(prepare_stream_request(slot));
+            }
+            if (admitted.empty()) return;
+            if (!requests.admit(admitted)) throw std::runtime_error("request group admission failed");
+            current=requests.phase();
+        }
+        if (current==phase::vision) {
+            park_stream_context();
+            while (requests.phase()==phase::vision) {
+                llama_kv_stream_group_request next;
+                if (!requests.next_preparation(next)) throw std::runtime_error("missing group vision request");
+                auto & slot=slots[next.slot];bool encoded=false;
+                queue_tasks.yield_to_queue([&] {encoded=encode_stream_images(slot);});
+                if (!encoded) {
+                    if (!stream_contexts->release_vision() && !stream_contexts->prepare_vision_parent())
+                        throw std::runtime_error("group vision resources could not retire");
+                    send_error(slot,"failed to encode image within the shared vision arena",ERROR_TYPE_SERVER);slot.release();
+                } else if (!requests.prepared(next.slot,next.request,phase::vision,next.history_tokens))
+                    throw std::runtime_error("image preparation frontier could not be published");
+            }
+            current=requests.phase();
+            if (current==phase::retiring) {
+                if (!requests.release()) throw std::runtime_error("failed image group could not retire");
+                stream_prefill={};stream_selection={};stream_proposal={};return;
+            }
+        }
+        if (current==phase::prefill) {
+            llama_kv_stream_prefill_plan next;
+            if (!plan_stream_prefill(requests, next)) throw std::runtime_error("prefill selection is unavailable");
+            bool same = next.selected.slots.size() == stream_selection.slots.size();
+            for (size_t i = 0; same && i < next.selected.slots.size(); ++i) {
+                const auto & old = stream_selection.slots[i];
+                const auto & incoming = next.selected.slots[i];
+                same = old.id == incoming.id && old.offset_tokens == incoming.offset_tokens &&
+                    old.history_tokens + old.growth_tokens == incoming.history_tokens + incoming.growth_tokens;
+            }
+            if (!same) park_stream_context();
+            stream_selection = next.selected;
+            stream_prefill = std::move(next);
+            return;
+        }
+        if (current!=phase::decode) throw std::runtime_error("unsupported request-group phase");
+        std::vector<llama_kv_stream_group_progress> progress;
+        const auto & handles=stream_contexts->source_handles();
+        for (const auto & slot : slots) if (slot.state==SLOT_STATE_GENERATING && requests.selected(uint32_t(slot.id),handles[slot.id].generation))
+            progress.push_back({uint32_t(slot.id),handles[slot.id].generation,size_t(slot.prompt.n_tokens())+1});
+        if (!progress.empty() && !requests.advance(progress)) throw std::runtime_error("selected logical allowance was exceeded");
+        if (requests.needs_reselection()) {
+            park_stream_context();llama_kv_stream_group_plan plan;
+            auto result=llama_kv_stream_selection_status::no_progress;
+            queue_tasks.yield_to_queue([&] {result=requests.plan(plan,admit_stream_selection,this);});
+            if (result==llama_kv_stream_selection_status::interrupted) throw stream_selection_interrupted{};
+            if (result!=llama_kv_stream_selection_status::success) throw std::runtime_error("no request selection can progress");
+            stream_selection=plan.selected;stream_proposal=std::move(plan);
+        }
+        stream_prefill={};
+    }
+
+    bool stream_can_batch(const server_slot & slot) const {
+        if (!stream_contexts) return true;
+        const auto handle=stream_contexts->source_handles()[slot.id];
+        if (stream_requests->phase()==llama_kv_stream_group_phase::prefill)
+            return slot.state != SLOT_STATE_GENERATING && stream_requests->preparing(handle.slot, handle.generation) &&
+                std::any_of(stream_prefill.selected.slots.begin(), stream_prefill.selected.slots.end(),
+                    [&](const auto & member) { return member.id == uint32_t(slot.id); });
+        if (stream_proposal.epoch) {
+            return stream_requests->busy(uint32_t(slot.id),handle.generation) &&
+                std::any_of(stream_proposal.selected.slots.begin(),stream_proposal.selected.slots.end(),
+                    [&](const auto & chosen) {return chosen.id==uint32_t(slot.id);});
+        }
+        return stream_requests->selected(uint32_t(slot.id),handle.generation);
+    }
+
+    bool ensure_stream_execution(llama_batch * supplied=nullptr, bool causal=true,
+            llama_context_memory_create_result * rejected=nullptr) {
+        if (!stream_contexts) return true;
+        const auto phase=stream_requests->phase()==llama_kv_stream_group_phase::decode ?
+            llama_memory_work_phase::target_verify : llama_memory_work_phase::target_prefill;
+        std::unique_ptr<llama_batch_compat> translated;
+        if (supplied) translated=std::make_unique<llama_batch_compat>(ctx_tgt,*supplied);
+        auto * input=translated ? translated->batch_ext : batch.view.get();
+        llama_batch_allocr allocator(uint32_t(input->n_pos_per_embd));
+        if (!allocator.init(*input,*vocab,false)) throw std::runtime_error("invalid selected native batch");
+        const auto & representative=allocator.get_batch();
+        std::vector<std::array<uint32_t,2>> shape(slots.size());
+        for (int32_t row=0;row<representative.n_tokens;++row) {
+            if (representative.n_seq_id[row]!=1 || representative.seq_id[row][0]<0 ||
+                    size_t(representative.seq_id[row][0])>=shape.size()) throw std::runtime_error("invalid selected native sequence");
+            const auto slot=representative.seq_id[row][0];++shape[slot][0];
+            if (spec) {
+                shape[slot][1]+=representative.logits[row]!=0;
+            } else {
+                // Reserve the last output row even in cache-only prefill microbatches.
+                representative.logits[row]=1;
+                for (int32_t previous=row-1;previous>=0;--previous) if (representative.seq_id[previous][0]==slot) {
+                    representative.logits[previous]=0;break;
+                }
+                shape[slot][1]=1;
+            }
+        }
+        auto * active=stream_contexts->context();
+        const bool embedded=representative.embd!=nullptr;
+        if (active && embedded==stream_embedded && active->get_cparams().causal_attn==causal &&
+                (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) &&
+                active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) return true;
+        park_stream_context();
+        llama_set_causal_attn(stream_contexts->metadata_context(),causal);
+        auto selection=stream_selection;selection.history_tokens=0;
+        std::vector<llama_kv_stream_slot_handle> handles;
+        for (auto & selected : selection.slots) {
+            const auto handle=stream_contexts->source_handles()[selected.id];
+            std::shared_ptr<llama_kv_stream_logical_cache> cache;
+            if (!stream_contexts->source_table()->get(handle,0,cache)) throw std::runtime_error("selected source is stale");
+            const size_t end=selected.history_tokens+selected.growth_tokens;
+            const size_t used=cache->tokens()+size_t(phase==llama_memory_work_phase::target_verify);
+            if (used>=end) throw std::runtime_error("selected source has no logical allowance");
+            selected.history_tokens=used;selected.growth_tokens=end-used;selection.history_tokens+=used;
+            handles.push_back(handle);
+        }
+        if (stream_binding_revision==UINT64_MAX) throw std::runtime_error("selection revision exhausted");
+        llama_context_memory_create_result admission;
+        if (!stream_contexts->activate(selection,handles,representative,phase,1,++stream_binding_revision,&admission)) {
+            if (rejected) { *rejected = admission; return false; }
+            throw std::runtime_error(std::string("selected workload admission failed: ")+llama_context_memory_create_status_name(admission.status));
+        }
+        if (stream_proposal.epoch) {
+            auto proposal=std::move(stream_proposal);stream_proposal={};
+            if (!stream_requests->activate(std::move(proposal))) {
+                park_stream_context();throw std::runtime_error("request selection could not commit after resource activation");
+            }
+        }
+        bind_stream_context(stream_contexts->context());stream_shape=std::move(shape);stream_embedded=embedded;
+        SRV_INF("stream group bind: selected=%zu rows=%d phase=%s revision=%" PRIu64 "\n",selection.slots.size(),
+            representative.n_tokens,phase==llama_memory_work_phase::target_verify ? "decode" : "prefill",stream_binding_revision);
+        return true;
+    }
+
+    int process_stream_image(server_slot & slot,size_t index,size_t & count) {
+        const auto & chunk=slot.task->tokens.find_chunk(index);
+        if (mtmd_input_chunk_get_type(chunk.get())!=MTMD_INPUT_CHUNK_TYPE_IMAGE) return -1;
+        const auto found=slot.image_outputs.find(index);
+        if (found==slot.image_outputs.end()) return -1;
+        const auto & view=found->second;count=mtmd_input_chunk_get_n_tokens(chunk.get());
+        const size_t width=llama_model_n_embd_inp(model_tgt);
+        if (!count || view.n_tokens()!=count || view.n_embd()!=width) return -1;
+        const auto * image=mtmd_input_chunk_get_tokens_image(chunk.get());
+        const bool spatial=mtmd_decode_use_mrope(mctx),causal=!mtmd_decode_use_non_causal(mctx,chunk.get());
+        const auto base=slot.prompt.tokens.pos_next();
+        const size_t maximum=llama_n_batch(stream_contexts->metadata_context());
+        if (!maximum || base<0 || count>uint64_t(INT32_MAX)-uint32_t(base)) return -1;
+        for (size_t first=0;first<count;) {
+            const auto rows=std::min(maximum,count-first);
+            common_batch input(stream_contexts->metadata_context());
+            for (size_t row=0;row<rows;++row) {
+                const auto i=first+row;const auto p=base+llama_pos(i);llama_pos position[4]={p,p,p,p};
+                if (spatial) {
+                    if (!image) return -1;
+                    const auto pos=mtmd_image_tokens_get_decoder_pos(image,base,i);
+                    position[0]=pos.t;position[1]=pos.y;position[2]=pos.x;position[3]=pos.z;
+                }
+                input.add_embd({view.data()+i*width,1,width},position,slot.id,false);
+            }
+            llama_batch_allocr allocator(uint32_t(input.get()->n_pos_per_embd));
+            if (!allocator.init(*input.get(),*vocab,false)) return -1;
+            auto representative=allocator.get_batch();ensure_stream_execution(&representative,causal);
+            int result=0;
+            queue_tasks.yield_to_queue([&] {
+                result=llama_process(ctx_tgt,LLAMA_PROCESS_TYPE_DECODE,input.get());
+                if (!result && spec && !common_speculative_process(spec.get(),input)) result=-1;
+            });
+            if (result) return result;
+            first+=rows;
+        }
+        return 0;
+    }
+
     void pre_decode() {
+        prepare_stream_slots();
+        if (stream_contexts && spec && stream_requests->phase()==llama_kv_stream_group_phase::decode) {
+            auto input=llama_batch_init(int32_t(stream_selection.slots.size()),0,1);
+            struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{input};
+            input.n_tokens=int32_t(stream_selection.slots.size());
+            for (int32_t row=0;row<input.n_tokens;++row) {
+                const auto id=stream_selection.slots[row].id;const auto & slot=slots[id];
+                input.token[row]=slot.sampled;input.pos[row]=slot.prompt.tokens.pos_next();
+                input.n_seq_id[row]=1;input.seq_id[row][0]=llama_seq_id(id);input.logits[row]=true;
+            }
+            ensure_stream_execution(&input);
+        }
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3983,7 +4874,7 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+            if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME || !stream_can_batch(slot)) {
                 return;
             }
 
@@ -4010,7 +4901,19 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (stream_contexts) {
+                    const auto handle=stream_contexts->source_handles()[slot.id];
+                    llama_kv_stream_generation_budget allowed;
+                    if (!stream_requests->submission(handle.slot,handle.generation,
+                            uint32_t(common_speculative_n_max(spec.get())),slot.n_remaining()>0 ? size_t(slot.n_remaining()) : SIZE_MAX,allowed))
+                        throw std::runtime_error("selected MTP submission has no logical allowance");
+                    n_draft_max=std::min(n_draft_max,int(allowed.proposal_tokens));
+                    if (slot.spec_draft.size()>allowed.proposal_tokens) {
+                        slot.spec_draft.resize(allowed.proposal_tokens);
+                        if (!slot.spec_draft_q.empty()) slot.spec_draft_q.resize(allowed.proposal_tokens);
+                    }
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -4122,7 +5025,7 @@ private:
         });
 
         // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
+        int32_t n_batch  = stream_contexts ? std::min(llama_n_batch(ctx_tgt),llama_n_ubatch(ctx_tgt)) : llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
@@ -4137,7 +5040,7 @@ private:
                     return; // batch is full, skip remaining slots
                 }
 
-                if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME || !stream_can_batch(slot)) {
                     return;
                 }
 
@@ -4256,7 +5159,9 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                            if (stream_contexts) {
+                                n_past=int(slot.stream_cached_tokens);
+                            } else if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4355,7 +5260,7 @@ private:
                             // a state or a checkpoint is useful when its pos_min is below this threshold
                             const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            if (!stream_contexts && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -4521,7 +5426,8 @@ private:
                         SLT_WRN(slot, "%s", "failed to release the MTP layer before reusing the prompt\n");
                     }
 
-                    if (!slot.mem.seq_rm_try(slot.id, p0, -1)) {
+                    // a streamed slot keeps its own canonical history; the group restores it instead
+                    if (!stream_contexts && !slot.mem.seq_rm_try(slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         // a bounded or streamed memory can refuse an arbitrary suffix removal
@@ -4532,6 +5438,7 @@ private:
                         slot.stats.n_prompt_cached    = 0;
                         slot.stats.n_prompt_processed = 0;
                     }
+
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4607,14 +5514,17 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
-                        queue_tasks.yield_to_queue([&]() {
+                        if (stream_contexts) res=process_stream_image(slot,cur_token_idx,n_tokens_out);
+                        else queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
-                            if (slot.vision_arena) {
+                            if (stream_contexts) {
+                                abort_all_slots("selected image prefill failed");return;
+                            } else if (slot.vision_arena) {
                                 auto * owner = llama_context_compute_memory(ctx_tgt);
                                 bool restored = owner && owner->valid() &&
                                     (!owner->kv_device_suspended() || llama_context_resume_kv_device(ctx_tgt,llama_memory_text_phase::prefill));
@@ -4651,7 +5561,9 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    const size_t prompt_limit = stream_contexts ?
+                        std::min(size_t(n_batch), size_t(batch.size()) + stream_prefill.tokens_per_slot) : size_t(n_batch);
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && size_t(batch.size()) < prompt_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4818,8 +5730,8 @@ private:
 
             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
 
-            float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
-            if (!embd) {
+            const float * embd = retained_mtmd_chunk(slot,cur_token_idx,chunk.get());
+            if (!embd && !slot.grouped_vision) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
                 queue_tasks.yield_to_queue([&]() {
@@ -4848,6 +5760,7 @@ private:
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
+        ensure_stream_execution();
         metrics_pre_decode();
 
         if (batch.size() == 0) {
@@ -4880,7 +5793,7 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            if (params_base.kv_stream_pool_bytes || params_base.shared_device_memory_bytes) {
+            if (!stream_contexts && (params_base.kv_stream_pool_bytes || params_base.shared_device_memory_bytes)) {
                 const bool decoding = slots.size() == 1 && slots.front().state == SLOT_STATE_GENERATING;
                 llama_set_kv_stream_decode(ctx_tgt,decoding);
             }
@@ -5419,15 +6332,20 @@ server_response_reader server_context::get_response_reader() {
 json server_context::get_vision_memory_report() const {
     auto * owner=llama_context_compute_memory(impl->ctx_tgt);
     mtmd_vision_geometry geometry;
-    if (!impl->vision_arena || !impl->mctx || !owner || !owner->valid() ||
-            !owner->can_suspend_for_vision() || !mtmd_get_vision_geometry(impl->mctx,geometry)) {
+    const bool grouped=impl->stream_contexts!=nullptr;
+    if (!impl->vision_arena || !impl->mctx || (!grouped && (!owner || !owner->valid() ||
+            !owner->can_suspend_for_vision())) || !mtmd_get_vision_geometry(impl->mctx,geometry)) {
         throw std::runtime_error("vision memory reporting requires an admitted shared-arena Qwen3-VL or Gemma4 projector");
     }
-    auto * parent=owner->shared_parent();
+    auto * parent=grouped ? impl->stream_contexts->prepare_vision_parent() : owner->shared_parent();
+    if (!parent) throw std::runtime_error("vision parent admission is unavailable");
+    const auto quote=[&](const std::vector<size_t> & bytes,llama_context_memory_create_result & result) {
+        return grouped ? impl->stream_contexts->quote_vision(bytes,result) : owner->quote_suspended_loans(bytes,result);
+    };
     const size_t weights=mtmd_vision_weight_bytes(impl->mctx,ggml_backend_buffer_get_type(parent));
     if (!weights) throw std::runtime_error("cannot measure projector weight storage");
     llama_context_memory_create_result lower;
-    const bool lower_fits=owner->quote_suspended_loans({weights,1},lower);
+    const bool lower_fits=quote({weights,1},lower);
     if (!lower_fits && lower.status!=llama_context_memory_create_status::insufficient_budget)
         throw std::runtime_error("vision parent admission is unavailable");
     json ratios=json::array();
@@ -5456,7 +6374,7 @@ json server_context::get_vision_memory_report() const {
             if (!mtmd_measure_vision_shape(impl->mctx,parent,shape,plan))
                 throw std::runtime_error("vision graph measurement failed for "+std::to_string(shape.width)+"x"+std::to_string(shape.height));
             llama_context_memory_create_result admission;
-            if (!owner->quote_suspended_loans({plan.weight_bytes,plan.device_compute_bytes},admission)) {
+            if (!quote({plan.weight_bytes,plan.device_compute_bytes},admission)) {
                 if (admission.status!=llama_context_memory_create_status::insufficient_budget)
                     throw std::runtime_error("vision shape admission failed without a quota result");
                 rejected_minimum=std::min(rejected_minimum,admission.required_bytes);
@@ -5502,6 +6420,9 @@ server_context_meta server_context::get_meta() const {
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eos_id, true) : "";
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
+    const bool stream_multi = impl->params_base.n_parallel > 1 &&
+        (impl->params_base.kv_stream_pool_bytes || impl->params_base.shared_device_memory_bytes);
+    const uint32_t stream_group = stream_multi ? llama_n_ctx_seq(impl->ctx_tgt) : 0;
 
     std::vector<std::string> tts_voices;
     if (impl->mctx) {
@@ -5550,6 +6471,9 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
+        /* stream_group_n_ctx      */ stream_group,
+        /* stream_history_n_ctx    */ uint64_t(stream_group) * impl->params_base.n_parallel,
+        /* stream_storage_n_ctx    */ stream_multi ? llama_n_ctx(impl->ctx_tgt) : 0,
     };
 }
 
@@ -5993,6 +6917,15 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     if (!meta.tts_voices.empty()) {
         props["voices"] = meta.tts_voices;
     }
+    if (meta.stream_group_n_ctx) {
+        props["stream_context_limits"] = {
+            {"per_slot", meta.stream_group_n_ctx},
+            {"selected_group", meta.stream_group_n_ctx},
+            {"all_histories", meta.stream_history_n_ctx},
+            {"selected_storage", meta.stream_storage_n_ctx},
+        };
+    }
+
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
             props["chat_template_tool_use"] = tmpl_tools;

@@ -251,6 +251,70 @@ int main(int argc, char ** argv) {
                 t.assert_equal(before.bytes,layout.allocation.bytes);
             }
     });
+    t.test("bounded_state_parking_preserves_identity_and_rejects_unfinished_or_escaped_readers", [](testing & t) {
+        auto * type=ggml_backend_cpu_buffer_type();
+        llama_memory_cache_requirement cache;
+        cache.identity={809,3}; cache.role=llama_memory_cache_role::bounded_resident;
+        cache.layers=1;cache.history_rows=4096;cache.window_rows=16;cache.headroom_rows=16;cache.row_padding=32;
+        cache.format={GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,32,32,1,false};cache.row_bytes=52;
+        llama_memory_bounded_kv_layout layout;
+        if (!t.assert_true(llama_memory_bounded_kv_layout_make(cache,{7},type,layout))) return;
+        const size_t a=layout.allocation.alignment,bytes=layout.allocation.bytes;
+        arena_ptr arena(ggml_backend_memory_arena_new(type,bytes+2*a),ggml_backend_memory_arena_free);
+        if (!t.assert_true(arena && ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),91,a,bytes,a,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease_ptr lease(ggml_backend_memory_arena_acquire(arena.get(),91),ggml_backend_memory_lease_free);
+        llama_memory_bounded_kv owner(layout);
+        if (!t.assert_true(lease && owner.bind(lease.get()))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0x53);
+        std::vector<uint8_t> saved(bytes);
+        size_t captures=0;
+        const auto save=[&](const llama_memory_bounded_kv_read & source) {
+            ++captures;
+            t.assert_true(!owner.read(cache.identity) && !owner.begin_write(cache.identity));
+            std::memcpy(saved.data(),ggml_backend_buffer_get_base(source.buffer()),bytes);
+            return true;
+        };
+        auto pin=owner.read(cache.identity);
+        t.assert_true(!owner.park(cache.identity,save) && captures==0);
+        pin.reset();
+        const auto write=owner.begin_write(cache.identity);
+        t.assert_true(write && !owner.park(cache.identity,save) && owner.finish_write(write,true));
+        cache.identity=owner.identity();
+        t.assert_true(!owner.park({809,3},save));
+        t.assert_true(!owner.park(cache.identity,[](const auto &) -> bool { throw std::runtime_error("snapshot failure"); }));
+        t.assert_true(bool(owner.read(cache.identity)));
+        t.assert_true(!owner.park(cache.identity,[&](const auto & source) { pin=source;return true; }));
+        t.assert_true(!owner.parked() && bool(pin));pin.reset();
+        if (!t.assert_true(owner.park(cache.identity,save))) return;
+        t.assert_true(owner.parked() && !owner.read(cache.identity) && !owner.begin_write(cache.identity));
+        t.assert_equal(uint64_t(4),owner.identity().generation);
+        t.assert_true(!owner.bind(lease.get()));
+        lease.reset();
+        if (!t.assert_true(ggml_backend_memory_arena_begin(arena.get(),0) &&
+                ggml_backend_memory_arena_reserve_at(arena.get(),92,a,bytes,a,GGML_BACKEND_MEMORY_REGION_PERSISTENT,nullptr) &&
+                ggml_backend_memory_arena_commit(arena.get()))) return;
+        lease.reset(ggml_backend_memory_arena_acquire(arena.get(),92));
+        if (!t.assert_true(bool(lease))) return;
+        ggml_backend_buffer_clear(ggml_backend_memory_lease_buffer(lease.get()),0xa5);
+        const auto restore=[&](ggml_backend_buffer_t destination) {
+            t.assert_true(!owner.read(cache.identity) && !owner.begin_write(cache.identity));
+            std::memcpy(ggml_backend_buffer_get_base(destination),saved.data(),bytes);
+            return true;
+        };
+        t.assert_true(!owner.restore_parked({810,4},lease.get(),restore));
+        t.assert_true(!owner.restore_parked(cache.identity,lease.get(),[&](auto destination) {
+            ggml_backend_buffer_clear(destination,0x6b);return false;
+        }));
+        t.assert_true(owner.parked() && !owner.read(cache.identity));
+        if (!t.assert_true(owner.restore_parked(cache.identity,lease.get(),restore))) return;
+        t.assert_true(!owner.parked());
+        pin=owner.read(cache.identity);
+        if (!t.assert_true(bool(pin))) return;
+        t.assert_equal(uint64_t(4),owner.identity().generation);
+        t.assert_true(!std::memcmp(saved.data(),ggml_backend_buffer_get_base(pin.buffer()),bytes));
+    });
     t.test("bounded_KV_pins_preserve_storage_and_close_stale_writer_admission", [](testing & t) {
         auto * buft=ggml_backend_cpu_buffer_type();
         llama_memory_cache_requirement cache;
@@ -453,6 +517,136 @@ int main(int argc, char ** argv) {
         t.assert_true(owner->enter(llama_memory_work_phase::target_verify,1,advanced_target,{202,0}).status ==
             llama_memory_phase_owner_status::stale_identity);
         t.assert_true(owner->snapshot().phase == llama_memory_work_phase::mtp_draft);
+    });
+    t.test("decode_selection_profiles_transition_without_a_logical_phase_change", [](testing & t) {
+        fixture f(t,false);
+        auto single=f.target;
+        single.plan.stages.push_back({11,{10},{{11,f.a,f.a,f.a,LLAMA_MEMORY_ACCESS_WRITE,0},
+            {12,2*f.a,2*f.a,f.a,LLAMA_MEMORY_ACCESS_READ_WRITE,0}}});
+        auto joint=single; joint.stage=11;
+        llama_memory_phase_target one{llama_memory_work_phase::target_verify,single,4}; one.profile=1;
+        llama_memory_phase_target two{llama_memory_work_phase::target_verify,joint,8}; two.profile=2;
+        struct observer : llama_memory_consumer {
+            uint64_t proposed=0;
+            bool prepare(const llama_memory_transition_target & target,const llama_memory_layout &,
+                    std::unique_ptr<llama_memory_preparation> &) override {
+                proposed=target.selection_revision;
+                return true;
+            }
+        } selection;
+        const llama_memory_phase_cache_identity target{501,1},draft{502,1};
+        auto owner=llama_memory_phase_owner::create({one,two},f.arenas,{&f.workspace,&f.preserved,&selection},target,draft);
+        if (!t.assert_true(bool(owner))) return;
+        t.assert_true(owner->enter(one.phase,4,target,draft,1,1).status == llama_memory_phase_owner_status::changed);
+        t.assert_equal(uint32_t(1),owner->active_profile());
+        t.assert_equal(uint64_t(1),owner->selection_revision());
+        t.assert_equal(uint64_t(1),selection.proposed);
+        const auto ticket=owner->admit();
+        if (!t.assert_true(ticket != 0)) return;
+        t.assert_true(owner->enter(two.phase,8,target,draft,2,2).status == llama_memory_phase_owner_status::busy);
+        t.assert_equal(uint64_t(1),selection.proposed);
+        t.assert_true(owner->finish(ticket,target,draft));
+        t.assert_true(owner->enter(two.phase,8,target,draft,2,2).status == llama_memory_phase_owner_status::changed);
+        t.assert_equal(uint32_t(2),owner->active_profile());
+        t.assert_equal(uint64_t(2),owner->selection_revision());
+        const int activations=f.workspace.activations;
+        t.assert_true(owner->enter(two.phase,8,target,draft,2,2).status == llama_memory_phase_owner_status::unchanged);
+        t.assert_equal(activations,f.workspace.activations);
+        f.workspace.runtime_changed=true;
+        t.assert_true(owner->enter(two.phase,8,target,draft,2,3).status == llama_memory_phase_owner_status::changed);
+        t.assert_equal(activations+1,f.workspace.activations);
+        t.assert_equal(uint64_t(3),selection.proposed);
+        t.assert_equal(uint64_t(3),owner->selection_revision());
+        t.assert_true(owner->enter(two.phase,8,target,draft,2,2).status == llama_memory_phase_owner_status::stale_identity);
+        t.assert_true(owner->enter(one.phase,5,target,draft,1,4).status == llama_memory_phase_owner_status::invalid_signal);
+        t.assert_true(owner->enter(one.phase,1,target,draft,0,4).status == llama_memory_phase_owner_status::invalid_signal);
+        t.assert_true(owner->enter(one.phase,1,target,draft,3,4).status == llama_memory_phase_owner_status::invalid_phase);
+        f.workspace.hook=[&](const std::string & step) {if (step == "activate") f.workspace.fail_at="activate";};
+        t.assert_true(owner->enter(one.phase,4,target,draft,1,4).status == llama_memory_phase_owner_status::transition_failed);
+        t.assert_equal(uint32_t(2),owner->active_profile());
+        t.assert_equal(uint64_t(3),owner->selection_revision());
+        f.workspace.hook={}; f.workspace.fail_at.clear();
+        t.assert_true(owner->enter(one.phase,4,target,draft,1,4).status == llama_memory_phase_owner_status::changed);
+        t.assert_equal(uint64_t(4),owner->selection_revision());
+        t.assert_true(!llama_memory_phase_owner::create({one,one},f.arenas,{&f.workspace},target,draft));
+    });
+    t.test("group_phase_owner_checks_every_source_without_serial_role_placeholders", [](testing & t) {
+        fixture f(t,false);
+        llama_memory_phase_target target{llama_memory_work_phase::target_verify,f.target,16}; target.profile=2;
+        std::vector<llama_memory_phase_cache_identity> sources={{901,1},{902,4},{903,7}};
+        struct observer : llama_memory_consumer {
+            std::vector<llama_memory_phase_cache_identity> prepared;
+            bool prepare(const llama_memory_transition_target & target,const llama_memory_layout &,
+                    std::unique_ptr<llama_memory_preparation> &) override {
+                prepared=target.source_identities; return true;
+            }
+        } source_reader;
+        auto owner=llama_memory_phase_owner::create({target},f.arenas,{&f.workspace,&f.preserved,&source_reader},sources);
+        if (!t.assert_true(bool(owner))) return;
+        if (!t.assert_true(owner->enter(target.phase,8,sources,2,1).status == llama_memory_phase_owner_status::changed)) return;
+        t.assert_equal(size_t(3),source_reader.prepared.size());
+        t.assert_equal(uint64_t(4),source_reader.prepared[1].generation);
+        auto stale=sources; --stale[1].generation;
+        t.assert_true(owner->enter(target.phase,8,stale,2,1).status == llama_memory_phase_owner_status::stale_identity);
+        auto missing=sources; missing.pop_back();
+        t.assert_true(owner->enter(target.phase,8,missing,2,1).status == llama_memory_phase_owner_status::stale_identity);
+        t.assert_true(owner->enter(target.phase,8,sources,0,0).status == llama_memory_phase_owner_status::invalid_signal);
+        const auto ticket=owner->admit();
+        if (!t.assert_true(ticket!=0)) return;
+        auto advanced=sources; ++advanced[0].generation; ++advanced[2].generation;
+        t.assert_true(!owner->finish(ticket,stale));
+        t.assert_true(!owner->finish(ticket,missing));
+        t.assert_true(owner->finish(ticket,advanced));
+        t.assert_equal(uint64_t(2),owner->source_identities()[0].generation);
+        t.assert_equal(uint64_t(4),owner->source_identities()[1].generation);
+        t.assert_equal(uint64_t(8),owner->source_identities()[2].generation);
+        t.assert_true(owner->enter(target.phase,8,sources,2,1).status == llama_memory_phase_owner_status::stale_identity);
+        f.workspace.runtime_changed=true;
+        t.assert_true(owner->enter(target.phase,8,advanced,2,2).status == llama_memory_phase_owner_status::changed);
+        t.assert_equal(uint64_t(8),source_reader.prepared[2].generation);
+        auto duplicate=sources; duplicate[2]=duplicate[0];
+        t.assert_true(!llama_memory_phase_owner::create({target},f.arenas,{&f.workspace},duplicate));
+        t.assert_true(!llama_memory_phase_owner::create({target},f.arenas,{&f.workspace},
+            std::vector<llama_memory_phase_cache_identity>{}));
+    });
+    t.test("closed_shared_owner_cannot_reenter_after_a_consumer_retires", [](testing & t) {
+        for (bool grouped : {false,true}) {
+            fixture f(t,false);
+            auto target=f.target;
+            target.plan.stages.push_back({11,{10},{{11,f.a,f.a,f.a,LLAMA_MEMORY_ACCESS_WRITE,0},
+                {12,2*f.a,2*f.a,f.a,LLAMA_MEMORY_ACCESS_READ_WRITE,0}}});
+            auto draft=target;draft.stage=11;
+            struct observer : llama_memory_consumer {
+                bool prepare(const llama_memory_transition_target &,const llama_memory_layout &,
+                        std::unique_ptr<llama_memory_preparation> &) override {return true;}
+            };
+            auto participant=std::make_unique<observer>();
+            const std::vector<llama_memory_phase_target> targets={
+                {llama_memory_work_phase::target_verify,target,4,uint32_t(grouped)},
+                {llama_memory_work_phase::mtp_draft,draft,2,uint32_t(grouped)}};
+            const std::vector<llama_memory_consumer *> consumers={&f.workspace,&f.preserved,participant.get()};
+            const std::vector<llama_memory_phase_cache_identity> sources={{701,1},{702,1},{703,1},{704,1}};
+            auto owner=grouped ? llama_memory_phase_owner::create(targets,f.arenas,consumers,sources) :
+                llama_memory_phase_owner::create(targets,f.arenas,consumers,sources[0],sources[1]);
+            if (!t.assert_true(owner!=nullptr)) return;
+            const auto enter=[&](llama_memory_work_phase phase) {
+                return grouped ? owner->enter(phase,2,sources,1,1) : owner->enter(phase,2,sources[0],sources[1]);
+            };
+            if (!t.assert_true(enter(llama_memory_work_phase::target_verify).status==llama_memory_phase_owner_status::changed)) return;
+            const auto ticket=owner->admit();
+            if (!t.assert_true(ticket!=0)) return;
+            t.assert_true(!owner->close());
+            t.assert_true(grouped ? owner->finish(ticket,sources) : owner->finish(ticket,sources[0],sources[1]));
+            t.assert_true(owner->close() && owner->close());
+            const auto before=owner->snapshot();const auto events=f.events.size();
+            participant.reset();
+            t.assert_true(enter(llama_memory_work_phase::mtp_draft).status==llama_memory_phase_owner_status::session_invalid);
+            t.assert_true(enter(llama_memory_work_phase::target_verify).status==llama_memory_phase_owner_status::session_invalid);
+            t.assert_equal(uint64_t(0),owner->admit());
+            t.assert_true(!owner->finish(ticket,sources));
+            t.assert_equal(before.revision,owner->snapshot().revision);
+            t.assert_equal(events,f.events.size());
+        }
     });
     t.test("failed_handoff_recovers_old_phase_and_independent_generations", [](testing & t) {
         fixture f(t,false);
@@ -827,6 +1021,222 @@ int main(int argc, char ** argv) {
                       llama_memory_workload_budget_status::missing_cache);
     });
 
+    t.test("group_catalog_requires_joint_measurements_and_preserves_exact_minimum_admission", [](testing & t) {
+        llama_memory_cache_requirement first;
+        first.identity={701,1}; first.layers=2; first.history_rows=8192; first.row_padding=256;
+        first.format={GGML_TYPE_F16,GGML_TYPE_F16,32,32,1,false}; first.row_bytes=128;
+        auto second=first; second.identity={702,2};
+        auto local=first; local.identity={703,1}; local.role=llama_memory_cache_role::bounded_resident;
+        local.window_rows=16; local.headroom_rows=8; local.row_padding=16; local.sequence_capacity=2;
+        const std::vector<llama_memory_cache_requirement> caches={first,second,local};
+        std::vector<llama_memory_cache_allocation_measurement> allocations;
+        for (const auto & cache : caches) {
+            llama_memory_cache_bound bound;
+            if (!t.assert_true(llama_memory_cache_bound_make(cache,nullptr,bound))) return;
+            allocations.push_back({cache.identity,cache.role == llama_memory_cache_role::bounded_resident ?
+                bound.storage_bytes : 0,128,bound.capacity_rows,cache.format});
+        }
+        t.assert_equal(size_t(12288),allocations.back().bytes);
+        llama_memory_workload_requirement a;
+        a.phase=llama_memory_work_phase::target_verify; a.cache=first.identity;
+        a.input_rows=a.query_rows=a.output_rows=4; a.microbatch_rows=16; a.writes_cache=true;
+        auto b=a; b.cache=second.identity;
+        llama_memory_group_workload joint;
+        joint.id=81; joint.selected_count=2; joint.microbatch_rows=16;
+        const llama_memory_group_member_range first_rows{0,0,4,4},second_rows{1,0,4,4};
+        joint.members={a,b}; joint.native_batches={{first_rows,second_rows}};
+        auto ragged=joint; ragged.id=82;
+        ragged.members[0].input_rows=ragged.members[0].query_rows=ragged.members[0].output_rows=2;
+        // Native Qwen takes two rows from both slots, then the remaining two from slot one.
+        ragged.native_batches={{{0,0,2,2},{1,0,2,2}},{{1,2,2,2}}};
+        llama_memory_group_workload_measurement measure;
+        measure.workload=joint; measure.graph_bytes={640}; measure.execution_available={true};
+        measure.live_device_bytes=128; measure.alignment=128;
+        auto tail=measure; tail.workload=ragged; tail.graph_bytes={320,512};
+        tail.execution_available={true,true}; tail.live_device_bytes=256;
+        const std::vector<llama_memory_group_workload> declared={joint,ragged};
+        const std::vector<llama_memory_group_workload_measurement> measured={measure,tail};
+        llama_memory_workload_budget budget;
+        const auto fit=llama_memory_group_workload_budget_make(caches,allocations,declared,measured,512,13568,budget);
+        if (!t.assert_true(fit.status == llama_memory_workload_budget_status::success)) return;
+        t.assert_equal(size_t(12288),budget.persistent_cache_bytes);
+        t.assert_equal(size_t(768),budget.workspace_peak_bytes);
+        t.assert_equal(size_t(13568),budget.parent_minimum_bytes);
+        t.assert_true(budget.workload_bytes == std::vector<size_t>({768,768}));
+        const auto saved=budget;
+        const auto short_fit=llama_memory_group_workload_budget_make(caches,allocations,declared,measured,512,13567,budget);
+        t.assert_true(short_fit.status == llama_memory_workload_budget_status::insufficient_budget);
+        t.assert_equal(size_t(1),short_fit.additional_bytes);
+        t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+        for (int defect=0;defect<10;++defect) {
+            auto bad=declared;
+            if (defect == 0) bad[0].id=0;
+            if (defect == 1) bad[0].selected_count=0;
+            if (defect == 2) bad[0].selected_count=1;
+            if (defect == 3) bad[0].native_batches={{{0,0,4,4}},{{0,0,4,4}}};
+            if (defect == 4) bad[0].native_batches={{{0,0,4,4}}};
+            if (defect == 5) bad[0].native_batches={{{0,0,4,4},{2,0,4,4}}};
+            if (defect == 6) bad[0].members[1].cache=first.identity;
+            if (defect == 7) bad[0].members[0].serial=true;
+            if (defect == 8) bad[0].microbatch_rows=7;
+            if (defect == 9) bad[1].id=bad[0].id;
+            const auto rejected=llama_memory_group_workload_budget_make(caches,allocations,bad,measured,512,13568,budget);
+            t.assert_true(rejected.status == llama_memory_workload_budget_status::invalid_workload);
+            t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+            t.assert_true(saved.workload_bytes == budget.workload_bytes);
+        }
+        for (int defect=0;defect<7;++defect) {
+            auto bad=declared;
+            if (defect == 0) bad[1].native_batches[1][0].first_row=1;
+            if (defect == 1) bad[1].native_batches[1][0].first_row=3;
+            if (defect == 2) bad[1].native_batches[1][0].rows=3;
+            if (defect == 3) bad[1].native_batches[1][0].rows=0;
+            if (defect == 4) bad[1].native_batches[1][0].output_rows=3;
+            if (defect == 5) bad[1].native_batches[1][0].output_rows=1;
+            if (defect == 6) std::reverse(bad[1].native_batches.begin(),bad[1].native_batches.end());
+            t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,bad,measured,512,13568,budget).status ==
+                llama_memory_workload_budget_status::invalid_workload);
+            t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+        }
+        for (int defect=0;defect<5;++defect) {
+            auto bad=measured;
+            if (defect == 0) bad[0].graph_bytes={320,320};
+            if (defect == 1) bad[0].workload.selected_count=1;
+            if (defect == 2) bad[0].workload.members[0].cache.generation=2;
+            if (defect == 3) bad[1].execution_available.pop_back();
+            if (defect == 4) --bad[1].workload.native_batches[0][0].rows;
+            t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,declared,bad,512,13568,budget).status ==
+                llama_memory_workload_budget_status::missing_measurement);
+        }
+        auto unavailable=measured; unavailable[0].execution_available[0]=false;
+        t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,declared,unavailable,512,13568,budget).status ==
+            llama_memory_workload_budget_status::missing_kernel);
+        t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+        for (int defect=0;defect<5;++defect) {
+            auto bad=measured;
+            if (defect == 0) bad[0].graph_bytes[0]=0;
+            if (defect == 1) bad[0].alignment=0;
+            if (defect == 2) bad[0].alignment=3;
+            if (defect == 3) bad[0].graph_bytes[0]=SIZE_MAX;
+            if (defect == 4) bad[0].live_device_bytes=SIZE_MAX;
+            t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,declared,bad,512,13568,budget).status ==
+                llama_memory_workload_budget_status::invalid_measurement);
+            t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+            t.assert_true(saved.workload_bytes == budget.workload_bytes);
+        }
+        auto stale=caches; ++stale[0].identity.generation;
+        auto stale_allocations=allocations; stale_allocations[0].cache=stale[0].identity;
+        t.assert_true(llama_memory_group_workload_budget_make(stale,stale_allocations,declared,measured,512,13568,budget).status ==
+            llama_memory_workload_budget_status::stale_cache);
+        auto missing=declared; missing[0].members[0].cache.id=799;
+        t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,missing,measured,512,13568,budget).status ==
+            llama_memory_workload_budget_status::missing_cache);
+        t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,declared,measured,SIZE_MAX,13568,budget).status ==
+            llama_memory_workload_budget_status::invalid_measurement);
+        t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+    });
+    t.test("group_members_span_native_microbatches_without_enlarging_each_launch", [](testing & t) {
+        llama_memory_cache_requirement first;
+        first.identity={4101,1};first.layers=1;first.history_rows=32;first.row_bytes=52;first.row_padding=32;
+        first.format={GGML_TYPE_Q8_0,GGML_TYPE_Q4_0,32,32,1,false};
+        auto second=first;second.identity={4102,1};
+        llama_memory_workload_requirement a;
+        a.phase=llama_memory_work_phase::target_prefill;a.cache=first.identity;
+        a.input_rows=a.query_rows=5;a.output_rows=1;a.microbatch_rows=4;a.writes_cache=true;a.serial=false;
+        auto b=a;b.cache=second.identity;b.input_rows=b.query_rows=3;
+        llama_memory_group_workload group;
+        group.id=901;group.selected_count=2;group.microbatch_rows=4;group.members={a,b};
+        group.native_batches={{{0,0,4,0}},{{0,4,1,1},{1,0,3,1}}};
+        llama_memory_group_workload_measurement measured;
+        measured.workload=group;measured.graph_bytes={1024,2048};measured.execution_available={true,true};
+        measured.live_device_bytes=256;measured.alignment=64;
+        const std::vector<llama_memory_cache_requirement> caches={first,second};
+        const std::vector<llama_memory_cache_allocation_measurement> allocations={
+            {first.identity,0,64,32,first.format},{second.identity,0,64,32,second.format}};
+        llama_memory_workload_budget output;
+        const auto fit=llama_memory_group_workload_budget_make(caches,allocations,{group},{measured},0,2304,output);
+        if (!t.assert_true("full member extent is covered by bounded native launches",fit.status==llama_memory_workload_budget_status::success)) return;
+        t.assert_equal(size_t(2304),output.parent_minimum_bytes);
+        auto serial=a;serial.serial=true;
+        t.assert_true(!llama_memory_workload_requirement_valid(serial,first));
+        const auto short_fit=llama_memory_group_workload_budget_make(caches,allocations,{group},{measured},0,2303,output);
+        t.assert_true(short_fit.status==llama_memory_workload_budget_status::insufficient_budget && short_fit.additional_bytes==1);
+        for (int invalid=0;invalid<3;++invalid) {
+            auto bad=group;
+            if (invalid==0) bad.native_batches[1][0].rows=2;
+            if (invalid==1) bad.native_batches[1][0].first_row=3;
+            if (invalid==2) bad.microbatch_rows=0;
+            auto proof=measured;proof.workload=bad;
+            t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,{bad},{proof},0,2304,output).status==
+                llama_memory_workload_budget_status::invalid_workload);
+        }
+    });
+    t.test("DFlash_group_accounts_for_source_features_and_one_bounded_destination", [](testing & t) {
+        llama_memory_cache_requirement first;
+        first.identity={711,1};first.layers=2;first.history_rows=8192;first.row_padding=256;
+        first.format={GGML_TYPE_F16,GGML_TYPE_F16,32,32,1,false};first.row_bytes=128;
+        auto second=first;second.identity={712,2};
+        auto destination=first;destination.identity={713,3};destination.role=llama_memory_cache_role::bounded_resident;
+        destination.layers=5;destination.window_rows=16;destination.headroom_rows=8;destination.row_padding=16;
+        destination.sequence_capacity=2;destination.format={GGML_TYPE_F16,GGML_TYPE_F16,64,64,2,false};destination.row_bytes=512;
+        std::vector<llama_memory_cache_requirement> caches={first,second,destination};
+        std::vector<llama_memory_cache_allocation_measurement> allocations;
+        for (const auto & cache : caches) {
+            llama_memory_cache_bound bound;
+            if (!t.assert_true(llama_memory_cache_bound_make(cache,nullptr,bound))) return;
+            allocations.push_back({cache.identity,cache.role==llama_memory_cache_role::bounded_resident ? bound.storage_bytes : 0,
+                128,bound.capacity_rows,cache.format});
+        }
+        t.assert_equal(size_t(122880),allocations.back().bytes);
+        llama_memory_workload_requirement a;
+        a.phase=llama_memory_work_phase::draft_block_prediction;a.cache=first.identity;
+        a.destination_cache=destination.identity;a.input_rows=a.query_rows=a.hidden_output_rows=8;
+        a.microbatch_rows=16;a.writes_cache=true;a.causal=false;
+        auto b=a;b.cache=second.identity;
+        llama_memory_group_workload predict;
+        predict.id=83;predict.selected_count=2;predict.microbatch_rows=16;predict.members={a,b};
+        predict.native_batches={{{0,0,8,0,8},{1,0,8,0,8}}};
+        auto inject=predict;inject.id=84;
+        for (size_t i=0;i<inject.members.size();++i) {
+            auto & member=inject.members[i];member.phase=llama_memory_work_phase::draft_feature_injection;
+            member.input_rows=uint32_t(5+2*i);member.query_rows=member.hidden_output_rows=0;
+        }
+        inject.native_batches={{{0,0,5,0,0}},{{1,0,7,0,0}}};
+        llama_memory_group_workload_measurement p;
+        p.workload=predict;p.graph_bytes={640};p.execution_available={true};p.live_device_bytes=128;p.alignment=128;
+        auto q=p;q.workload=inject;q.graph_bytes={320,512};q.execution_available={true,true};
+        const std::vector<llama_memory_group_workload> workloads={predict,inject};
+        const std::vector<llama_memory_group_workload_measurement> measured={p,q};
+        llama_memory_workload_budget budget;
+        if (!t.assert_true(llama_memory_group_workload_budget_make(caches,allocations,workloads,measured,512,124160,budget).status==
+                llama_memory_workload_budget_status::success)) return;
+        t.assert_equal(size_t(122880),budget.persistent_cache_bytes);
+        t.assert_equal(size_t(124160),budget.parent_minimum_bytes);
+        const auto saved=budget;
+        const auto short_fit=llama_memory_group_workload_budget_make(caches,allocations,workloads,measured,512,124159,budget);
+        t.assert_true(short_fit.status==llama_memory_workload_budget_status::insufficient_budget && short_fit.additional_bytes==1);
+        for (uint32_t defect=0;defect<9;++defect) {
+            auto bad=workloads;auto proof=measured;
+            switch (defect) {
+                case 0: bad[0].members[0].destination_cache.id=799;break;
+                case 1: ++bad[0].members[0].destination_cache.generation;break;
+                case 2: bad[0].members[0].destination_cache=first.identity;break;
+                case 3: bad[0].members[1].cache=first.identity;break;
+                case 4: bad[0].members[0].hidden_output_rows=9;break;
+                case 5: bad[0].native_batches[0][0].hidden_output_rows=7;break;
+                case 6: proof[0].workload.members[0].hidden_output_rows=7;break;
+                case 7: bad[1].members[0].phase=llama_memory_work_phase::target_verify;break;
+                case 8: bad[0].members[0].destination_cache={};break;
+            }
+            const auto result=llama_memory_group_workload_budget_make(caches,allocations,bad,proof,512,124160,budget);
+            const auto expected=defect==0 ? llama_memory_workload_budget_status::missing_cache :
+                defect==1 ? llama_memory_workload_budget_status::stale_cache :
+                defect==6 ? llama_memory_workload_budget_status::missing_measurement : llama_memory_workload_budget_status::invalid_workload;
+            t.assert_true(result.status==expected);
+            t.assert_equal(saved.parent_minimum_bytes,budget.parent_minimum_bytes);
+            t.assert_true(saved.workload_bytes==budget.workload_bytes);
+        }
+    });
     t.test("measured_cache_padding_and_aliases_are_accounted_once", [](testing & t) {
         llama_memory_cache_requirement source{{201,2},{},llama_memory_cache_role::bounded_resident,
                                             5,262144,2048,256,256,1664};

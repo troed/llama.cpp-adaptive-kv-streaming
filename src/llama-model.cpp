@@ -2938,6 +2938,23 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    const bool selected_mtp=params.defer_full_cache && params.ctx_type==LLAMA_CONTEXT_TYPE_MTP && arch==LLM_ARCH_QWEN35 &&
+        hparams.n_layer_nextn==1 && cparams.n_seq_max>1 && cparams.n_seq_max<=LLAMA_MAX_SEQ && params.shared_device_memory_bytes &&
+        !cparams.shared_device_memory_bytes && !cparams.n_rs_seq;
+    const bool selected_dflash=params.defer_full_cache && params.defer_bounded_cache && arch==LLM_ARCH_DFLASH &&
+        params.ctx_type==LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_seq_max>1 && cparams.n_seq_max<=LLAMA_MAX_SEQ && params.shared_device_memory_bytes &&
+        !cparams.shared_device_memory_bytes && !cparams.n_rs_seq && hparams.n_swa && hparams.dflash_selector_rank;
+    if (!params.kv_stream_selected_sequences.empty() &&
+            ((!params.measure_only && !params.defer_full_cache) || !cparams.kv_unified ||
+             (cparams.n_rs_seq && !(params.defer_full_cache && arch==LLM_ARCH_QWEN35 && cparams.n_rs_seq<=7 && params.kv_stream_rs_rollback)) || params.mem_other ||
+             (params.ctx_type!=LLAMA_CONTEXT_TYPE_DEFAULT && !selected_mtp) ||
+             (arch!=LLM_ARCH_QWEN35 && arch!=LLM_ARCH_GEMMA4 && !selected_dflash) ||
+             !llama_memory_selected_sequences_valid(params,cparams.n_seq_max)))
+        throw std::runtime_error("selected memory factory is restricted to target measurement until group execution is bound");
+
+    if (params.defer_full_cache && (params.measure_only || params.kv_stream_selected_sequences.empty() ||
+            !params.shared_device_memory_bytes || params.kv_stream_pool_bytes))
+        throw std::runtime_error("deferred group execution requires selected targets and one phase arena");
 
     // the non-causal LFM2 and LFM3 decision graphs read the whole prompt in one batch, nothing is kept
     if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
@@ -3410,14 +3427,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ params.kv_stream_selected_sequences.empty() ?
+                                std::max(uint32_t(1),cparams.n_seq_max) : uint32_t(params.kv_stream_selected_sequences.size()),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* streaming         */ (params.kv_stream_pool_bytes || params.shared_device_memory_bytes) ? &params : nullptr);
+                            /* streaming         */ (params.kv_stream_pool_bytes || params.shared_device_memory_bytes || params.measure_only) ? &params : nullptr);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3492,7 +3510,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share, (params.bounded_cache_lease || params.kv_stream_pool_bytes || params.shared_device_memory_bytes) ? &params : nullptr);
+                                    share, (params.bounded_cache_lease || params.kv_stream_pool_bytes || params.shared_device_memory_bytes || params.measure_only) ? &params : nullptr);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -3515,7 +3533,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 nullptr,
                                 "",
-                                params.mtp_host_cache ? &params : nullptr);
+                                (params.mtp_host_cache || selected_mtp) ? &params : nullptr);
                     }
                 }
             }

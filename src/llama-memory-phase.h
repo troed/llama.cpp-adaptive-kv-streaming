@@ -39,6 +39,8 @@ struct llama_memory_cache_requirement {
     size_t row_bytes = 0;
     uint32_t source_first_layer = 0;
     llama_memory_cache_format format = {};
+    // Bounded unified storage has one visibility window per sequence; headroom is shared.
+    uint32_t sequence_capacity = 1;
 };
 
 struct llama_memory_cache_bound {
@@ -140,11 +142,22 @@ struct llama_memory_workload_requirement {
     bool serial = false;
     bool writes_cache = false;
     bool causal = true;
+    // Block drafts consume target features but write a different bounded cache.
+    llama_memory_phase_cache_identity destination_cache = {};
+    uint32_t hidden_output_rows = 0;
 };
 
 // Check metadata against a separately validated cache descriptor; backend admission is separate.
 bool llama_memory_workload_requirement_valid(const llama_memory_workload_requirement & requirement,
         const llama_memory_cache_requirement & cache) noexcept;
+bool llama_memory_workload_requirement_valid(const llama_memory_workload_requirement & requirement,
+        const llama_memory_cache_requirement & cache,const llama_memory_cache_requirement * destination) noexcept;
+
+// A group owns launch ordering; each member describes one source without claiming serial execution.
+bool llama_memory_workload_group_member_valid(const llama_memory_workload_requirement & requirement,
+        const llama_memory_cache_requirement & cache) noexcept;
+bool llama_memory_workload_group_member_valid(const llama_memory_workload_requirement & requirement,
+        const llama_memory_cache_requirement & cache,const llama_memory_cache_requirement * destination) noexcept;
 
 struct llama_memory_work_phase_signal {
     llama_memory_work_phase phase = llama_memory_work_phase::none;

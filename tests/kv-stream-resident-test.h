@@ -19,7 +19,8 @@ using arena_ptr = std::unique_ptr<ggml_backend_memory_arena, decltype(&ggml_back
 using lease_ptr = std::unique_ptr<ggml_backend_memory_lease, decltype(&ggml_backend_memory_lease_free)>;
 
 // Encode deterministic token-major data; the independent oracle reads back the actual quantized values.
-static void populate(const std::shared_ptr<llama_kv_stream_host> & host) {
+static void populate(const std::shared_ptr<llama_kv_stream_host> & host, uint32_t salt = 0) {
+    GGML_ASSERT(host->prepare(host->layout().tokens));
     const auto & c = host->config();
     const size_t rows = host->layout().tokens*size_t(c.shape.heads);
     for (uint32_t layer = 0; layer < c.layers; ++layer) {
@@ -28,7 +29,7 @@ static void populate(const std::shared_ptr<llama_kv_stream_host> & host) {
             auto type = ggml_type(side ? c.shape.type_v : c.shape.type_k);
             const size_t dim = size_t(side ? c.shape.head_dim_v : c.shape.head_dim_k);
             std::vector<float> data(rows*dim);
-            for (size_t i = 0; i < data.size(); ++i) data[i] = .2f*std::sin(float(i % 401 + 53*layer + 19*side)*.13f);
+            for (size_t i = 0; i < data.size(); ++i) data[i] = .2f*std::sin(float(i % 401 + 53*layer + 19*side + salt)*.13f);
             ggml_quantize_chunk(type, data.data(), side ? planes.v : planes.k, 0, int64_t(rows), int64_t(dim), nullptr);
         }
     }
@@ -47,8 +48,9 @@ struct fixture {
     // The unused ring remains at the front; active resident planes must use policy offsets, not a flat host copy.
     fixture(ggml_backend_t backend, bool cuda, ggml_type k = GGML_TYPE_F16, ggml_type v = GGML_TYPE_F16,
             size_t context = 769, bool fallback = false, uint32_t layers = 2, uint32_t heads = 2,
-            size_t pool_pages = 0, uint32_t key_width = 256, uint32_t value_width = 256) : backend(backend), cuda(cuda) {
-        llama_kv_stream_host_config c{37, {k, v, key_width, value_width, int32_t(heads), 256, 128},
+            size_t pool_pages = 0, uint32_t key_width = 256, uint32_t value_width = 256,
+            ggml_backend_memory_lease_t borrowed = nullptr, uint64_t cache_id = 37, uint32_t salt = 0) : backend(backend), cuda(cuda) {
+        llama_kv_stream_host_config c{cache_id, {k, v, key_width, value_width, int32_t(heads), 256, 128},
             {{k, true, true, true, true}, {v, true, true, true, true}, true, true}, context, layers};
         auto * dev = ggml_backend_get_device(backend);
         if (cuda) {
@@ -62,20 +64,27 @@ struct fixture {
         GGML_ASSERT(host_type && device_type);
         host = llama_kv_stream_host::create(c, host_type);
         GGML_ASSERT(host);
-        populate(host);
+        populate(host,salt);
         content = std::make_shared<llama_kv_stream_content>(host);
         ggml_kv_stream_layout page; GGML_ASSERT(ggml_kv_stream_layout_make(c.shape, 256, page).status == ggml_kv_stream_status::success);
         ggml_kv_stream_execution execution;
         GGML_ASSERT(ggml_kv_stream_resolve(c.shape,c.capabilities,256,execution).status == ggml_kv_stream_status::success);
         policy.shape = c.shape; policy.capabilities = c.capabilities; policy.layers = c.layers;
         policy.pool_bytes = page.bytes*(pool_pages ? pool_pages : std::max(size_t(16),size_t(layers)+8)) + execution.conversion.bytes;
-        arena.reset(ggml_backend_memory_arena_new(device_type, policy.pool_bytes + 256));
-        GGML_ASSERT(arena && ggml_backend_memory_arena_begin(arena.get(), 0));
-        auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(ggml_backend_memory_arena_parent(arena.get())));
-        const size_t offset = 128 + (128 - base % 128) % 128;
-        GGML_ASSERT(ggml_backend_memory_arena_reserve_at(arena.get(), 9, offset, policy.pool_bytes, 64, 0, nullptr));
-        GGML_ASSERT(ggml_backend_memory_arena_commit(arena.get()));
-        lease.reset(ggml_backend_memory_arena_acquire(arena.get(), 9));
+        if (borrowed) {
+            auto * buffer=ggml_backend_memory_lease_buffer(borrowed);
+            GGML_ASSERT(buffer && ggml_backend_buffer_get_type(buffer)==device_type &&
+                ggml_backend_buffer_get_size(buffer)==policy.pool_bytes);
+            lease.reset(ggml_backend_memory_lease_retain(borrowed));
+        } else {
+            arena.reset(ggml_backend_memory_arena_new(device_type, policy.pool_bytes + 256));
+            GGML_ASSERT(arena && ggml_backend_memory_arena_begin(arena.get(), 0));
+            auto base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(ggml_backend_memory_arena_parent(arena.get())));
+            const size_t offset = 128 + (128 - base % 128) % 128;
+            GGML_ASSERT(ggml_backend_memory_arena_reserve_at(arena.get(), 9, offset, policy.pool_bytes, 64, 0, nullptr));
+            GGML_ASSERT(ggml_backend_memory_arena_commit(arena.get()));
+            lease.reset(ggml_backend_memory_arena_acquire(arena.get(), 9));
+        }
         binding = std::make_unique<llama_kv_stream_binding>(c.cache_id, device_type);
     }
     bool attach(const llama_kv_stream_policy_state * placement = nullptr) {
@@ -88,11 +97,13 @@ struct fixture {
 };
 
 // Decode exact GGML rows, without assuming that quantized values equal their original float inputs.
-static std::vector<float> unpack(const fixture & f, uint32_t layer, bool value) {
+static std::vector<float> unpack(const fixture & f,uint32_t layer,bool value,size_t tokens=SIZE_MAX) {
     const auto & shape = f.host->config().shape;
     const auto type = ggml_type(value ? shape.type_v : shape.type_k);
     const size_t dim = size_t(value ? shape.head_dim_v : shape.head_dim_k);
-    const size_t rows = f.host->layout().tokens*size_t(shape.heads);
+    if (tokens == SIZE_MAX) tokens=f.host->layout().tokens;
+    GGML_ASSERT(tokens <= f.host->layout().tokens);
+    const size_t rows = tokens*size_t(shape.heads);
     const size_t stride = ggml_row_size(type, int64_t(dim));
     llama_kv_stream_host_layer planes; f.host->layer(layer, planes);
     auto * source = static_cast<const uint8_t *>(value ? planes.v : planes.k);
@@ -107,7 +118,8 @@ static std::vector<float> unpack(const fixture & f, uint32_t layer, bool value) 
 // Scalar causal softmax oracle, independent of GGML graph strides and attention dispatch.
 static std::vector<float> oracle(const fixture & f, uint32_t layer, size_t active, size_t queries, const std::vector<float> & q) {
     constexpr size_t dim = 256, heads = 4, kv_heads = 2;
-    auto k = unpack(f, layer, false), v = unpack(f, layer, true);
+    const size_t tokens=f.host->demand_backed() ? active : SIZE_MAX;
+    auto k = unpack(f,layer,false,tokens), v = unpack(f,layer,true,tokens);
     std::vector<float> result(dim*heads*queries);
     for (size_t h = 0; h < heads; ++h) for (size_t query = 0; query < queries; ++query) {
         const size_t visible = active - queries + query + 1;
