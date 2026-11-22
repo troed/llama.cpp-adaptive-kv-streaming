@@ -40,7 +40,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
         float * resume_state, int chunk_first, int chunk_end, bool reset_state, bool finish_state,
         int work_y, int work_count, int output_y, int output_count, const int32_t * mask_bounds = nullptr) {
     // Ring reuse records an event after resumed launches, so they must not signal completion before their final read.
@@ -115,7 +115,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh  = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0) : nullptr;
+    const half * maskh  = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0) : nullptr;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -351,7 +351,7 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
         for (int j = 0; j < ncols; ++j) {
 #pragma unroll
             for (int offset = nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
-                KQ_max_new[j] = fmaxf(KQ_max_new[j], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[j], offset, WARP_SIZE));
+                KQ_max_new[j] = fmaxf(KQ_max_new[j], ggml_cuda_shfl_xor(KQ_max_new[j], offset, WARP_SIZE));
             }
             const float KQ_max_scale = expf(KQ_max[j] - KQ_max_new[j]);
             VKQ_scale[j] = KQ_max_scale;
@@ -662,7 +662,7 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
     flash_attn_ext_vec_impl<D,ncols,type_K,type_V,use_logit_softcap,false>(
         Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31,nb32,nb33,nullptr,0,0,true,true,int(blockIdx.y),int(gridDim.y),int(blockIdx.y),int(gridDim.y));
 }
@@ -692,7 +692,7 @@ static __global__ void flash_attn_ext_vec_resume(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
         float * state, int first, int end, bool reset, bool finish, const int32_t * mask_bounds = nullptr) {
     flash_attn_ext_vec_impl<D,ncols,type_K,type_V,false,true,tail_safe,compact_mask>(
         Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne31, ne32, ne33, nb31,nb32,nb33,state,first,end,reset,finish,int(blockIdx.y),int(gridDim.y),int(blockIdx.y),int(gridDim.y),mask_bounds);

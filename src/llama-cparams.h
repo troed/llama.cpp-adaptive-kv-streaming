@@ -75,8 +75,6 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
-    bool fused_lid;          // use fused lightning indexer
-    bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
@@ -90,6 +88,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;

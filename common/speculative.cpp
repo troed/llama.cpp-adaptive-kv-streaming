@@ -76,17 +76,19 @@ static void spec_retune(
 }
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
-    {"none",          COMMON_SPECULATIVE_TYPE_NONE},
-    {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
-    {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
-    {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
-    {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
-    {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
-    {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-    {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
-    {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
-    {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"none",           COMMON_SPECULATIVE_TYPE_NONE},
+    {"draft-simple",   COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+    {"draft-eagle3",   COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+    {"draft-mtp",      COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-dflash",   COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+    {"draft-dspark",   COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+    {"draft-dflash2",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2},
+    {"draft-lilicorr", COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR},
+    {"ngram-simple",   COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+    {"ngram-map-k",    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
+    {"ngram-map-k4v",  COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
+    {"ngram-mod",      COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
+    {"ngram-cache",    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -2707,18 +2709,20 @@ const char * common_speculative_all_types_str() {
 
 std::string common_speculative_type_to_str(common_speculative_type type) {
     switch (type) {
-        case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
-        default:                                    return "unknown";
+        case COMMON_SPECULATIVE_TYPE_NONE:           return "none";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:   return "draft-simple";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:   return "draft-eagle3";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:      return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:   return "draft-dflash";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:   return "draft-dspark";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:  return "draft-dflash2";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR: return "draft-lilicorr";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:   return "ngram-simple";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:    return "ngram-map-k";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:  return "ngram-map-k4v";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:      return "ngram-mod";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:    return "ngram-cache";
+        default:                                     return "unknown";
     }
 }
 
@@ -2776,10 +2780,8 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
         return {};
     }
 
-    // the Markov head distinguishes draft-dspark from draft-dflash
-    const auto type = gguf_find_tensor(gguf_ctx.get(), "markov_w1.weight") >= 0
-                    ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
-                    : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+    // draft-dflash runs every DFlash family draft, the head of the loaded draft picks the driver
+    const auto type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
 
     SPC_INF("auto-detected speculative type '%s' from the draft model metadata\n", common_speculative_type_to_str(type).c_str());
 
@@ -2813,6 +2815,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -3003,7 +3007,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_block_draft = std::any_of(
         params.speculative.types.begin(), params.speculative.types.end(),
         [](common_speculative_type t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
@@ -3248,6 +3255,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     {
         uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
 
+        // the DFlash family types share the draft context, so one run uses at most one of them
+        const uint32_t dflash_configs = enabled_configs & (
+                (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)  | (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) |
+                (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) | (1u << COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR));
+        if (dflash_configs & (dflash_configs - 1)) {
+            throw std::runtime_error("draft-dflash, draft-dflash2, draft-dspark and draft-lilicorr cannot be combined");
+        }
+
         auto add_config_if_enabled = [&](common_speculative_type type, bool available = true) {
             if (available && (enabled_configs & (1u << type))) {
                 configs.emplace_back(type, params);
@@ -3255,7 +3270,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -3266,10 +3281,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,   params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR, params.draft.ctx_dft != nullptr);
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -3290,13 +3307,31 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq));
-                break;
-            }
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
-                        config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR: {
+                common_speculative_type type_model = COMMON_SPECULATIVE_TYPE_NONE;
+                switch (llama_model_dflash_variant(llama_get_model(config.params.draft.ctx_dft))) {
+                    case LLAMA_DFLASH_VARIANT_DFLASH:   type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;   break;
+                    case LLAMA_DFLASH_VARIANT_DFLASH2:  type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2;  break;
+                    case LLAMA_DFLASH_VARIANT_DSPARK:   type_model = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;   break;
+                    case LLAMA_DFLASH_VARIANT_LILICORR: type_model = COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR; break;
+                    case LLAMA_DFLASH_VARIANT_NONE:     break;
+                }
+                if (type_model == COMMON_SPECULATIVE_TYPE_NONE) {
+                    throw std::runtime_error(string_format("--spec-type %s requires a DFlash draft model",
+                            common_speculative_type_to_str(config.type).c_str()));
+                }
+
+                // draft-dflash runs every DFlash family draft, the other types must match the head of the draft
+                if (config.type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && config.type != type_model) {
+                    throw std::runtime_error(string_format("--spec-type %s does not match the draft model: use %s",
+                            common_speculative_type_to_str(config.type).c_str(), common_speculative_type_to_str(type_model).c_str()));
+                }
+
+                // one DFlash-family driver covers all four heads, the draft model picks the behavior
+                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq, type_model));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -3349,8 +3384,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     }
 
     // the n-gram drafters ignore p_min, and DSpark uses it as the cutoff of its confidence head
-    const bool uses_p_min = std::any_of(configs.begin(), configs.end(), [](const common_speculative_config & c) {
-        switch (c.type) {
+    const bool uses_p_min = std::any_of(impls.begin(), impls.end(), [](const auto & impl) {
+        switch (impl->type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:

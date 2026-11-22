@@ -568,6 +568,8 @@ if (GGML_CUDA AND GGML_CUDA_FA)
 endif()
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+llama_build_and_test(test-sleep.cpp LINK ggml)
+llama_build_and_test(test-backend-sched.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
@@ -608,7 +610,7 @@ foreach(TEST IN ITEMS workspace embeddings session projector-storage)
     endif()
 endforeach()
 
-llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd)
+llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

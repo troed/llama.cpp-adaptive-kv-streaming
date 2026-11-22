@@ -1,6 +1,7 @@
 #include "../src/llama-context.h"
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-task.h"
+#include "../tools/server/server-slot-sched.h"
 #include "ngram-map.h"
 #include "testing.h"
 #include <cstring>
@@ -29,17 +30,17 @@ int main(int argc, char ** argv) {
         if (!t.assert_true(entry!=nullptr)) return;
         entry->data.main={11,12,13};
         unsigned calls=0;
-        t.assert_true(!cache.load(current,requested,[&](server_prompt_cache_state & saved) {
+        t.assert_true(!cache.load(current,requested,current.lora,[&](server_prompt_cache_state & saved) {
             ++calls;return saved.data.main.empty();
         }));
         t.assert_true(current.tokens.empty() && cache.states.size()==1 && calls==1);
-        t.assert_true(cache.load(current,requested,[&](server_prompt_cache_state & saved) {
+        t.assert_true(cache.load(current,requested,current.lora,[&](server_prompt_cache_state & saved) {
             const std::vector<uint8_t> expected{11,12,13};
             ++calls;return saved.data.main.size()==expected.size() &&
                 std::equal(saved.data.main.begin(),saved.data.main.end(),expected.begin());
         }));
         t.assert_true(cache.states.empty() && current.tokens.size()==3 && calls==2);
-        t.assert_true(cache.load(current,requested,[&](server_prompt_cache_state &) {++calls;return false;}));
+        t.assert_true(cache.load(current,requested,current.lora,[&](server_prompt_cache_state &) {++calls;return false;}));
         t.assert_equal(2u,calls);
     });
     t.test("compact_prompt_checkpoints_account_for_native_state_without_copying_full_KV", [](testing & t) {
