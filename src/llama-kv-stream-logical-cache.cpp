@@ -562,7 +562,7 @@ std::unique_ptr<llama_kv_stream_group_producer> llama_kv_stream_group_producer::
         std::shared_ptr<llama_kv_stream_slot_table> table,std::shared_ptr<llama_kv_stream_writer> writer,
         uint32_t maximum_rows,uint32_t maximum_verify_rows,uint32_t maximum_selected) {
     if (!table || !writer || !maximum_rows || maximum_rows>writer->maximum_rows() ||
-            !maximum_verify_rows || maximum_verify_rows>8 || !maximum_selected || maximum_selected>table->limits().slots ||
+            !maximum_verify_rows || maximum_verify_rows>64 || !maximum_selected || maximum_selected>table->limits().slots ||
             maximum_verify_rows>maximum_rows) return {};
     try {
         auto result=std::unique_ptr<llama_kv_stream_group_producer>(new llama_kv_stream_group_producer);

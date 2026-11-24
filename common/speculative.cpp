@@ -1713,7 +1713,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // shared memory and chained heads keep the host rows; so does a draft whose workspace is
         // borrowed from the target, because the target cannot replace its arena while it is borrowed
         auto * dft_compute = llama_context_compute_memory(ctx_dft);
-        const bool arena_borrowed = dft_compute && dft_compute->borrows_serial_parent();
+        // a grouped draft has no serial parent, but its workspace belongs to the group's arena
+        const bool grouped = ctx_dft->group_parent() || ctx_dft->group_storage_pending();
+        const bool arena_borrowed = grouped || (dft_compute && dft_compute->borrows_serial_parent());
         if (!is_mem_shared && !chain_heads && !arena_borrowed) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
@@ -2805,6 +2807,20 @@ static bool common_speculative_is_dflash(common_speculative_type type) {
     return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
 }
 
+// spike: temporary wide multi-slot admission, ngram companions next to attached MTP
+static bool common_speculative_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
     int32_t n_max = 0;
 
@@ -3072,7 +3088,7 @@ common_speculative_init_result::common_speculative_init_result(
             std::any_of(params.speculative.types.begin(),params.speculative.types.end(),[&](auto type) {
                 return type!=COMMON_SPECULATIVE_TYPE_NONE && (spec_dflash ?
                     type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V :
-                    type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+                    type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP && !common_speculative_is_ngram(type));
             }))) throw std::invalid_argument("group speculative startup requires matching deferred targets and inherited draft parameters");
     auto * target_memory=llama_context_compute_memory(ctx_tgt);
     const bool streamed_block=spec_dflash && (group || (target_memory && target_memory->shares_kv_memory()));
@@ -3593,16 +3609,20 @@ void common_speculative_draft(common_speculative * spec) {
 bool common_speculative_rebind(common_speculative * spec,llama_context * target,llama_context * draft) {
     if (!spec || spec->impls.empty()) return false;
     common_speculative_impl_draft_dflash * block=nullptr;
+    common_speculative_impl_draft_mtp    * mtp  =nullptr;
     for (const auto & candidate : spec->impls) {
         if (candidate->type==COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
             if (block) return false;
             block=static_cast<common_speculative_impl_draft_dflash *>(candidate.get());
-        } else if (candidate->type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
-                candidate->type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP) return false;
+        } else if (candidate->type==COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            if (mtp) return false;
+            mtp=static_cast<common_speculative_impl_draft_mtp *>(candidate.get());
+        } else if (!common_speculative_is_ngram(candidate->type)) return false;
     }
     if (block) {
-        if (std::any_of(spec->impls.begin(),spec->impls.end(),[](const auto & candidate) {
-                return candidate->type==COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        if (mtp || std::any_of(spec->impls.begin(),spec->impls.end(),[](const auto & candidate) {
+                return candidate->type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                    candidate->type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
             }) || !llama_speculative_rebind_compatible(block->params.ctx_tgt,block->params.ctx_dft,target,draft,
                 block->backend_chains.data(),block->backend_chains.size())) return false;
         if (block->params.ctx_tgt==target && block->params.ctx_dft==draft) return true;
@@ -3618,8 +3638,8 @@ bool common_speculative_rebind(common_speculative * spec,llama_context * target,
             return true;
         } catch (const std::bad_alloc &) {return false;}
     }
-    if (spec->impls.size()!=1 || spec->impls.front()->type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP) return false;
-    auto & impl=*static_cast<common_speculative_impl_draft_mtp *>(spec->impls.front().get());
+    if (!mtp) return false;
+    auto & impl=*mtp;
     if (!llama_mtp_rebind_compatible(impl.params.ctx_tgt,impl.params.ctx_dft,target,draft,
             impl.backend_chains.data(),impl.backend_chains.size()) ||
             impl.is_mem_shared!=(llama_get_ctx_other(draft)==target)) return false;

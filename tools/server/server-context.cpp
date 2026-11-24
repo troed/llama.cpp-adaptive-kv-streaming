@@ -1504,7 +1504,7 @@ private:
                 !params_base.kv_unified || std::any_of(params_base.speculative.types.begin(),params_base.speculative.types.end(),
                     [streamed_dflash](auto type) {return type!=COMMON_SPECULATIVE_TYPE_NONE && (streamed_dflash ?
                         type!=COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type!=COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V :
-                        type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP);}))) {
+                        type!=COMMON_SPECULATIVE_TYPE_DRAFT_MTP && !spec_type_is_ngram(type));}))) {
             SRV_ERR("%s\n","multi-slot KV streaming requires valid independent slots, unified KV and admitted target or speculative execution");return false;
         }
         llama_init = common_init_from_params(params_base,multi_stream);
@@ -2993,8 +2993,14 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         if (stream_contexts) {
-            park_stream_context();cur.streamed=std::make_shared<llama_context_group_checkpoint>();
-            if (!stream_contexts->save_request(uint32_t(slot.id),*cur.streamed,false)) throw std::runtime_error("stream checkpoint export failed");
+            // A checkpoint is logical state, so keep the live execution unless the export needs parking.
+            cur.streamed=std::make_shared<llama_context_group_checkpoint>();
+            const bool live=stream_contexts->context() &&
+                stream_contexts->save_request_active(uint32_t(slot.id),*cur.streamed,false);
+            if (!live) {
+                park_stream_context();
+                if (!stream_contexts->save_request(uint32_t(slot.id),*cur.streamed,false)) throw std::runtime_error("stream checkpoint export failed");
+            }
         } else {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -4642,7 +4648,20 @@ private:
         auto * input=translated ? translated->batch_ext : batch.view.get();
         llama_batch_allocr allocator(uint32_t(input->n_pos_per_embd));
         if (!allocator.init(*input,*vocab,false)) throw std::runtime_error("invalid selected native batch");
-        const auto & representative=allocator.get_batch();
+        auto representative=allocator.get_batch();
+        const bool verify_phase=phase==llama_memory_work_phase::target_verify;
+        if (spec && !verify_phase) {
+            // The batch builder emits the prompt's logits only in the segment that ends it, which
+            // may be a later and narrower one. Declare one output per selected slot so every
+            // segment stays inside the reserved writes.
+            for (int32_t row=0;row<representative.n_tokens;++row) representative.logits[row]=0;
+            for (int32_t row=representative.n_tokens-1;row>=0;--row) {
+                bool seen=false;
+                for (int32_t later=row+1;later<representative.n_tokens;++later)
+                    if (representative.seq_id[later][0]==representative.seq_id[row][0]) {seen=true;break;}
+                if (!seen) representative.logits[row]=1;
+            }
+        }
         std::vector<std::array<uint32_t,2>> shape(slots.size());
         for (int32_t row=0;row<representative.n_tokens;++row) {
             if (representative.n_seq_id[row]!=1 || representative.seq_id[row][0]<0 ||
@@ -4661,9 +4680,19 @@ private:
         }
         auto * active=stream_contexts->context();
         const bool embedded=representative.embd!=nullptr;
+        // A later segment of the same selection only ever narrows the rows and outputs that the
+        // active execution already reserved, so it must not retire it.
+        const auto fits=[&]() {
+            if (stream_shape.size()!=shape.size()) return false;
+            for (size_t i=0;i<shape.size();++i) {
+                if ((shape[i][0]!=0)!=(stream_shape[i][0]!=0)) return false;
+                if (shape[i][0]>stream_shape[i][0] || shape[i][1]>stream_shape[i][1]) return false;
+            }
+            return true;
+        };
         if (active && embedded==stream_embedded && active->get_cparams().causal_attn==causal &&
-                (shape==stream_shape || (spec && phase==llama_memory_work_phase::target_verify)) &&
-                active->get_cparams().kv_stream_decode==(phase==llama_memory_work_phase::target_verify)) return true;
+                ((spec && verify_phase) || fits()) &&
+                active->get_cparams().kv_stream_decode==verify_phase) return true;
         park_stream_context();
         llama_set_causal_attn(stream_contexts->metadata_context(),causal);
         auto selection=stream_selection;selection.history_tokens=0;

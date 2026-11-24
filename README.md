@@ -64,12 +64,17 @@ flash-attn = on
 - Synced to Raymond's adaptive-KV fork, now on V3 ("Oceanus", multi-slot): merged
   [RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
   [`0ddabe803`](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming/commit/0ddabe803c18f7b501ed3074f3e00a06542ef3e7) (2026-11-22)
-- ngram speculators can run alongside attached MTP on a streamed context:
+- ngram speculators can run alongside attached MTP on a streamed context, serial
+  and multi-slot alike:
   `--spec-type ngram-simple,draft-mtp` (any `ngram-*` type works) lets the ngram
   drafter propose the wide round and the MTP head the narrow one, sharing one
   target pool [^1]. A draft wider than the span tile runs as span-width row tiles,
   so it no longer reserves the whole-layer gather shape, and the vision projector
-  loads with the combination too [^3].
+  loads with the combination too [^3]. With `--parallel 2` both slots draft and
+  verify in the same batch: a decode step costs about 1.7x a single-slot step, so
+  each request runs at 55-60 % of single-slot speed while the aggregate holds
+  about one slot's throughput. Slots buy concurrency and isolation, not
+  throughput.
 - Attached MTP accepts more than three draft tokens: `--spec-draft-n-max` may be
   raised to 5, which together with a 0.7-0.8 cutoff raises TG tps [^2].
 - DFlash2 also accepts an `ngram-*` drafter alongside it
@@ -243,6 +248,8 @@ Oceanus runs on one CUDA GPU. Model weights and KV-cache quantization are separa
 | Parallel requests | Configurable logical slots, one shared GPU arena, independent histories, and jointly executed selections that fit the context and memory budgets. |
 
 Q8V8 and Q8V4 have full-model reference profiles. Q4V4 is available through the common KV reader, with narrower full-model qualification; availability is not evidence that every model/drafter/image combination has been qualified. GPU execution evidence covers selected one- to four-slot profiles. Larger configured counts and other GPUs need their own qualification; see the [qualification ledger](MULTI_SLOT_PHASE_ARENA_ROADMAP.md).
+
+[CI build profiles and architecture-specific binary releases](.github/CI.md).
 
 ## Quick Starts
 

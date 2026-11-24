@@ -1605,7 +1605,7 @@ struct llama_kv_stream_group_model::implementation {
 
 std::unique_ptr<llama_kv_stream_group_model> llama_kv_stream_group_model::create(const llama_kv_stream_group_model_config & config) {
     if (!config.backend || !config.table || !config.layers || !config.query_heads || !config.maximum_rows ||
-            !config.maximum_verify_rows || config.maximum_verify_rows>8 || !config.maximum_selected ||
+            !config.maximum_verify_rows || config.maximum_verify_rows>64 || !config.maximum_selected ||
             config.maximum_selected>config.table->limits().slots ||
             config.maximum_verify_rows>config.maximum_rows ||
             config.maximum_rows>config.table->limits().slot_storage || config.shape.page_tokens!=256 ||
