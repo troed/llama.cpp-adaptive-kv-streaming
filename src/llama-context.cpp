@@ -150,8 +150,9 @@ static bool group_rollback_supported(const llama_model & model,uint32_t depth) {
 }
 
 static bool group_auxiliary_supported(const llama_model & model,const llama_context_params & params) {
+    // spike: attached MTP depth up to the streamed draft cap, not just Raymond's qualified 3
     return !params.kv_stream_auxiliary_layers || (params.kv_stream_auxiliary_layers==1 && model.arch==LLM_ARCH_QWEN35 &&
-        model.hparams.n_layer_nextn==1 && params.n_rs_seq>0 && params.n_rs_seq<=3);
+        model.hparams.n_layer_nextn==1 && params.n_rs_seq>0 && params.n_rs_seq<=LLAMA_KV_STREAM_MTP_DRAFT_MAX);
 }
 
 static std::vector<llama_seq_id> group_slot_ids(uint32_t count) {
@@ -163,7 +164,10 @@ static std::vector<llama_seq_id> group_slot_ids(uint32_t count) {
 }
 
 static uint32_t group_verify_rows(const llama_cparams & params) {
-    return params.kv_stream_verify_max ? params.kv_stream_verify_max : params.n_rs_seq ? params.n_rs_seq+1 : 1;
+    if (params.kv_stream_verify_max) return params.kv_stream_verify_max;
+    // spike: carry the configured streamed verify width (ngram companions exceed the MTP depth)
+    if (params.kv_stream_verify_width > 1) return params.kv_stream_verify_width;
+    return params.n_rs_seq ? params.n_rs_seq+1 : 1;
 }
 
 static bool group_next_position(const llama_kv_cells & cells,size_t tokens,llama_pos & output) {
@@ -417,6 +421,10 @@ struct llama_context::group_execution_binding {
                     next_phase=predict ? llama_memory_work_phase::mtp_draft : llama_memory_work_phase::mtp_catchup;
                 } else next_phase=context.cparams.kv_stream_decode ? llama_memory_work_phase::target_verify : llama_memory_work_phase::target_prefill;
             }
+            // MTP catch-up carries the hidden rows out of band (host or target device), not as embd rows
+            const bool state_rows = shared_roles && context.cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP &&
+                std::any_of(batch.tokens.begin(),batch.tokens.end(),[](const auto & token) {
+                    return token.has_state || token.state_row >= 0;});
             for (const auto & token : batch.tokens) {
                 if (token.seq_ids.size()!=1) return false;
                 const auto id=*token.seq_ids.begin();
@@ -442,7 +450,7 @@ struct llama_context::group_execution_binding {
                     next_phase==llama_memory_work_phase::target_verify || next_phase==llama_memory_work_phase::mtp_draft,false};
                 coordinates.sequence=llama_seq_id(handle.slot);
                 coordinates.token_hidden=shared_roles && context.cparams.ctx_type==LLAMA_CONTEXT_TYPE_MTP &&
-                    !context.mtp_visual_hidden;
+                    !context.mtp_visual_hidden && !state_rows;
                 if (!llama_kv_stream_validate_append(selected,coordinates)) return false;
                 if (shared_block && context.model.arch==LLM_ARCH_QWEN35 && peer) {
                     const bool pinned=context.serial_feature_images && batch.n_pos_per_embd==4 && selected.tokens.size()>1 &&
@@ -586,8 +594,9 @@ bool llama_context::group_mtp_ready(uint32_t future_tokens) const noexcept {
     if (group_initializing || !group_execution || !group_execution->shared_roles || group_execution->failed ||
             group_execution->admission || !group_execution->owner || !group_execution->peer) return false;
     const bool readonly=group_execution->shared_readonly;
+    // the lease spans the verify batch: the anchor plus n_rs_seq drafted rows
     if (readonly ? !cparams.kv_stream_verify_max || future_tokens>=cparams.kv_stream_verify_max :
-            cparams.kv_stream_auxiliary_layers!=1 || future_tokens>cparams.n_rs_seq) return false;
+            cparams.kv_stream_auxiliary_layers!=1 || future_tokens>cparams.n_rs_seq+1) return false;
     try {
         const auto & peer=*group_execution->peer;
         if (readonly && (!peer.read_prepare || !peer.read_release ||
@@ -738,6 +747,8 @@ bool llama_context::attach_group_execution_impl(std::unique_ptr<llama_context_me
         cparams.kv_stream_decode=phase==llama_memory_work_phase::target_verify || phase==llama_memory_work_phase::mtp_draft;
         compute_memory_graph_revision=compute_memory->graph_binding_revision();
         backend_buf_exp_size=std::move(expected_bytes);
+        // a group-attached context runs the dense mask its declaration measured; the span reader selects the rows
+        cparams.fused_kv_rows=false;
         sched_reserve_state.complete();group_initializing=false;return true;
     } catch (...) {return false;}
 }
@@ -1703,7 +1714,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     // the fallback attends to the whole unified cache with a dense mask
     if (cparams.auto_fkvr) {
         // streamed attention reads its rows through the span reader, so the dense kv_rows mask does not match
-        cparams.fused_kv_rows = cparams.flash_attn && !cparams.kv_streaming();
+        // a group declaration has no KV-stream execution owner yet; its reserve uses the dense fallback
+        cparams.fused_kv_rows = cparams.flash_attn && !cparams.kv_streaming() && !group_initializing;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
     }
@@ -1774,7 +1786,8 @@ bool llama_context::prepare_compute_arenas(
     }
 
     llama_kv_stream_model * stream = nullptr;
-    if (cparams.kv_streaming() && memory) {
+    // Group initialization defers the full cache, so its stream exists only after the slot table is bound.
+    if (cparams.kv_streaming() && memory && !group_initializing) {
         stream = kv_resources.full ? kv_resources.full->get_kv_stream() : nullptr;
         if (!stream) return false;
     }
@@ -2090,10 +2103,14 @@ void llama_context::sched_reserve() {
     }
     llama_log_memory_phase(compute_memory.get());
 
+    // A group declaration and a measurement context only record their graph sizes; the real
+    // workspace is attached by the group before execution.
+    const bool measure_graphs = no_alloc();
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+                measure_graphs, measure_graphs ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -2106,8 +2123,9 @@ void llama_context::sched_reserve() {
                     /*.parallel   =*/ false,
                     /*.op_offload =*/ cparams.op_offload,
                 });
-                if (model.no_alloc() || prepare_arenas()) {
-                    gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                if (prepare_arenas()) {
+                    gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), measure_graphs,
+                        measure_graphs ? backend_buf_exp_size.data() : nullptr);
                 }
             }
             if (!gf) {
@@ -2129,7 +2147,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), measure_graphs);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -2144,7 +2162,7 @@ void llama_context::sched_reserve() {
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.no_alloc());
+        ggml_cgraph * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), measure_graphs);
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -2154,7 +2172,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.no_alloc()) {
+        if (!measure_graphs) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -4885,63 +4903,28 @@ llama_context_memory_create_result llama_context::quote_target_group(const llama
         }
         std::vector<llama_context_group_workload_quote> catalog;
         const uint32_t verify_rows=group_verify_rows(cparams);
-        if (group_initializing && phase==llama_memory_work_phase::target_verify && verify_rows>1) {
-            if (sources.size()>2) {
-                const auto maximum=std::min(cparams.n_batch,cparams.n_ubatch);
-                auto input=llama_batch_init(int32_t(maximum),0,1);
-                struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{input};
-                uint64_t profile_id=1;
-                if (!llama_context_group_graph_profiles(uint32_t(sources.size()),verify_rows,maximum,
-                        cparams.n_outputs_max,cparams.n_outputs_max_per_seq,kv_resources.recurrent!=nullptr,
-                        [&](const llama_context_group_graph_profile & profile) {
-                    input.n_tokens=0;
-                    for (size_t i=0;i<profile.rows.size();++i) for (uint32_t row=0;row<profile.rows[i];++row) {
-                        const auto token=input.n_tokens++;
-                        input.token[token]=0;input.pos[token]=llama_pos(row);input.n_seq_id[token]=1;
-                        input.seq_id[token][0]=group_selected[i];
-                        input.logits[token]=row+profile.outputs[i]>=profile.rows[i];
-                    }
-                    llama_context_group_workload_quote measured;
-                    if (!measure_target_workload(input,sources,phase,profile_id++,measured)) return false;
-                    catalog.push_back(std::move(measured));return true;
-                })) return result;
-            } else {
-            struct option {uint32_t rows,outputs;};
-            std::vector<option> options{{0,0}};
-            for (uint32_t rows=1;rows<=verify_rows;++rows) {
-                options.push_back({rows,1});
-                const auto outputs=std::min(rows,cparams.n_outputs_max_per_seq);
-                if (outputs>1) options.push_back({rows,outputs});
-            }
-            size_t combinations=1;
-            for (size_t i=0;i<sources.size();++i) {
-                if (combinations>SIZE_MAX/options.size()) return result;
-                combinations*=options.size();
-            }
-            const auto maximum=uint32_t(std::min(uint64_t(cparams.n_batch),uint64_t(sources.size())*verify_rows));
+        // A wide group declares the whole per-slot profile lattice so slots can enter verify at
+        // any width. Narrower groups only ever use the maximum width per slot, and measuring the
+        // cross product there costs seconds per selection.
+        if (group_initializing && phase==llama_memory_work_phase::target_verify && verify_rows>1 && sources.size()>2) {
+            const auto maximum=std::min(cparams.n_batch,cparams.n_ubatch);
             auto input=llama_batch_init(int32_t(maximum),0,1);
             struct release_batch {llama_batch & batch;~release_batch() {llama_batch_free(batch);}} release{input};
-            for (size_t profile=1;profile<combinations;++profile) {
-                size_t value=profile;
-                std::vector<option> selected;
-                uint64_t rows=0,outputs=0;
-                for (size_t i=0;i<sources.size();++i) {
-                    const auto shape=options[value%options.size()];value/=options.size();
-                    selected.push_back(shape);rows+=shape.rows;outputs+=shape.outputs;
-                }
-                if (!rows || rows>maximum || outputs>cparams.n_outputs_max) continue;
+            uint64_t profile_id=1;
+            if (!llama_context_group_graph_profiles(uint32_t(sources.size()),verify_rows,maximum,
+                    cparams.n_outputs_max,cparams.n_outputs_max_per_seq,kv_resources.recurrent!=nullptr,
+                    [&](const llama_context_group_graph_profile & profile) {
                 input.n_tokens=0;
-                for (size_t i=0;i<selected.size();++i) for (uint32_t row=0;row<selected[i].rows;++row) {
+                for (size_t i=0;i<profile.rows.size();++i) for (uint32_t row=0;row<profile.rows[i];++row) {
                     const auto token=input.n_tokens++;
                     input.token[token]=0;input.pos[token]=llama_pos(row);input.n_seq_id[token]=1;
-                    input.seq_id[token][0]=group_selected.empty() ? llama_seq_id(i) : group_selected[i];
-                    input.logits[token]=row+selected[i].outputs>=selected[i].rows;
+                    input.seq_id[token][0]=group_selected[i];
+                    input.logits[token]=row+profile.outputs[i]>=profile.rows[i];
                 }
                 llama_context_group_workload_quote measured;
-                if (!measure_target_workload(input,sources,phase,profile,measured)) return result;
-                catalog.push_back(std::move(measured));
-            }
-            }
+                if (!measure_target_workload(input,sources,phase,profile_id++,measured)) return false;
+                catalog.push_back(std::move(measured));return true;
+            })) return result;
             if (catalog.empty()) return result;
             const auto valid_verify=[](const llama_context_group_workload_quote & quote) {
                 return std::all_of(quote.measurement.workload.members.begin(),quote.measurement.workload.members.end(),
@@ -5722,6 +5705,8 @@ bool llama_context::measure_workspace_impl(const llama_ubatch * native_batch, ui
             }
         } restore{*this,roots};
         for (auto & item : roots) item.first->buffer=buffer.get();
+        // keep the dense form the group declaration and its execution both use; the rows form
+        // would split the attention by sequence and the span reader takes one stream per op
         auto * graph=build();
         if (!graph) return false;
         size_t managed=0;
@@ -9138,6 +9123,8 @@ std::unique_ptr<llama_context_group> llama_context_group::create(const llama_mod
             auto child=params;
             child.ctx_type=LLAMA_CONTEXT_TYPE_MTP;child.ctx_other=owner->impl->metadata.get();
             child.shared_device_memory_bytes=0;child.n_rs_seq=0;child.kv_stream_auxiliary_layers=0;
+            // spike: the draft child keeps the narrow MTP window, only the target verifies wide
+            child.kv_stream_verify_width=LLAMA_KV_STREAM_MTP_DRAFT_MAX+1;
             child.samplers=nullptr;child.n_samplers=0;
             owner->impl->auxiliary_metadata=std::make_unique<llama_context>(model,child,group_slot_ids(params.n_seq_max));
             owner->impl->auxiliary_metadata->set_embeddings_nextn(true,true);
@@ -9266,6 +9253,12 @@ bool llama_context_group::activate(const llama_kv_stream_selection & selection,
             child->set_embeddings_nextn(true,!impl->block_model);
             if (impl->auxiliary_metadata && !child->bind_group_samplers_from(*impl->auxiliary_metadata)) return false;
         }
+        // The declared metadata pair may publish target state rows; the live pair has to read them.
+        if (child && impl->metadata && impl->auxiliary_metadata &&
+                impl->metadata->get_cparams().embeddings_nextn_dev &&
+                impl->auxiliary_metadata->get_cparams().ctx_state_src == impl->metadata.get()) {
+            if (!candidate->set_embeddings_nextn_dev(true) || !child->set_ctx_state_src(candidate.get())) return false;
+        }
         if (!candidate->initialize_group_execution(impl->table,projection,representative,phase,profile,selection_revision,
                 impl->parent.get(),states,result,child.get(),child_projection,child_states)) return false;
         if (!impl->parent) impl->parent.reset(ggml_backend_buffer_retain(candidate->group_parent()));
@@ -9316,8 +9309,9 @@ llama_context * llama_context_group::auxiliary_metadata_context() const noexcept
 std::shared_ptr<llama_kv_stream_slot_table> llama_context_group::source_table() const noexcept {return impl ? impl->table : nullptr;}
 const std::vector<llama_kv_stream_slot_handle> & llama_context_group::source_handles() const noexcept {return impl->handles;}
 
-bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes) const {
-    if (!impl || impl->active || impl->vision_lent || slot>=impl->handles.size()) return false;
+bool llama_context_group::save_request_state(uint32_t slot,const llama_context_group_sequence_state & target,
+        const llama_context_group_sequence_state & auxiliary,llama_context_group_checkpoint & output,bool copy_bytes) const {
+    if (!impl || impl->vision_lent || slot>=impl->handles.size()) return false;
     try {
         llama_context_group_checkpoint saved;
         saved.model=impl->model;saved.auxiliary_model=impl->block_model ? impl->block_model : impl->shared_model;saved.slot=slot;
@@ -9329,7 +9323,7 @@ bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpo
                     !impl->table->get_cells(handle,role,cells) || cells->get_used()!=history.tokens) return false;
             saved.histories.push_back(std::move(history));saved.cells.push_back(std::make_shared<llama_kv_cells>(*cells));
         }
-        saved.target=impl->parked[slot];saved.auxiliary=impl->parked_auxiliary[slot];
+        saved.target=target;saved.auxiliary=auxiliary;
         const auto & source=saved.histories.front();
         std::shared_ptr<llama_kv_stream_logical_cache> cache;
         if (!impl->table->get(handle,0,cache)) return false;
@@ -9337,6 +9331,32 @@ bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpo
                 saved.target.request_epoch!=handle.generation || saved.target.tokens!=source.tokens ||
                 saved.target.cache_id!=cache->identity().id || saved.target.cache_generation!=cache->identity().generation)) return false;
         output=std::move(saved);return true;
+    } catch (const std::bad_alloc &) {return false;}
+}
+
+bool llama_context_group::save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes) const {
+    if (!impl || impl->active) return false;
+    return save_request_state(slot,impl->parked[slot],impl->parked_auxiliary[slot],output,copy_bytes);
+}
+
+bool llama_context_group::save_request_active(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes) {
+    if (!impl || !impl->active || impl->vision_lent || slot>=impl->handles.size()) return false;
+    try {
+        std::vector<llama_context_group_sequence_state> states;
+        if (!impl->active->save_group_sequences(states)) return false;
+        std::vector<llama_context_group_sequence_state> auxiliary_states;
+        if (impl->active_auxiliary && !impl->shared_model && !impl->active_auxiliary->save_group_sequences(auxiliary_states)) return false;
+        const auto find=[](const std::vector<llama_context_group_sequence_state> & list,llama_seq_id sequence)
+                -> const llama_context_group_sequence_state * {
+            for (const auto & state : list) if (state.sequence==sequence) return &state;
+            return nullptr;
+        };
+        const auto * target=find(states,llama_seq_id(slot));
+        if (!target) return false;
+        // A shared MTP child aliases the target bank and keeps no state of its own.
+        static const llama_context_group_sequence_state empty{};
+        const auto * auxiliary=impl->shared_model ? &empty : find(auxiliary_states,llama_seq_id(slot));
+        return save_request_state(slot,*target,auxiliary ? *auxiliary : empty,output,copy_bytes);
     } catch (const std::bad_alloc &) {return false;}
 }
 

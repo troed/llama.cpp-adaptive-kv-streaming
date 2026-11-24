@@ -748,6 +748,9 @@ public:
     LLAMA_API const std::vector<llama_kv_stream_slot_handle> & source_handles() const noexcept;
     // Export only parked sources. Loading starts a new namespace at the destination's reserved addresses.
     LLAMA_API bool save_request(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes=true) const;
+    // Export one selected request without retiring the live execution. A checkpoint is logical
+    // state, so it does not need the parking step that the caller would otherwise pay for.
+    LLAMA_API bool save_request_active(uint32_t slot,llama_context_group_checkpoint & output,bool copy_bytes=true);
     // Versioned native-endian checkpoint. Caller supplies the actual remaining input bytes.
     LLAMA_API bool write_request(uint32_t slot,llama_io_write_i & output) const;
     LLAMA_API bool read_request(uint32_t slot,llama_io_read_i & input,size_t available);
@@ -762,4 +765,6 @@ private:
     llama_context_group();
     struct implementation;
     std::unique_ptr<implementation> impl;
+    bool save_request_state(uint32_t slot,const llama_context_group_sequence_state & target,
+        const llama_context_group_sequence_state & auxiliary,llama_context_group_checkpoint & output,bool copy_bytes) const;
 };

@@ -242,6 +242,11 @@ bool llama_kv_cache::bind_bounded_storage(ggml_backend_memory_lease_t lease) {
         if (next.get_layer_ids() != ids || next.ctxs_bufs.bufs.size() != 1 || !retired_storage_metadata.empty()) return false;
         retired_storage_metadata.swap(ctxs_bufs.bufs);
         ctxs_bufs.bufs.swap(next.ctxs_bufs.bufs);
+        // the rotation tensors follow their layers, so keep the old ones alive with the retired storage
+        decltype(attn_rot_bufs.bufs) old_rot;
+        old_rot.swap(attn_rot_bufs.bufs);
+        attn_rot_bufs.bufs.swap(next.attn_rot_bufs.bufs);
+        for (auto & item : old_rot) retired_storage_metadata.push_back(std::move(item));
         layers.swap(next.layers);
         map_layer_ids.swap(next.map_layer_ids);
         bounded_lease.swap(next.bounded_lease);
@@ -276,7 +281,12 @@ bool llama_kv_cache::bind_group_model(std::unique_ptr<llama_kv_stream_group_mode
         if (next.get_layer_ids()!=ids || next.ctxs_bufs.bufs.size()!=1 || next.full_pending) return false;
         next.v_cells[0]=*projection.cells;
         retired_storage_metadata.swap(ctxs_bufs.bufs);
-        ctxs_bufs.bufs.swap(next.ctxs_bufs.bufs);layers.swap(next.layers);map_layer_ids.swap(next.map_layer_ids);
+        ctxs_bufs.bufs.swap(next.ctxs_bufs.bufs);
+        decltype(attn_rot_bufs.bufs) old_rot;
+        old_rot.swap(attn_rot_bufs.bufs);
+        attn_rot_bufs.bufs.swap(next.attn_rot_bufs.bufs);
+        for (auto & item : old_rot) retired_storage_metadata.push_back(std::move(item));
+        layers.swap(next.layers);map_layer_ids.swap(next.map_layer_ids);
         v_cells.swap(next.v_cells);v_heads.swap(next.v_heads);storage_selected_sequences.swap(next.storage_selected_sequences);
         group_stream=std::move(candidate);full_pending=false;return true;
     } catch (...) {return false;}
@@ -298,6 +308,7 @@ bool llama_kv_cache::release_bounded_storage() {
         if (next.get_layer_ids()!=ids || next.ctxs_bufs.bufs.size()!=1 || !next.bounded_pending || next.bounded_lease) return false;
         retired_storage_metadata.clear();
         ctxs_bufs.bufs.swap(next.ctxs_bufs.bufs);
+        attn_rot_bufs.bufs.swap(next.attn_rot_bufs.bufs);
         layers.swap(next.layers);
         map_layer_ids.swap(next.map_layer_ids);
         bounded_lease.swap(next.bounded_lease);

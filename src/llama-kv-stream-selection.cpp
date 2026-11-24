@@ -47,7 +47,8 @@ llama_kv_stream_selection_status llama_kv_stream_prefill_plan_make(
 
 bool llama_kv_stream_generation_budget_make(size_t headroom, uint32_t maximum_proposals, size_t remaining_outputs,
         llama_kv_stream_generation_budget & output) noexcept {
-    if (!headroom || !remaining_outputs || maximum_proposals > 7) return false;
+    // spike: allow proposals wider than the narrow MTP window
+    if (!headroom || !remaining_outputs || maximum_proposals > 64) return false;
     const size_t rows=std::min({headroom,remaining_outputs,size_t(maximum_proposals)+1});
     output={uint32_t(rows),uint32_t(rows-1)};
     return true;

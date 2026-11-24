@@ -8671,9 +8671,9 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
     if (!t.assert_true(group && group->metadata_context() && !group->context())) return;
     {
         llama_context lone(*target->model(),cparams,std::vector<llama_seq_id>{1});
-        t.assert_true(lone.group_storage_pending() && !lone.group_parent());
+        t.assert_true("a lone group member keeps pending storage and no parent",lone.group_storage_pending() && !lone.group_parent());
         if (auto * recurrent=lone.get_kv_resources().recurrent)
-            t.assert_true(recurrent->spill_bank(1) && !recurrent->spill_bank(0));
+            t.assert_true("a lone group member spills only its own sequence",recurrent->spill_bank(1) && !recurrent->spill_bank(0));
     }
     auto dparams=common_base_params_to_speculative(params);
     for (const bool key : {true,false}) {
@@ -8684,7 +8684,7 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
         try {auto unexpected=common_speculative_init_from_params(invalid,target->model(),group->metadata_context(),group.get());}
         catch (const std::invalid_argument &) {rejected=true;}
         if (!t.assert_true(rejected)) return;
-        t.assert_true(!group->context() && !group->metadata_context()->group_parent());
+        t.assert_true("a rejected draft leaves the group undeclared",!group->context() && !group->metadata_context()->group_parent());
     }
     for (unsigned profile=0;profile<7;++profile) {
         auto invalid=dparams;
@@ -8695,12 +8695,17 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
             case 3:invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);break;
             case 4:invalid.shared_device_memory_bytes=1;break;
             case 5:invalid.kv_stream_pool_bytes=1;break;
-            case 6:invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);break;
+            case 6:invalid.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);break;
         }
-        bool rejected=false;
-        try {auto unexpected=common_speculative_init_from_params(invalid,target->model(),group->metadata_context(),group.get());}
+        // an ngram companion shares the declared MTP group instead of being rejected
+        const bool companion=profile==6;
+        bool rejected=false,admitted=false;
+        try {auto unexpected=common_speculative_init_from_params(invalid,target->model(),group->metadata_context(),group.get());
+            admitted=true;}
         catch (const std::invalid_argument &) {rejected=true;}
-        if (!t.assert_true(rejected)) return;
+        if (companion) {
+            if (!t.assert_true("an ngram companion is admitted beside the group MTP role",admitted && !rejected)) return;
+        } else if (!t.assert_true(rejected)) return;
     }
     struct loading_state {llama_context_group * group;unsigned calls=0;bool unallocated=true;} loading{group.get()};
     dparams.load_progress_callback=[](float,void * data) {
@@ -8712,15 +8717,22 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
     };
     dparams.load_progress_callback_user_data=&loading;
     draft=common_speculative_init_from_params(dparams,target->model(),group->metadata_context(),group.get());
-    if (!t.assert_true(draft && draft->context()==group->auxiliary_metadata_context() && draft->context())) return;
-    t.assert_true(loading.unallocated && (assistant_path ? loading.calls>0 : loading.calls==0));
-    t.assert_true(!group->metadata_context()->group_parent() && !draft->context()->group_parent());
-    t.assert_true(draft->context()->group_storage_pending() && !draft->context()->get_cparams().shared_device_memory_bytes);
+    if (!t.assert_true("the draft context is the group auxiliary metadata context",
+            draft && draft->context()==group->auxiliary_metadata_context() && draft->context())) return;
+    t.assert_true("loading declared the group roles without allocating",loading.unallocated && (assistant_path ? loading.calls>0 : loading.calls==0));
+    t.assert_true("no group parent before the arena",!group->metadata_context()->group_parent() && !draft->context()->group_parent());
+    t.assert_true("the draft metadata context owns no device arena",
+        draft->context()->group_storage_pending() && !draft->context()->get_cparams().shared_device_memory_bytes);
     t.assert_true("unbound metadata cannot authorize recurrent prefetch",!draft->context()->group_recurrent_restore_isolated());
-    for (const auto & entry : draft->context()->get_memory()->memory_breakdown()) t.assert_equal(size_t(0),entry.second);
+    // attention rotation keeps one fixed Hadamard table per head side in every cache; it is not KV payload
+    const auto & dh=target->model()->hparams;
+    const size_t rot_limit=size_t(dh.n_embd_head_k())*dh.n_embd_head_k()*sizeof(float) +
+        size_t(dh.n_embd_head_v())*dh.n_embd_head_v()*sizeof(float);
+    for (const auto & entry : draft->context()->get_memory()->memory_breakdown())
+        t.assert_true("model-only startup allocates only the fixed rotation tables",entry.second<=rot_limit);
     params.speculative.draft.ctx_tgt=group->metadata_context();params.speculative.draft.ctx_dft=draft->context();
     common_speculative_ptr spec(common_speculative_init(params.speculative,2));
-    if (!t.assert_true(spec!=nullptr)) return;
+    if (!t.assert_true("common_speculative_init builds the MTP driver",spec!=nullptr)) return;
     if (failure) for (llama_seq_id slot=0;slot<2;++slot) {
         std::vector<uint8_t> seeded,observed;
         if (!t.assert_true(common_speculative_get_state(spec.get(),slot,seeded) && seeded.size()>sizeof(uint32_t))) return;
@@ -8739,13 +8751,22 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
         input.token[slot]=100+slot;input.pos[slot]=0;input.n_seq_id[slot]=1;input.seq_id[slot][0]=slot;input.logits[slot]=true;
     }
     llama_kv_stream_selection selection;
-    if (!t.assert_true(llama_kv_stream_select({cparams.n_ctx,2},{{0,0},{1,0}},selection)==llama_kv_stream_selection_status::success &&
+    const auto selected=llama_kv_stream_select({cparams.n_ctx,2},{{0,0},{1,0}},selection);
+    if (!t.assert_equal("group selection admits both declared slots",
+            int(llama_kv_stream_selection_status::success),int(selected))) return;
+    if (!t.assert_true("group activation binds the declared pair",
             group->activate(selection,group->source_handles(),input,llama_memory_work_phase::target_prefill,1,1))) return;
     auto * active=group->context();auto * child=group->auxiliary_context();
     if (!t.assert_true(active && child && active->group_parent()==child->group_parent() &&
             common_speculative_rebind(spec.get(),active,child))) return;
     t.assert_equal("only a recurrent target supplies an isolated persistent restore region",
         active->get_kv_resources().recurrent!=nullptr,child->group_recurrent_restore_isolated());
+    const uint32_t rs_depth=llama_n_rs_seq(active);
+    if (!t.assert_true(rs_depth>0)) return;
+    t.assert_true("the grouped MTP lease spans the anchor plus every admitted draft row",
+        llama_kv_stream_mtp_prepare(active,rs_depth+1));
+    t.assert_true("the grouped MTP lease rejects one row beyond the declared verify width",
+        !llama_kv_stream_mtp_prepare(active,rs_depth+2));
     common_batch prompt(active);std::array<llama_tokens,2> histories,proposals;
     for (llama_seq_id slot=0;slot<2;++slot) {histories[slot]={llama_token(100+slot)};prompt.add(100+slot,0,slot,true);}
     if (!t.assert_equal(0,llama_process(active,LLAMA_PROCESS_TYPE_DECODE,prompt.get())) ||
