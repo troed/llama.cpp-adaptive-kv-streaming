@@ -1971,6 +1971,7 @@ struct llama_model * common_model_load(const std::vector<std::string> & paths, c
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
+    cparams.recurrent_rollback_ram = params.recurrent_rollback_ram;
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
