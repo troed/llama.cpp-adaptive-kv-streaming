@@ -8655,7 +8655,7 @@ static void test_group_common_mtp_startup(testing & t,const char * target_path,c
     common_params params;
     params.model.path=target_path;params.n_gpu_layers=999;params.fit_params=false;params.warmup=true;
     params.n_ctx=4096;params.n_batch=params.n_ubatch=256;params.n_parallel=2;params.kv_unified=true;
-    params.shared_device_memory_bytes=size_t(1024)*1024*1024;
+    params.shared_device_memory_bytes=size_t(1024)*1024*1024;params.recurrent_rollback_ram=true;
     params.cache_type_k=GGML_TYPE_Q8_0;params.cache_type_v=GGML_TYPE_Q4_0;params.flash_attn_type=LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.n_outputs_max=8;params.n_outputs_max_per_seq=4;
     params.cpuparams.n_threads=params.cpuparams_batch.n_threads=4;

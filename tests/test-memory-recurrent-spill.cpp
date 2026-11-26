@@ -754,13 +754,13 @@ int main(int argc, char ** argv) {
         for (auto selected : std::vector<std::vector<llama_seq_id>>{{2},{3,1},{3,1,0},{3,1,0,2}})
         for (uint32_t depth=1;depth<=7;++depth) for (uint32_t rollback=0;rollback<=depth;++rollback) {
             const auto count=uint32_t(selected.size());
-            llama_memory_recurrent memory(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,count,4,depth,nullptr,false,true,true);
+            llama_memory_recurrent memory(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,count,4,depth,nullptr,false,true,true);
             if (!t.assert_true("native rollback admits a compact selected bank",memory.configure_selected_sequences(selected))) return;
             t.assert_true(!memory.spill_enabled());
             t.assert_equal(int64_t(count*(depth+1)),memory.s_l[0]->ne[1]);
             ggml_backend_buffer_type_t type=nullptr;size_t bytes=0;
             if (!t.assert_true(memory.current_storage_requirements(type,bytes))) return;
-            llama_memory_recurrent native(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,count,count,depth,nullptr);
+            llama_memory_recurrent native(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,count,count,depth,nullptr);
             ggml_backend_buffer_type_t native_type=nullptr;size_t native_bytes=0;
             if (!t.assert_true(native.current_storage_requirements(native_type,native_bytes))) return;
             t.assert_equal(native_bytes,bytes);
@@ -797,7 +797,7 @@ int main(int argc, char ** argv) {
                 const auto rejected=(rollback+seq)%(depth+1);
                 if (rejected && !t.assert_true(memory.seq_rm(sequence,11+depth-rejected,-1))) return;
                 recurrent_bytes_writer saved;memory.state_write(saved,sequence,0);
-                llama_memory_recurrent restored(*model,GGML_TYPE_F32,GGML_TYPE_F32,false,1,1,0,nullptr);
+                llama_memory_recurrent restored(*model,false,GGML_TYPE_F32,GGML_TYPE_F32,false,1,1,0,nullptr);
                 recurrent_bytes_reader reader(saved.bytes);restored.state_read(reader,0,0);
                 t.assert_equal(saved.bytes.size(),reader.cursor);
                 for (auto * tensor : {restored.r_l[0],restored.s_l[0]}) {
