@@ -1716,7 +1716,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fkvr) {
         // streamed attention reads its rows through the span reader, so the dense kv_rows mask does not match
         // a group declaration has no KV-stream execution owner yet; its reserve uses the dense fallback
-        cparams.fused_kv_rows = cparams.flash_attn && !cparams.kv_streaming() && !group_initializing;
+        // a serially attached consumer reads through the span reader or a gathered workspace, never the row map
+        const bool serial_consumer = cparams.mtp_publish_host || cparams.serial_block_rows || cparams.kv_shared_read;
+        cparams.fused_kv_rows = cparams.flash_attn && !cparams.kv_streaming() && !group_initializing && !serial_consumer;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
     }
